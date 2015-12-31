@@ -1,0 +1,48 @@
+#|--------------------------------------------------------------------------|
+#|						   TOPMake 2.0										|
+#| Copyright (c) 2000-2003 Shanghai Huateng Software Systems Co., Ltd.		|
+#|	All Rights Reserved														|
+#|--------------------------------------------------------------------------|
+#| FILE NAME	: sample.dynamiclib.mak										|
+#| DESCRIPTIONS : Sample makefile for dynamic library						|
+#|--------------------------------------------------------------------------|
+
+include $(HOME)/mak/platform.mak
+include $(HOME)/mak/database.mak
+include $(HOME)/mak/tuxedo.mak
+
+PRGOBJS = shmtk.o shmapi.o pubcom.o log.o load.o tree.o list.o sem.o sysfiled.o \
+		tbl_region_code.o \
+		tbl_brh_info.o \
+		tbl_brh_profit_info.o \
+		tbl_mcht_mcc_inf.o  \
+		tbl_brh_profit_def.o	\
+		tbl_brh_profit_algo.o   \
+		tbl_acct_info.o \
+		tbl_opr_info.o  \
+		tbl_spdb_brh.o  \
+		tbl_mcht_base.o \
+		tbl_mcht_algo.o \
+		tbl_pub_disc_algo.o \
+		tbl_mcht_user.o \
+		tbl_mcht_cups_inf.o \
+		tbl_n_mcht_match.o  \
+		tbl_service_config.o	\
+		tbl_disc_algo.o \
+		tbl_pro_config.o	\
+		tbl_mcht_card.o \
+		tbl_pro_special_mcht.o
+PRGTARG = ShmTbl
+PRGDEFS = 
+
+# used for db2 database
+PRGDBNM = $(DBLINK)
+PRGLIBS = -lDbsApi -lBatCom  $(NETLIBS) $(UXLIBS) $(DBLIBS)
+
+debug all: debugstatic
+release: releasestatic
+
+# DO NOT modify any code below!!!
+
+releasedynamic debugdynamic releasestatic debugstatic releaseexec debugexec clean:
+	@make -f $(HOME)/mak/mkstand.mak $@ TARGET="$(PRGTARG)" OBJS="$(PRGOBJS)" LIBS="$(PRGLIBS)" DEFS="$(PRGDEFS)" DBNM="$(PRGDBNM)"

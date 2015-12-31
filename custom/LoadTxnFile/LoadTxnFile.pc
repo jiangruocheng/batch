@@ -1,0 +1,766 @@
+/*****************************************************************
+*文 件 名: LoadTxnfile.c
+*功	能: 加载本地成功交易流水
+******************************************************************/
+#include "DbsApi.h"
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_txn_succ.h"
+#include "tbl_order_inf.h"
+#include "tbl_stlm_err.h"
+#include "tbl_stlm_succ.h"
+EXEC SQL END DECLARE SECTION;
+
+#define	IBoxcpy(d,s,f,l)	memcpy(d, s + f, l);   f += l;  sTrimAll(d)
+#define	IBoxtol(i,d,s,f,l)	memset(d,0,sizeof(d));	IBoxcpy(d,s,f,l); i = atol(d)
+#define	IBoxtof(i,d,s,f,l)	memset(d,0,sizeof(d));	IBoxcpy(d,s,f,l); i = atof(d)
+
+
+/************************************************************************************
+	对每个渠道对应生成KEY值方法	
+ ************************************************************************************/
+extern	int	 nGetCupKey(char *pszCupsNo, TTxnSucc *pszTxnSucc);
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int nClearTxnData														*/
+/*   功能  ： 清除单交易流水表数据													*/
+/*   参数  ： pszSettleDate		   --日期   										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			RC_FAIL	--  失败														*/
+/************************************************************************************/
+int		nClearTxnData(char *pszSettleDate)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szDate[12];
+	EXEC SQL END DECLARE SECTION;
+
+/*
+//	删除order_inf流水表数据
+	snprintf(szSql, sizeof(szSql), "delete from tbl_order_inf where order_no in 	
+		(select order_no from TBL_TXN_SUCC where tx_date='%s')", pszSettleDate);
+	HtLog(NML_PARAM, "delete tbl_order_inf SQL:(%s)", szSql);
+	iRet = DbsRunSQL(szSql);   
+	if(iRet && iRet != DBS_NOTFOUND)
+	{   
+		HtLog(NML_PARAM, "delete TBL_ORDER_INF err:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+*/
+
+//	删除txn_succ流水表数据
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pszSettleDate, 8);
+
+	EXEC SQL DELETE FROM TBL_TXN_SUCC WHERE TX_DATE = :szDate;
+	if(SQL_UD_ERR)
+	{   
+		HtLog(NML_PARAM, "删除TBL_TXN_SUCC交易日(%s)流水失败, err(%d)(%s)", szDate, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： void vGetUserInfo														*/
+/*   功能  ： 填充用户信息冗余数据													*/
+/*  返回值 ： 无 																	*/
+/************************************************************************************/
+void	vGetUserInfo(TTxnSucc *pstTxn, TStlmErr *pstErr)
+{
+	dbMchtUser	  stUser;
+	
+	memset(&stUser, 0, sizeof(stUser));
+	
+	if(pstTxn)
+	{
+		if(RC_SUCC == lGetMchtUser(&stUser, pstTxn->user_id))
+		{
+			memcpy(pstTxn->user_name, stUser.user_name,  sizeof(pstTxn->user_name) - 1);
+			memcpy(pstTxn->user_phone, stUser.user_phone,  sizeof(pstTxn->user_phone) - 1);
+			memcpy(pstTxn->user_email, stUser.user_email,  sizeof(pstTxn->user_email) - 1);
+		}
+		else
+			HtLog(ERR_PARAM, "警告:获取商户(%s)用户(%d)数据失败, err:%s", pstTxn->ibox42, 
+				pstTxn->user_id, sGetError());
+	}
+	
+	if(pstErr)
+	{
+		if(RC_SUCC == lGetMchtUser(&stUser, pstErr->user_id))
+		{
+			memcpy(pstErr->user_name, stUser.user_name,  sizeof(pstErr->user_name) - 1);
+			memcpy(pstErr->user_phone, stUser.user_phone,  sizeof(pstErr->user_phone) - 1);
+			memcpy(pstErr->user_email, stUser.user_email,  sizeof(pstErr->user_email) - 1);
+		}
+		else
+			HtLog(ERR_PARAM, "警告:获取商户(%s)用户(%d)数据失败, err:%s", pstErr->ibox42, 
+				pstErr->user_id, sGetError());
+	}
+
+	return ;
+}
+
+/************************************************************************************/
+/*   声明  ： int nLoadToTxnSucc										 			*/
+/*   功能  ： 从卸载的本地流水文件装载到交易表中									*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			RC_FAIL	--  失败														*/
+/************************************************************************************/
+int		nLoadToTxnSucc(char *pszStlmNum, char *pszSettleDate)
+{	
+	int	 iRet = 0, lCount = 0, lIdx = 0;
+	char	szTemp[15], szFile[512], szLine[RECORD_LEN_MAX];
+	FILE	*fp = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TOrderInf	stOrder;
+	TTxnSucc	stTxn;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "%s/TBLNTXT%s.txt", getenv("POSP_FILE_PATH"), pszSettleDate);
+	HtLog(NML_PARAM, "开始装载(%s)成功交易流水:日期(%s)文件名[%s]", pszStlmNum, 
+		pszSettleDate, szFile);
+
+	iRet = nClearTxnData(pszSettleDate);
+	if(iRet)
+	{
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+	
+	if(NULL == (fp = fopen(szFile, "rb")))
+	{
+		HtLog(ERR_PARAM, "打开文件[%s]失败, err:(%s)", szFile, strerror(errno));
+		return RC_FAIL;
+	}
+
+	while(fgets(szLine, RECORD_LEN_MAX - 1, fp) != NULL)
+	{
+		sTrimCRLF(szLine);
+		if(strlen(szLine) <= 2)
+			 continue;
+
+		lIdx = 0;
+		memset(&stTxn, 0, sizeof(stTxn));	
+		IBoxcpy(stTxn.tx_date, szLine, lIdx, 8);	
+		IBoxcpy(stTxn.tx_time, szLine, lIdx, 10);	
+		IBoxcpy(stTxn.trace_no, szLine, lIdx, 12);	
+		IBoxcpy(stTxn.ibox_no, szLine, lIdx, 24);	
+		IBoxcpy(stTxn.order_no, szLine, lIdx, 20);	
+		IBoxcpy(stTxn.cups_no, szLine, lIdx, 4);	
+		IBoxcpy(stTxn.ac_no, szLine, lIdx, 19);	
+
+		IBoxtol(stTxn.user_id, szTemp, szLine, lIdx, 16);
+		IBoxtol(stTxn.disc_cycle, szTemp, szLine, lIdx, 16);
+		IBoxtol(stTxn.ac_type, szTemp, szLine, lIdx, 16);
+
+//		memcpy(stTxn.ac_bank_no, szLine + lIdx, 15);	lIdx += 15;
+		lIdx += 15;
+		IBoxtof(stTxn.tx_amt, szTemp, szLine, lIdx, 16);
+		IBoxtof(stTxn.fee_amt, szTemp, szLine, lIdx, 16);
+		IBoxtof(stTxn.cups_fee, szTemp, szLine, lIdx, 16);
+		IBoxtof(stTxn.re_tx_amt, szTemp, szLine, lIdx, 16);
+		IBoxcpy(stTxn.tx_code, szLine, lIdx, 20);	
+		IBoxcpy(stTxn.tx_sub_code, szLine, lIdx, 20);	
+		IBoxcpy(stTxn.brno, szLine, lIdx, 20);	
+		IBoxcpy(stTxn.longitude, szLine, lIdx, 20);	
+		IBoxcpy(stTxn.latitude, szLine, lIdx, 20);	
+		IBoxcpy(stTxn.sw_respcd, szLine, lIdx, 8);	
+		IBoxcpy(stTxn.ibox_respcd, szLine, lIdx, 8);	
+		IBoxcpy(stTxn.stat, szLine, lIdx, 1);	
+		IBoxcpy(stTxn.brf, szLine, lIdx, 60);	
+		IBoxcpy(stTxn.fill, szLine, lIdx, 60);	
+		IBoxcpy(stTxn.fd3, szLine, lIdx, 6);	
+		IBoxcpy(stTxn.fd7, szLine, lIdx, 10);	
+		IBoxcpy(stTxn.ibox11, szLine, lIdx, 6);	
+		IBoxcpy(stTxn.fd11, szLine, lIdx, 6);	
+		IBoxcpy(stTxn.fd12, szLine, lIdx, 6);	
+		IBoxcpy(stTxn.fd13, szLine, lIdx, 4);	
+		IBoxcpy(stTxn.fd15, szLine, lIdx, 4);	
+		IBoxcpy(stTxn.ibox18, szLine, lIdx, 4);	
+		IBoxcpy(stTxn.fd28, szLine, lIdx, 9);	
+		IBoxcpy(stTxn.fd37, szLine, lIdx, 12);	
+		IBoxcpy(stTxn.fd38, szLine, lIdx, 6);	
+		IBoxcpy(stTxn.fd39, szLine, lIdx, 6);	
+		IBoxcpy(stTxn.ibox41, szLine, lIdx, 15);	
+		IBoxcpy(stTxn.fd41, szLine, lIdx, 15);	
+		IBoxcpy(stTxn.ibox42, szLine, lIdx, 25);	
+		IBoxcpy(stTxn.fd42, szLine, lIdx, 15);	
+		IBoxcpy(stTxn.ibox43, szLine, lIdx, 200);	
+		IBoxcpy(stTxn.fd43, szLine, lIdx, 60);	
+		IBoxcpy(stTxn.fd49, szLine, lIdx, 3);	
+		IBoxcpy(stTxn.fd60, szLine, lIdx, 100);	
+		IBoxcpy(stTxn.fd100, szLine, lIdx, 11);	
+		IBoxcpy(stTxn.fd102, szLine, lIdx, 28);	
+		IBoxcpy(stTxn.fd103, szLine, lIdx, 28);	
+		IBoxtol(stTxn.fdx, szTemp, szLine, lIdx, 16);
+		IBoxcpy(stTxn.fdxx, szLine, lIdx, 32);	
+		IBoxcpy(stTxn.fdxxx, szLine, lIdx, 128);	
+		IBoxtol(stTxn.expand, szTemp, szLine, lIdx, 16);
+		IBoxcpy(stTxn.ibox_batch_no, szLine, lIdx, 6);	
+		IBoxcpy(stTxn.servetype, szLine, lIdx, 4);	
+		IBoxtol(stTxn.promtsid, szTemp, szLine, lIdx, 16);	
+		IBoxcpy(stTxn.promtsmode, szLine, lIdx, 4);	
+		IBoxtof(stTxn.promtsvalue, szTemp, szLine, lIdx, 16);	
+		IBoxcpy(stTxn.fd62, szLine, lIdx, 128);	
+		IBoxcpy(stTxn.settlemode, szLine, lIdx, 4); 
+
+		//	状态使消费类交易并且状态为交易成功的，初始化状态，参加对账
+		if(!memcmp(stTxn.cups_no, "sqpy", 4) || !memcmp(stTxn.cups_no, "vway", 4))  //  在社区001未上线之前， 全部置9
+			stTxn.result_flag[0] = '9';
+		else if('0' == stTxn.stat[0] && 
+			(!memcmp(stTxn.tx_sub_code, "31", 2) || !memcmp(stTxn.tx_sub_code, "51", 2) || !memcmp(stTxn.tx_sub_code, "90", 2)))
+			stTxn.result_flag[0] = TRADE_TXN_INIT;
+		else	
+			stTxn.result_flag[0] = '9';
+
+		//	PK唯一键值	  */
+		snprintf(stTxn.id, sizeof(stTxn.id), "%s%s", stTxn.tx_date, stTxn.trace_no);
+		iRet = nGetCupKey(stTxn.cups_no, &stTxn);
+		if(iRet)
+		{
+			fclose(fp);
+			EXEC SQL ROLLBACK WORK;
+			HtLog(ERR_PARAM, "获取渠道(%s)对应Key失败, err(%d)(%s)", stTxn.cups_no, iRet, stTxn.id);
+			return RC_FAIL;   
+		}
+
+//		执行本个步骤时，内存还没初始化
+//		vGetUserInfo(&stTxn, NULL);
+
+		EXEC SQL INSERT INTO TBL_TXN_SUCC VALUES (:stTxn);
+		if(SQLCODE)
+		{			 
+			fclose(fp);
+			HtLog(ERR_PARAM, "新增TBL_TXN_SUCC本地流水表失败, err:(%d)(%s) Key(%s)ID(%s)", SQLCODE, 
+				sDbsError(), stTxn.cup_key, stTxn.id);
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;   
+		}
+		
+		if(0 == ++ lCount % 1000)
+			EXEC SQL COMMIT WORK;
+
+		memset(szLine, 0, sizeof(szLine));
+	}
+	fclose(fp);
+	EXEC SQL COMMIT WORK;
+	HtLog(NML_PARAM, "对(%s)装载成功, 有效记录数(%d)", pszStlmNum, lCount);
+
+//目前没有order_inf 易石 交易
+return RC_SUCC;
+
+
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "%s/ORDER%s.txt", getenv("POSP_FILE_PATH"), pszSettleDate);
+	HtLog(NML_PARAM, "开始装载(%s)交易订单流水:日期(%s)文件名(%s)", pszStlmNum, pszSettleDate, szFile);
+	if(NULL == (fp = fopen(szFile, "rb")))
+	{
+		HtLog(ERR_PARAM, "打开订单文件(%s)失败, err(%s)", szFile, strerror(errno));
+		return RC_FAIL;
+	}
+
+	lCount = 0;
+	while(fgets(szLine, RECORD_LEN_MAX - 1, fp) != NULL)
+	{   
+		if(strlen(szLine) <= 2)
+			 continue;
+
+		lCount ++;
+		lIdx = 0;
+		memset(&stOrder, 0, sizeof(stOrder));	
+		memcpy(stOrder.order_no_out, szLine + lIdx, 30);			lIdx += 30;	
+		sTrimAll(stOrder.order_no_out);
+
+		memcpy(stOrder.order_no_out, szLine + lIdx, 20);			lIdx += 20;	
+		sTrimAll(stOrder.order_no);
+
+		memset(szTemp, 0, sizeof(szTemp));
+		memcpy(szTemp, szLine + lIdx, 18);							lIdx += 18;	
+		sTrimAll(szTemp);
+		stOrder.order_money = atof(szTemp);	
+
+		memcpy(stOrder.stat, szLine + lIdx, 1);						lIdx += 1;	
+		memcpy(stOrder.term_no, szLine + lIdx, 15);					lIdx += 15;	
+		sTrimAll(stOrder.term_no);
+
+		memcpy(stOrder.brh_no, szLine + lIdx, 20);					lIdx += 20;	
+		sTrimAll(stOrder.brh_no);
+
+		memcpy(stOrder.brh_no, szLine + lIdx, 25);					lIdx += 25;	
+		sTrimAll(stOrder.mcht_no);
+
+		memcpy(stOrder.mcht_nm, szLine + lIdx, 160);				lIdx += 160;	
+		sTrimAll(stOrder.mcht_nm);
+
+		iRet = Tbl_order_inf_Ins(&stOrder);
+		if(iRet)
+		{			 
+			fclose(fp);
+			EXEC SQL ROLLBACK WORK;
+			HtLog(ERR_PARAM, "insert Tbl_order_inf err:(%d)(%s) order_out(%s)order(%s)", iRet, sDbsError(), 
+				stOrder.order_no_out, stOrder.order_no);
+			return RC_FAIL;   
+		}
+		
+		if(0 == lCount % 1000)
+			EXEC SQL COMMIT WORK;
+
+		memset(szLine, 0, sizeof(szLine));
+	}
+	fclose(fp);
+	EXEC SQL COMMIT WORK;
+	HtLog(NML_PARAM, "对(%s)装载成功, 有效记录数(%d)", pszStlmNum, lCount);
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ：int nCheckMchtInfo(char *pszMchtNo, char *pszId, char *pszFlag)		*/
+/*   功能  ：检查商户状态更改差错字段											   */
+/*  返回值 ：RC_SUCC		--  成功												*/
+/*		   RC_FAIL		--  失败												*/
+/************************************************************************************/
+int	 nCheckMchtInfo(char *pszMchtNo, char *pszId, char *pszFlag)
+{
+	long		lRet = 0;
+	dbMchtBase  stBase;
+
+	memset(&stBase, 0, sizeof(stBase));
+	lRet = lGetMchtBase(&stBase, pszMchtNo);
+	if(lRet && RC_NOTFOUND != lRet)
+	{
+		HtLog(ERR_PARAM, "获取商户(%s)信息失败, err:(%d)(%s)", pszMchtNo,
+			lRet, sGetError());
+		return RC_FAIL;
+	}
+	else if(RC_NOTFOUND == lRet)		//  找不到商户信息
+	{
+		HtLog(NML_PARAM, "警告:流水(%s)找不到商户(%s)相关信息, 直接放入差错表!",
+			pszId, pszMchtNo);
+		pszFlag[0] = ERR_CUP_MCHT_UNUSUAL;
+	}
+	else		//  找到
+	{
+		//  如果商户是非正常状态
+		if('0' != stBase.mcht_status[0] && '2' != stBase.mcht_status[0] &&
+			'5' != stBase.mcht_status[0])
+		{
+			HtLog(NML_PARAM, "警告:流水(%s)商户(%s)状态(%s)异常, 直接放入差错表!",
+				pszId, pszMchtNo, stBase.mcht_status);
+			pszFlag[0] = ERR_CUP_MCHT_UNNORMAL;
+		}
+		else
+			pszFlag[0] = ERR_CUP_MCHT_OK;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ：void  vFillStlmErr(TStlmSucc *pstSucc, TStlmSucc  *pstSucc)			*/
+/*   功能  ：用本地交易表填充对账差错表结构											*/
+/*  返回值 ：RC_SUCC	--  成功													*/
+/*		   RC_FAIL	--  失败														*/
+/************************************************************************************/
+void	vFillStlmErr(TStlmErr *pstErr, TStlmSucc *pstSucc)
+{
+	memcpy(pstErr->id, pstSucc->id, sizeof(pstErr->id) - 1);
+	memcpy(pstErr->tx_date, pstSucc->tx_date, 8);
+	memcpy(pstErr->tx_time, pstSucc->tx_time, 8);
+	memcpy(pstErr->cups_no, pstSucc->cups_no, sizeof(pstErr->cups_no) - 1);
+	memcpy(pstErr->trace_no, pstSucc->trace_no, sizeof(pstErr->trace_no) - 1);
+	memcpy(pstErr->ac_no, pstSucc->ac_no, sizeof(pstErr->ac_no) - 1);
+	memcpy(pstErr->ac_bank_no, pstSucc->ac_bank_no, sizeof(pstErr->ac_bank_no) - 1);
+	memcpy(pstErr->tx_code, pstSucc->tx_code, sizeof(pstSucc->tx_code) - 1);
+	memcpy(pstErr->tx_name, pstSucc->tx_name, sizeof(pstSucc->tx_name) - 1);
+	memcpy(pstErr->tx_sub_code, pstSucc->tx_sub_code, sizeof(pstErr->tx_sub_code) - 1);
+	pstErr->ac_type = pstSucc->ac_type;
+	pstErr->disc_cycle = pstSucc->disc_cycle;
+	pstErr->user_id = pstSucc->user_id;
+	pstErr->expand = pstSucc->expand;
+	memcpy(pstErr->brno, pstSucc->brno, sizeof(pstErr->brno) - 1);
+	memcpy(pstErr->ibox_no, pstSucc->ibox_no, sizeof(pstErr->ibox_no) - 1);
+	memcpy(pstErr->order_no, pstSucc->order_no, sizeof(pstErr->order_no) - 1);
+	memcpy(pstErr->longitude, pstSucc->longitude, sizeof(pstErr->longitude) - 1);
+	memcpy(pstErr->latitude, pstSucc->latitude, sizeof(pstErr->latitude) - 1);
+	memcpy(pstErr->ibox41, pstSucc->ibox41, sizeof(pstErr->ibox41) - 1);
+	memcpy(pstErr->ibox42, pstSucc->ibox42, sizeof(pstErr->ibox42) - 1);
+	memcpy(pstErr->ibox43, pstSucc->ibox43, sizeof(pstErr->ibox43) - 1);
+	memcpy(pstErr->fd41, pstSucc->fd41, sizeof(pstErr->fd41) - 1);
+	memcpy(pstErr->fd42, pstSucc->fd42, sizeof(pstErr->fd42) - 1);
+	memcpy(pstErr->fd43, pstSucc->fd43, sizeof(pstErr->fd43) - 1);
+	memcpy(pstErr->settlemode, pstSucc->settlemode, sizeof(pstErr->settlemode) - 1);
+	pstErr->fdx = pstSucc->fdx;
+	pstErr->local_amt = pstSucc->tx_amt;
+	memcpy(pstErr->fdxx, pstSucc->fdxx, sizeof(pstErr->fdxx) - 1);
+	memcpy(pstErr->fdxxx, pstSucc->fdxxx, sizeof(pstErr->fdxxx) - 1);
+}
+
+/************************************************************************************/
+/*   声明  ： void vGetRedunData													*/
+/*   功能  ： 填充用户信息冗余数据													*/
+/*  返回值 ： 无 																	*/
+/************************************************************************************/
+void	vGetRedunData(TStlmSucc *pstSucc)
+{
+	dbBrhInfo	stBrh;
+	dbOprInf	stOprIf;
+	
+	memset(&stBrh, 0, sizeof(stBrh));
+	memset(&stOprIf, 0, sizeof(stOprIf));
+
+	//  无论是否获取成功，都不报错
+	if(RC_SUCC == lGetOprInfo(&stOprIf, pstSucc->expand))
+		memcpy(pstSucc->expand_name, stOprIf.opr_name,  sizeof(pstSucc->expand_name) - 1);
+	else
+		HtLog(ERR_PARAM, "警告:获取商户(%s)用户(%d)数据失败, err:%s", pstSucc->ibox42,
+			pstSucc->expand, sGetError());
+
+	//  无论是否获取成功，都不报错
+	if(RC_SUCC == lGetBrhInfo(&stBrh, pstSucc->brno))
+		memcpy(pstSucc->trade_brh_name, stBrh.brh_name,  sizeof(pstSucc->trade_brh_name) - 1);
+	else
+		HtLog(ERR_PARAM, "警告:获取商户(%s)机构(%s)数据失败, err:%s", pstSucc->ibox42,
+			pstSucc->brno, sGetError());
+
+	return ;
+}
+
+/************************************************************************************/
+/*   声明  ： int nInitStlmErr														*/
+/*   功能  ： 将记录入差错表														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nInitStlmErr(TStlmSucc *pstSucc, char *pszStlmNum, char *pszLoadDate)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TStlmErr	stError;	
+	EXEC SQL END DECLARE SECTION;
+	char		szType[2];
+
+	memset(szType, 0, sizeof(szType));
+	memset(&stError, 0, sizeof(stError));
+
+	if(RC_SUCC != nCheckMchtInfo(pstSucc->ibox42, pstSucc->id, szType))
+	{
+		HtLog(ERR_PARAM, "检查商户(%s)信息失败!", pstSucc->ibox42);
+		return RC_FAIL;
+	}
+
+	if(ERR_CUP_MCHT_OK == szType[0])
+		return RC_SUCC;
+
+	vFillStlmErr(&stError, pstSucc);
+	vGetUserInfo(NULL, &stError);
+
+	pstSucc->result_flag[0] = STLM_SUCC_FLG_ERR;
+	//	填充差错表数据，加入差错表
+	memcpy(stError.load_date, pszLoadDate, sizeof(stError.load_date) - 1);
+	//	批次序号，商户自助查询用
+	memcpy(stError.settle_num, pszStlmNum, sizeof(stError.settle_num) - 1);	
+	stError.tx_amt = pstSucc->tx_amt; 
+	stError.cup_fee = pstSucc->cup_fee;
+	memcpy(stError.sys_ref_no, pstSucc->fd37, sizeof(stError.sys_ref_no) - 1);
+	stError.result_flag[0] = STLM_CUP_NOT_DEAL;
+	stError.err_type[0] = szType[0];
+	stError.stlm_type[0] = 0x00;								// 未对账置空
+	strcpy(stError.tx_name, "POS消费");
+	memcpy(stError.rec_crt_ts, sGetCurrentTime(), sizeof(stError.rec_crt_ts) - 1);
+	memcpy(stError.brh_name, pstSucc->trade_brh_name, sizeof(stError.brh_name) - 1);
+	memcpy(stError.expand_name, pstSucc->expand_name, sizeof(stError.expand_name) - 1);
+
+	//插入"对帐不平明细表"
+	EXEC SQL INSERT INTO TBL_STLM_ERR VALUES (:stError);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增差错交易流水失败, err:(%d)(%s)(%s)", SQLCODE, sDbsError(), 	
+			pstSucc->id);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCheckMchtBase													*/
+/*   功能  ： 从卸载的本地流水文件装载到交易表中									*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			 RC_FAIL	--  失败													*/
+/************************************************************************************/
+int  nCheckMchtBase(TStlmSucc *pstSucc, char *pszLoadDate, char *pszStlmNum)
+{
+	int			iRet = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szSettleNum[5], szLoadDate[9], szId[23], szTemp[23];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szId, 0, sizeof(szId));
+	memset(szTemp, 0, sizeof(szTemp));
+	
+	memcpy(szId, pstSucc->id, sizeof(szId) - 1);
+	EXEC SQL SELECT NVL(ID, ' ') INTO :szTemp FROM TBL_STLM_ERR WHERE ID = :szId;
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "查询TBL_STLM_ERR记录失败, err(%d)(%s), id(%s)", iRet, sGetError(), 
+			pstSucc->id);
+		return RC_FAIL;
+	}
+	else if(SQLOK)
+	{
+		HtLog(NML_PARAM, "流水(%s)在差错表中已存在, 直接更新必要字段", szId);
+
+		memset(szLoadDate, 0, sizeof(szLoadDate));
+		memset(szSettleNum, 0, sizeof(szSettleNum));
+		memcpy(szLoadDate, pszLoadDate, 8);
+		memcpy(szSettleNum, szSettleNum, 4);
+
+		EXEC SQL UPDATE TBL_STLM_ERR 
+			SET SETTLE_NUM = :szSettleNum, 
+			LOAD_DATE = :szLoadDate
+		WHERE ID = :szId;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新交易差错表失败, err:(%d)(%s)(%s)", iRet, sDbsError(), szId);
+			return RC_FAIL;
+		}
+		
+		pstSucc->result_flag[0] = STLM_SUCC_FLG_ERR;
+
+		return RC_SUCC;
+	}
+	else	//	  DBS_NOTFOUND == iRet	
+		;
+
+	return	nInitStlmErr(pstSucc, pszStlmNum, pszLoadDate);
+}
+
+/************************************************************************************/
+/*   声明  ： int nLoadToTxnSucc													*/
+/*   功能  ： 从卸载的本地流水文件装载到交易表中									*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int	nLoadToStlmSucc(char *pszStlmNum, char *pszSettleDate)
+{
+	int	 iRet = 0, lIdx = 0, lCount = 0;
+	char	szFile[512];
+	char	szLine[RECORD_LEN_MAX], szTemp[200], szExpand[15];
+	char	szTXAmt[13], szFeeAmt[13], szCupsFee[13];
+	char	szUserId[25], szDiscCycle[25], szType[25], szBack[25];
+	FILE	*fp = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TStlmSucc	stSucc; 
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "%s/TBLNTXT%s_%s.txt", getenv("POSP_FILE_PATH"), 
+		pszSettleDate, pszStlmNum);
+	
+	HtLog(NML_PARAM, "开始装载(%s)成功交易流水:日期(%s)文件名[%s]", pszStlmNum, 
+		pszSettleDate, szFile);
+	if(NULL == (fp = fopen(szFile, "rb")))
+	{
+		HtLog(ERR_PARAM, "打开文件批次(%s)文件(%s)失败, err:(%d)(%s)!", pszStlmNum, szFile,
+			errno, strerror(errno));
+		return RC_FAIL;
+	}
+
+	//	T+0装载考虑在一个事务里面，考虑T+0不会很多，又不容易重跑
+	memset(szLine, 0, sizeof(szLine));
+	while(fgets(szLine, RECORD_LEN_MAX-1, fp) != NULL)
+	{   
+		if(strlen(szFile) <= 2)
+			 continue;
+
+		lCount ++;
+		lIdx = 0;
+		memset(&stSucc, 0, sizeof(stSucc));	
+		memcpy(stSucc.stlm_date, pszSettleDate, 8);
+		IBoxcpy(stSucc.tx_date, szLine, lIdx, 8);
+		IBoxcpy(stSucc.tx_time, szLine, lIdx, 10);
+		IBoxcpy(stSucc.trace_no, szLine, lIdx, 12);
+		IBoxcpy(stSucc.ibox_no, szLine, lIdx, 24);
+		IBoxcpy(stSucc.order_no, szLine, lIdx, 20);
+		IBoxcpy(stSucc.cups_no, szLine, lIdx, 4);
+		IBoxcpy(stSucc.ac_no, szLine, lIdx, 19);
+
+		IBoxtol(stSucc.user_id, szTemp, szLine, lIdx, 16);
+		IBoxtol(stSucc.disc_cycle, szTemp, szLine, lIdx, 16);
+		IBoxtol(stSucc.ac_type, szTemp, szLine, lIdx, 16);
+		IBoxcpy(stSucc.ac_bank_no, szLine, lIdx, 15);
+
+		IBoxtof(stSucc.tx_amt, szTemp, szLine, lIdx, 16);
+		IBoxtof(stSucc.fee_amt, szTemp, szLine, lIdx, 16);
+		IBoxtof(stSucc.cup_fee, szTemp, szLine, lIdx, 16);
+
+//		stSucc.re_tx_amt = atof(szTemp);
+		lIdx += 16;
+		IBoxcpy(stSucc.tx_code, szLine, lIdx, 20);
+		IBoxcpy(stSucc.tx_sub_code, szLine, lIdx, 20);
+		IBoxcpy(stSucc.brno, szLine, lIdx, 20);
+		IBoxcpy(stSucc.longitude, szLine, lIdx, 20);
+		IBoxcpy(stSucc.latitude, szLine, lIdx, 20);
+		IBoxcpy(stSucc.sw_respcd, szLine, lIdx, 8);
+		IBoxcpy(stSucc.ibox_respcd, szLine, lIdx, 8);
+
+//		memcpy(stSucc.stat, szLine + lIdx, 1);	lIdx += 1;
+		lIdx += 1;
+//		memcpy(stSucc.brf, szLine + lIdx, 60);	lIdx += 60;
+		lIdx += 60;
+//		memcpy(stSucc.fill, szLine + lIdx, 60);	lIdx += 60;
+		lIdx += 60;
+		IBoxcpy(stSucc.fd3, szLine, lIdx, 6);
+		IBoxcpy(stSucc.fd7, szLine, lIdx, 10);
+		IBoxcpy(stSucc.ibox11, szLine, lIdx, 6);
+		IBoxcpy(stSucc.fd11, szLine, lIdx, 6);
+		IBoxcpy(stSucc.fd12, szLine, lIdx, 6);
+		IBoxcpy(stSucc.fd13, szLine, lIdx, 4);
+		IBoxcpy(stSucc.fd15, szLine, lIdx, 4);
+		IBoxcpy(stSucc.ibox18, szLine, lIdx, 4);
+		IBoxcpy(stSucc.fd28, szLine, lIdx, 9);
+		IBoxcpy(stSucc.fd37, szLine, lIdx, 12);
+		IBoxcpy(stSucc.fd38, szLine, lIdx, 6);
+		IBoxcpy(stSucc.fd39, szLine, lIdx, 6);
+		IBoxcpy(stSucc.ibox41, szLine, lIdx, 15);
+		IBoxcpy(stSucc.fd41, szLine, lIdx, 15);
+		IBoxcpy(stSucc.ibox42, szLine, lIdx, 25);
+		IBoxcpy(stSucc.fd42, szLine, lIdx, 15);
+		IBoxcpy(stSucc.ibox43, szLine, lIdx, 200);
+		IBoxcpy(stSucc.fd43, szLine, lIdx, 60);
+		IBoxcpy(stSucc.fd49, szLine, lIdx, 3);
+		IBoxcpy(stSucc.fd60, szLine, lIdx, 100);
+		IBoxcpy(stSucc.fd100, szLine, lIdx, 11);
+		IBoxcpy(stSucc.fd102, szLine, lIdx, 28);
+		IBoxcpy(stSucc.fd103, szLine, lIdx, 28);
+		IBoxtol(stSucc.fdx, szTemp, szLine, lIdx, 16);
+		IBoxcpy(stSucc.fdxx, szLine, lIdx, 32);
+		IBoxcpy(stSucc.fdxxx, szLine, lIdx, 128);
+		IBoxtol(stSucc.expand, szTemp, szLine, lIdx, 16);
+
+		IBoxcpy(stSucc.servetype, szLine, lIdx, 4); 
+		IBoxtol(stSucc.promtsid, szTemp, szLine, lIdx, 16);
+		IBoxcpy(stSucc.promtsmode, szLine, lIdx, 4); 
+		IBoxtol(stSucc.promtsvalue, szTemp, szLine, lIdx, 16);
+
+		IBoxcpy(stSucc.settlemode, szLine, lIdx, 4); 
+		memset(stSucc.settlemode, 0, sizeof(stSucc.settlemode));	//	置空
+
+		strcpy(stSucc.tx_name, "POS消费");
+		stSucc.result_flag[0] = STLM_SUCC_FLG_INIT;
+
+		snprintf(stSucc.id, sizeof(stSucc.id), "%s%s", stSucc.tx_date, stSucc.trace_no);
+
+		//	新增冗余字段
+		vGetRedunData(&stSucc);
+
+		//  加入风控和手工延迟
+		iRet = nCheckMchtBase(&stSucc, pszSettleDate, pszStlmNum);
+		if(iRet)
+		{			 
+			fclose(fp);
+			EXEC SQL ROLLBACK WORK;
+			HtLog(ERR_PARAM, "检查该笔记录是否延迟失败, err:(%d)!", iRet);
+			return RC_FAIL;   
+		}
+		
+		memcpy(stSucc.rec_crt_ts, sGetCurrentTime(), sizeof(stSucc.rec_crt_ts) - 1);
+
+		EXEC SQL INSERT INTO TBL_STLM_SUCC VALUES (:stSucc);
+		if(SQLCODE)
+		{			 
+			fclose(fp);
+			HtLog(ERR_PARAM, "新增成功表流水失败, err:(%d)(%s) id(%s)", SQLCODE, 
+				sDbsError(), stSucc.id);
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;   
+		}
+
+		memset(szLine, 0, sizeof(szLine));
+	}
+	fclose(fp);
+	EXEC SQL COMMIT WORK;
+	HtLog(NML_PARAM, "对(%s)装载成功, 有效记录数(%d)", pszStlmNum, lCount);
+	
+	return RC_SUCC;	
+}
+
+/************************************************************************************/
+/*   函数名：					   装载本地流水主函数								*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)											 	*/
+/*		   ： argv (参数列表 -- 输出)												*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		main(int argc, char **argv) 
+{
+	int		iRet = 0;
+	char	szToDay[9], szDate[9], szSettleNum[5];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "LoadTxnFile.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "开始装载(%s)流水数据", argv[2]);
+	memset(szDate, 0, sizeof(szDate));
+	memset(szToDay, 0, sizeof(szToDay));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	memcpy(szToDay, argv[1], 8);
+	memcpy(szSettleNum, argv[2], 4);
+	memcpy(szDate, sGetChgDate(szToDay, -1), 8);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "DbsConnect err:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	if(!memcmp(szSettleNum, "TN00", 4))	
+		iRet = nLoadToTxnSucc(szSettleNum, szDate);
+	else
+		iRet = nLoadToStlmSucc(szSettleNum, szToDay);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "装载批次(%s)流水文件失败, err:(%d)", szSettleNum, iRet);
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();
+	HtLog(NML_PARAM, "开始装载流水数据完毕！");
+
+	return RC_SUCC;
+}

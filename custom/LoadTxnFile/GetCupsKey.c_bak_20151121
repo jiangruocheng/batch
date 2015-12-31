@@ -1,0 +1,924 @@
+/*****************************************************************
+*文 件 名: LoadTxnfile.c
+*备	注:
+******************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+typedef struct _CUPSKEYFUN
+{
+	char	szCupsNo[20];
+	int		(*pfCupsKeyFun)(TTxnSucc *pstTxn);
+	char	szCupsDes[100];
+}KeyFunc;
+
+int		nIboxLocalLoad(TTxnSucc *pszTxnSucc);
+int		nCilkLocalLoad(TTxnSucc *pszTxnSucc);
+int		nSpdbLocalLoad(TTxnSucc *pszTxnSucc);
+int		nTftpLocalLoad(TTxnSucc *pszTxnSucc);
+int		nHxbpLocalLoad(TTxnSucc *pszTxnSucc);
+int		nBillLocalLoad(TTxnSucc *pszTxnSucc);
+int		nUmpyLocalLoad(TTxnSucc *pszTxnSucc);
+int		nHkrtLocalLoad(TTxnSucc *pszTxnSucc);
+int		nCofpLocalLoad(TTxnSucc *pszTxnSucc);
+int		nSqpyLocalLoad(TTxnSucc *pszTxnSucc);
+int		nCupsLocalLoad(TTxnSucc *pszTxnSucc);
+int		nCntpLocalLoad(TTxnSucc *pszTxnSucc);
+int		nCmspLocalLoad(TTxnSucc *pszTxnSucc);
+int		nScupLocalLoad(TTxnSucc *pszTxnSucc);
+int		nAlpyLocalLoad(TTxnSucc *pszTxnSucc);
+int		nJzdkLocalLoad(TTxnSucc *pszTxnSucc);
+int		nWchtLocalLoad(TTxnSucc *pszTxnSucc);
+int		nCpnrLocalLoad(TTxnSucc *pszTxnSucc);
+int		nBjysLocalLoad(TTxnSucc *pszTxnSucc);
+int		nHkubLocalLoad(TTxnSucc *pszTxnSucc);
+int		nWfjpLocalLoad(TTxnSucc *pszTxnSucc);
+int		nRyxpLocalLoad(TTxnSucc *pszTxnSucc);
+int		nYsepLocalLoad(TTxnSucc *pszTxnSucc);
+int		nTlpyLocalLoad(TTxnSucc *pszTxnSucc); 
+int		nHdsyLocalLoad(TTxnSucc *pszTxnSucc); 
+
+KeyFunc g_KeyFun[] = {
+		{"ibox",  nIboxLocalLoad, "公用对账生成Key值方法"},
+		{"cilk",  nCilkLocalLoad, "组织讯连对账KEY值"},
+		{"spdb",  nSpdbLocalLoad, "组织浦发对账KEY值"},
+		{"tftp",  nTftpLocalLoad, "组织腾付通对账KEY值"},
+		{"hxbp",  nHxbpLocalLoad, "组织翰鑫对账KEY值"},
+		{"hxnp",  nHxbpLocalLoad, "组织翰鑫新平台对账KEY值"},
+		{"bill",  nBillLocalLoad, "组织快钱对账KEY值"},
+		{"umpy",  nUmpyLocalLoad, "组织联动优势对账KEY值"},
+		{"hkrt",  nHkrtLocalLoad, "组织海科融通对账KEY值"},
+		{"cofp",  nCofpLocalLoad, "组织卡富通对账KEY值"},
+		{"sqpy",  nSqpyLocalLoad, "组织社区001对账KEY值"},
+		{"cups",  nCupsLocalLoad, "组织多渠道对账KEY值"},
+		{"cntp",  nCntpLocalLoad, "组织银视通对账KEY值"},
+		{"cmsp",  nCmspLocalLoad, "组织cmsp对账KEY值"},
+		{"scup",  nScupLocalLoad, "组织scup对账KEY值"},
+		{"alpy",  nAlpyLocalLoad, "组织支付宝对账KEY值"},
+		{"jzdk",  nJzdkLocalLoad, "组织卡宾对账KEY值"},
+		{"wcht",  nWchtLocalLoad, "组织微信对账KEY值"},
+		{"cpnr",  nCpnrLocalLoad, "组织汇付对账KEY值"},
+		{"xcpy",  nCpnrLocalLoad, "组织汇付对账KEY值"},
+		{"xcpa",  nCpnrLocalLoad, "组织汇付对账KEY值"},
+		{"bjys",  nBjysLocalLoad, "组织北京银商对账KEY值"},
+		{"bjnp",  nBjysLocalLoad, "组织北京银商对账KEY值"},
+		{"hkub",  nHkubLocalLoad, "组织海商对账KEY值"},
+		{"wfjp",  nWfjpLocalLoad, "组织王府井KEY值"},
+		{"ryxp",  nRyxpLocalLoad, "组织瑞银信对账KEY值"},
+		{"ysep",  nYsepLocalLoad, "组织银盛支付对账KEY值"},
+		{"tlpy",  nTlpyLocalLoad, "组织通联支付KEY值"},
+		{"hdsy",  nHdsyLocalLoad, "组织宏达上叶KEY值"},
+		{"wfjn",  nWfjpLocalLoad, "组织王府井新平台KEY值"}
+};
+
+/************************************************************************************/
+/*   声明  ： int nGetCupKey														*/
+/*   功能  ： 调用对应渠道的生成Key值												*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGetCupKey(char *pszCupsNo, TTxnSucc *pstTxn)
+{
+	int		 i = 0, lFlag = 0;
+
+	if(TRADE_TXN_INIT != pstTxn->result_flag[0])
+		return RC_SUCC;
+
+	for(i = 0; i < sizeof(g_KeyFun)/sizeof(KeyFunc); i ++)
+	{
+		if(!memcmp(g_KeyFun[i].szCupsNo, pszCupsNo, strlen(pszCupsNo)))
+			return g_KeyFun[i].pfCupsKeyFun(pstTxn);
+	}
+
+	HtLog(ERR_PARAM, "渠道(%s)对账CUP_KEY未定义生成方法, 默认公用渠道方法(%s)。", 
+		pstTxn->cups_no, IBP_COM_CUPSNO);
+
+	return nIboxLocalLoad(pstTxn);
+}
+
+/************************************************************************************/
+/*   声明  ： int nIboxLocalLoad 													*/
+/*   功能  ： 组织公用对账CUP_KEY													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nIboxLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	if(!strlen(pstTxn->tx_date) || !strlen(pstTxn->fd13) || 
+		!strlen(pstTxn->cups_no) || !strlen(pstTxn->fd11))
+	{
+		
+		HtLog(ERR_PARAM, "参数错误(%s)(%s)(%s)!", pstTxn->fd13, 
+			pstTxn->fd11, pstTxn->cups_no);
+		return RC_FAIL;
+	}
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no, 
+		szDate, pstTxn->fd11); 
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCntpLocalLoad													*/
+/*   功能  ： 组织银视通对账CUP_KEY													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nCntpLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no, 
+		szDate, pstTxn->fd11); 
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCntpLocalLoad													*/
+/*   功能  ： 组织讯连对账CUP_KEY												   	*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int nCilkLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no, 
+		szDate, pstTxn->fd11); 
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nSpdbLocalLoad													*/
+/*   功能  ： 组织浦发对账CUP_KEY												 	*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int nSpdbLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no, 
+		szDate, pstTxn->fd11); 
+	return RC_SUCC;
+}
+/************************************************************************************/
+/*   声明  ： int nHxbpLocalLoad													*/
+/*   功能  ： 组织对账CUP_KEY														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int nTftpLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	} 
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no, 
+		szDate, pstTxn->fd11); 
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nHxbpLocalLoad													*/
+/*   功能  ： 组织对账CUP_KEY														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int nHxbpLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nHxbpLocalLoad													*/
+/*   功能  ： 组织对账CUP_KEY														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int nHxnpLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nSqpyLocalLoad													*/
+/*   功能  ： 组织多渠道对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nSqpyLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCupsLocalLoad													*/
+/*   功能  ： 组织多渠道对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nCupsLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nBillLocalLoad													*/
+/*   功能  ： 组织快钱对账KEY值														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nBillLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nUmpyLocalLoad													*/
+/*   功能  ： 组织联动优势对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nUmpyLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nHkrtLocalLoad													*/
+/*   功能  ： 组织海科融通对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nHkrtLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCofpLocalLoad													*/
+/*   功能  ： 组织卡富通对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nCofpLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCpnrLocalLoad													*/
+/*   功能  ： 组织卡富通对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nCpnrLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nXcpyLocalLoad													*/
+/*   功能  ： 组织轩宸对账KEY值												   		*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nXcpyLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nBjysLocalLoad													*/
+/*   功能  ： 组织北京银商对账KEY值												 	*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nBjysLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+//	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+//		szDate, pstTxn->fd11);
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key),"%s", pstTxn->fd62);
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nHkubLocalLoad													*/
+/*   功能  ： 海口银行cup_key构造													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nHkubLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nWfjpLocalLoad													*/
+/*   功能  ： 王府井cup_key构造														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nWfjpLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nRyxpLocalLoad													*/
+/*   功能  ： 组织瑞银信对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nRyxpLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nYsepLocalLoad													*/
+/*   功能  ： 组织银盛支付对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nYsepLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nTlpyLocalLoad													*/
+/*   功能  ： 组织通连KEY															*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nTlpyLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nHdsyLocalLoad													*/
+/*   功能  ： 组织宏达上业对帐标示													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nHdsyLocalLoad(TTxnSucc *pstTxn)
+{
+	char	szDate[10];
+	int		nYear;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pstTxn->tx_date, 4);	 //  本地年份
+	nYear = atoi(szDate);
+
+	// 以他们真实交易日期为准
+	if(0 == memcmp(pstTxn->tx_date + 4, "1231", 4) && 0 == memcmp(pstTxn->fd13, "0101", 4))
+	{
+		nYear ++;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else if(0 == memcmp(pstTxn->tx_date + 4, "0101", 4) && 0 == memcmp(pstTxn->fd13, "1231", 4))
+	{
+		nYear --;
+		snprintf(szDate, sizeof(szDate), "%d%s", nYear, pstTxn->fd13);
+	}
+	else
+		memcpy(szDate + 4, pstTxn->fd13, 4);
+
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s000000%s", pstTxn->cups_no,
+		szDate, pstTxn->fd11);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nJzdkLocalLoad													*/
+/*   功能  ： 组织卡宾对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nJzdkLocalLoad(TTxnSucc *pstTxn)
+{
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s", pstTxn->cups_no,
+		pstTxn->order_no);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nAlpyLocalLoad													*/
+/*   功能  ： 组织卡富通对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nAlpyLocalLoad(TTxnSucc *pstTxn)
+{
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s", pstTxn->cups_no,
+		pstTxn->order_no);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nWchtLocalLoad													*/
+/*   功能  ： 组织微信支付对账KEY值													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nWchtLocalLoad(TTxnSucc *pstTxn)
+{
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s", pstTxn->cups_no,
+		pstTxn->order_no);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCmspLocalLoad													*/
+/*   功能  ： 组织对账CUP_KEY														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int nCmspLocalLoad(TTxnSucc *pstTxn)
+{
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s%s", pstTxn->cups_no, 
+		pstTxn->tx_date, pstTxn->fd37); 
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nScupLocalLoad													*/
+/*   功能  ： 组织CUP_KEY															*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int nScupLocalLoad(TTxnSucc *pstTxn)
+{
+	snprintf(pstTxn->cup_key, sizeof(pstTxn->cup_key), "%s%s%s", pstTxn->cups_no, 
+		pstTxn->tx_date, pstTxn->fd37); 
+	return RC_SUCC;
+}

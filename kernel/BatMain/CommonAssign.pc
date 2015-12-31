@@ -1,0 +1,336 @@
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_bat_task.h"
+EXEC SQL END DECLARE SECTION;
+
+/**************************************************************************
+ * 	分配1个子任务
+ **************************************************************************/
+int		nGen_1_AssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId, int lChdCount)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stTask, 0, sizeof(TBatTask));
+	memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+	memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+	memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1); 
+	memcpy(stTask.matchstr, "*", 1);
+	stTask.task_state[0] = TASK_RUN_STA_PRE;
+	memcpy(stTask.task_id, "  ", 2); 
+	memcpy(stTask.commit_point, "0", 1);
+	memcpy(stTask.fail_point, "0", 1);
+	memcpy(stTask.rec_opr_id, "I", 1);
+	memcpy(stTask.rec_upd_opr, "bat", 3);
+	memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+		
+	EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	} 
+	EXEC SQL COMMIT WORK;
+	
+	return RC_SUCC;
+}
+
+/**************************************************************************
+ * 	分配10个子任务
+ **************************************************************************/
+int		nGen_10_AssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId, int lChdCount)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long		i = 0;
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+
+	for(i = 0; i < 10; i ++)
+	{
+		memset(&stTask, 0x00, sizeof(stTask));
+		memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+		memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+		memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1);
+		snprintf(stTask.matchstr, sizeof(stTask.matchstr), "%d", i);
+		sTrimRight(stTask.matchstr);
+
+		stTask.task_state[0] = TASK_RUN_STA_PRE;
+		memcpy(stTask.task_id, "  ", 2);
+		memcpy(stTask.commit_point, "0", 1);
+		memcpy(stTask.fail_point, "0", 1);
+		memcpy(stTask.rec_opr_id, "I", 1);
+		memcpy(stTask.rec_upd_opr, "bat", 3);
+		memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+
+		EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}
+
+/**************************************************************************
+ * 	分配20个子任务
+ **************************************************************************/
+int  nGen_20_AssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId, int lChdCount)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long		iCount = 0;
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+
+	for(iCount = 0; iCount < 20; iCount ++)
+	{
+		memset(&stTask, 0, sizeof(stTask));
+		memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+		memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+		memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1);
+		snprintf(stTask.matchstr, sizeof(stTask.matchstr), "%d", iCount);
+		stTask.task_state[0] = TASK_RUN_STA_PRE;
+		memcpy(stTask.task_id, "  ", 2);
+		memcpy(stTask.commit_point, "0", 1);
+		memcpy(stTask.fail_point, "0", 1);
+		memcpy(stTask.rec_opr_id, "I", 1);
+		memcpy(stTask.rec_upd_opr, "bat", 3);
+		memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+
+		EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}
+
+/**************************************************************************
+ * 	内存加载任务分配
+ **************************************************************************/
+int nLoadShmAssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId, int lChdCount)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stTask, 0, sizeof(stTask));
+
+	memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+	memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+	memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1); 
+	// cup 装载渠道流水必要内存表数据 all 全部表数据
+	memcpy(stTask.matchstr, "all", 3);
+	stTask.task_state[0] = TASK_RUN_STA_PRE;
+	memcpy(stTask.task_id, "  ", 2); 
+	memcpy(stTask.commit_point, "0", 1);
+	memcpy(stTask.fail_point, "0", 1);
+	memcpy(stTask.rec_opr_id, "I", 1);
+	memcpy(stTask.rec_upd_opr, "bat", 3);
+	memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+		
+	EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	} 
+	EXEC SQL COMMIT WORK;
+	
+	return RC_SUCC;
+}		
+
+/**************************************************************************
+ *  分配计算渠道手续费任务列表
+ **************************************************************************/
+int		nCalacCupAssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId,
+			int lChdCount)
+{
+	int		iRet = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+	CMList	*pstNode = NULL, *pstRoot = NULL;
+
+	if(RC_SUCC != lGroupCupsNo(&pstRoot, 0))
+	{
+		HtLog(ERR_PARAM, "获取渠道列表失败, err:(%s)", sGetError());
+		vDestroyList(pstRoot);
+		return RC_FAIL;
+	}
+
+	pstNode = pstRoot;
+	while(pstNode)
+	{
+		memset(&stTask, 0, sizeof(stTask));
+		memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+		memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+		memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1 );
+		memcpy(stTask.matchstr, (char *)pstNode->pstData, 4);
+		sTrimAll(stTask.matchstr);
+		if(0 == strlen(stTask.matchstr))
+  			return RC_SUCC;
+
+		stTask.task_state[0] = TASK_RUN_STA_PRE;
+		stTask.rec_opr_id[0] = 'I';
+		memcpy(stTask.task_id, "  ", 2);
+		memcpy(stTask.commit_point, "0", 1);
+		memcpy(stTask.fail_point, "0", 1);
+		memcpy(stTask.rec_upd_opr, "bat", sizeof(stTask.rec_upd_opr) - 1);
+		memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+   		
+		EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			return RC_FAIL;
+		} 
+
+   		 pstNode = pstNode->pstNext;
+	}
+	vDestroyList(pstRoot);
+	EXEC SQL COMMIT WORK;
+ 
+	return RC_SUCC;
+}
+
+/**************************************************************************
+ * 	分配对账任务列表
+ **************************************************************************/
+int		nStlmTNAssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId, 
+			int lChdCount)
+{
+	int		iRet = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	long		lCount = 0;
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+	CMList	*pstNode = NULL, *pstRoot = NULL;
+
+	if(RC_SUCC != lGroupCupsNo(&pstRoot, 0))
+	{
+		HtLog(ERR_PARAM, "获取渠道列表失败, err:(%s)", sGetError());
+		vDestroyList(pstRoot);
+		return RC_FAIL;
+	}
+
+	pstNode = pstRoot;
+	while(pstNode)
+	{
+		memset(&stTask, 0, sizeof(stTask));
+		memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+		memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+		memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1 );
+		memcpy(stTask.matchstr, (char *)pstNode->pstData, 4);
+		sTrimAll(stTask.matchstr);
+		if(0 == strlen(stTask.matchstr))
+  			return RC_SUCC;
+
+		EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MCHT_CLEAR WHERE CUPS_NO = :stTask.matchstr;
+		if(lCount > 0)
+		{
+			pstNode = pstNode->pstNext;
+			continue;
+		}	
+
+		stTask.task_state[0] = TASK_RUN_STA_PRE;
+		stTask.rec_opr_id[0] = 'I';
+		memcpy(stTask.task_id, "  ", 2);
+		memcpy(stTask.commit_point, "0", 1);
+		memcpy(stTask.fail_point, "0", 1);
+		memcpy(stTask.rec_upd_opr, "bat", sizeof(stTask.rec_upd_opr) - 1);
+		memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+   		
+		EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			return RC_FAIL;
+		} 
+
+   		 pstNode = pstNode->pstNext;
+	}
+	vDestroyList(pstRoot);
+	EXEC SQL COMMIT WORK;
+ 
+	return RC_SUCC;
+}		
+
+/**************************************************************************
+ * 	分配对账任务列表
+ **************************************************************************/
+int		nStlmTCAssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId, 
+			int lChdCount)
+{
+	int		iRet = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szCupsNo[5];
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL DECLARE Cur_mcht_clear CURSOR FOR SELECT NVL(CUPS_NO, ' ')
+		FROM TBL_MCHT_CLEAR GROUP BY CUPS_NO;
+
+	EXEC SQL OPEN Cur_mcht_clear;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询一清渠道编号失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szCupsNo, 0, sizeof(szCupsNo));
+		EXEC SQL FETCH Cur_mcht_clear INTO :szCupsNo;
+		if(SQLNOTFOUND)
+			break;
+		else if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "查询依赖表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+ 			EXEC SQL CLOSE Cur_mcht_clear;
+			return RC_FAIL;
+		}
+
+		sTrimAll(szCupsNo);
+		if(!strlen(szCupsNo))	continue;
+
+		memset(&stTask, 0, sizeof(stTask));
+		memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+		memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+		memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1);
+		memcpy(stTask.matchstr, szCupsNo, 4);
+   	
+		stTask.task_state[0] = TASK_RUN_STA_PRE;
+		stTask.rec_opr_id[0] = 'I';
+		memcpy(stTask.task_id, "  ", 2);
+		memcpy(stTask.commit_point, "0", 1);
+		memcpy(stTask.fail_point, "0", 1);
+		memcpy(stTask.rec_upd_opr, "bat", sizeof(stTask.rec_upd_opr) - 1);
+		memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+   		
+		EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_clear;
+			return RC_FAIL;
+		} 
+	}
+	EXEC SQL CLOSE Cur_mcht_clear;
+	EXEC SQL COMMIT WORK;
+ 
+	return RC_SUCC;
+}		

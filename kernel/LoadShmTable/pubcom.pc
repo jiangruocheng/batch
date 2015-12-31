@@ -1,0 +1,83 @@
+#include	"load.h"
+
+/****************************************************************************************
+	可用到的public common
+ ****************************************************************************************/
+/****************************************************************************************
+	保存子进程函数
+ ****************************************************************************************/
+long	lSaveProcess(CMList **ppstRoot, long lPid)
+{
+	CMList	*pstList = *ppstRoot;
+
+	pstList = pInsertList(pstList, (void *)&lPid, sizeof(long));
+	if(!pstList)
+	{
+		vDestroyList(pstList);
+		return RC_FAIL;
+	}
+	
+	*ppstRoot = pstList;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	保存子进程函数
+ ****************************************************************************************/
+long	lWaiteProcess(CMList *pstRoot)
+{
+	long	lPid = 0, lStatus = 0, lRet;
+	pid_t	lPr = 0;
+	CMList	*pstNode = pstRoot;
+
+	while(pstNode)
+	{
+		for(memcpy(&lPid, pstNode->pstData, sizeof(lPid));;)
+		{
+			if(-1 == (lPr = waitpid(lPid, (int *)&lStatus, WNOHANG)))
+			{
+				vSetErrMsg("%s", strerror(errno));
+				vDestroyList(pstRoot);
+				pstRoot = NULL;
+				return RC_FAIL;
+			}
+			else if(0 == lPr)
+			{
+				usleep(50000);
+				continue;
+			}
+			else
+				break;
+		}
+
+ 		if(WIFEXITED(lStatus))	//	如果是正常处理退出
+		{
+			if(RC_SUCC != WEXITSTATUS(lStatus))	//	判断退出返回值
+			{
+				vSetErrMsg("进程(%d)处理异常!", lPid);
+				vDestroyList(pstRoot);
+				pstRoot = NULL;
+				return RC_FAIL;
+			}
+		}
+		else
+		{
+			vSetErrMsg("子进程异(%d)常退出", lPid);
+			vDestroyList(pstRoot);
+			pstRoot = NULL;
+			return RC_FAIL;
+		}
+		pstNode = pstNode->pstNext;
+	}
+	
+	vDestroyList(pstRoot);
+	pstRoot = NULL;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	code end
+ ****************************************************************************************/
+

@@ -1,0 +1,132 @@
+#include	"Ibp.h"
+#include	"load.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+/*************************************************************************************************
+	主函数	
+ *************************************************************************************************/
+int		main(int argc, char *argv[])
+{
+	int		iRet = 0;
+	pid_t	lPid;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szSettleDate[9], szSettleNum[5], szTemp[5];
+	EXEC SQL END DECLARE SECTION;
+	char	szCmd[1024];
+
+	memset(szCmd, 0, sizeof(szCmd));
+	memset(szTemp, 0, sizeof(szTemp));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+
+	sprintf(gsLogFile, "BatchCall.log");
+	memcpy(szSettleDate, argv[1], 8);
+	memcpy(szSettleNum, argv[2], 4);
+
+	if(!strcmp(szSettleNum, "TC00"))
+		memcpy(szTemp, argv[4], 4);
+	else
+		szTemp[0] = CHANNEL_CLEAR_NO;
+
+	HtLog(NML_PARAM, "开始调用批量任务(%s)(%s)(%s)!", szTemp, szSettleDate, szSettleNum);
+  	lPid = fork();
+	if(lPid < 0)
+ 	{
+		HtLog(ERR_PARAM, "fork子进程失败, err:(%d)(%s)\n", errno, strerror(errno));
+		return RC_FAIL;
+	}
+	else if(lPid > 0)	//	父进程返回
+		return RC_SUCC;
+	else	//  if (lPid == 0)
+  		;
+
+	sleep(1);	//	确保父进程已经向BatMain提交了任务
+	
+	if(RC_SUCC != lDbsConnect(DBS_BATCH))
+	{
+		HtLog(ERR_PARAM, "更新TBL_CHN_SETTLE表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	if(!strcmp(szSettleNum, "TC00"))
+	{
+HtLog(NML_PARAM, "TC00开始调用批量任务(%s)(%s)(%s)!", szTemp, szSettleDate, szSettleNum);
+		EXEC SQL UPDATE TBL_CHN_SETTLE SET 
+			SETTLE_STATE = '1' 
+		WHERE SETTLE_DATE = :szSettleDate AND CUPS_NO = :szTemp;
+	}
+	else
+	{
+HtLog(NML_PARAM, "TN00开始调用批量任务(%s)(%s)(%s)!", szTemp, szSettleDate, szSettleNum);
+		EXEC SQL UPDATE TBL_CHN_SETTLE SET 
+			SETTLE_STATE = '1' 
+		WHERE SETTLE_DATE = :szSettleDate AND CLEAR_FLAG = :szTemp;
+	}
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新TBL_CHN_SETTLE表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+	EXEC SQL COMMIT WORK;
+
+	snprintf(szCmd, sizeof(szCmd), "sh %s/sbin/BatchSettle.sh 1>/dev/null 2>&1", getenv("HOME"));
+	HtLog(NML_PARAM, "CMD[%s]", szCmd);
+
+	if(RC_SUCC != system(szCmd))
+	{
+		HtLog(ERR_PARAM, "调用命令[%s]失败, err:(%d)(%s)", szCmd, errno, strerror(errno));
+		if(!strcmp(szSettleNum, "TC00"))
+		{
+			EXEC SQL UPDATE TBL_CHN_SETTLE SET 
+				SETTLE_STATE = '3' 
+			WHERE SETTLE_DATE = :szSettleDate AND CUPS_NO = :szTemp;
+		}
+		else
+		{
+			EXEC SQL UPDATE TBL_CHN_SETTLE SET 
+				SETTLE_STATE = '3' 
+			WHERE SETTLE_DATE = :szSettleDate AND CLEAR_FLAG = :szTemp;
+		}
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新TBL_CHN_SETTLE表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL ROLLBACK WORK;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	if(!strcmp(szSettleNum, "TC00"))
+	{
+HtLog(NML_PARAM, "TC00开始调用批量任务(%s)(%s)(%s)!", szTemp, szSettleDate, szSettleNum);
+		EXEC SQL UPDATE TBL_CHN_SETTLE SET 
+			SETTLE_STATE = '2' 
+		WHERE SETTLE_DATE = :szSettleDate AND CUPS_NO = :szTemp;
+	}
+	else
+	{
+HtLog(NML_PARAM, "TN00开始调用批量任务(%s)(%s)(%s)!", szTemp, szSettleDate, szSettleNum);
+		EXEC SQL UPDATE TBL_CHN_SETTLE SET 
+			SETTLE_STATE = '2' 
+		WHERE SETTLE_DATE = :szSettleDate AND CLEAR_FLAG = :szTemp;
+	}
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新TBL_CHN_SETTLE表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	vDbsDisconnect();
+
+	return RC_SUCC;
+}

@@ -1,0 +1,196 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取去年的当天
+ ****************************************************************************************/
+char *sGetLastYear(char *pszDate)
+{
+	char	szYear[4];
+	long	lYear = 0;
+	static  char	szDate[9];
+
+	memset(szYear, 0, sizeof(szYear));
+	memset(szDate, 0, sizeof(szDate));
+
+	memcpy(szYear, pszDate, 4);
+	lYear = atol(szYear);
+
+	lYear = ((lYear - 1) > 0) ? (lYear - 1) : lYear;
+
+	snprintf(szDate, sizeof(szDate), "%04d%s", lYear, pszDate + 4);
+
+	return szDate;
+}
+
+/****************************************************************************************
+	获取客户表TBL_PRO_CONFIG启动内存大小
+ ****************************************************************************************/
+long	lDefine_ProConfig(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100], szDate[9];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	memset(szDate, 0, sizeof(szDate));
+
+	strcpy(szTable, sGetTableName(t));
+	memcpy(szDate, sGetLastYear(pszSettleDate), 8);
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_PRO_CONFIG WHERE TX_DATE >= :szDate;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbProCfg), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbProCfg, id, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(tx_date)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbProCfg, tx_date, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(tx_date)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(service_code)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbProCfg, service_code, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(service_code)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(stlm_date)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbProCfg, stlm_date, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(stlm_date)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(pro_rate)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbProCfg, pro_rate, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(pro_rate)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(pro_fix)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbProCfg, pro_fix, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(pro_fix)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_PRO_CONFIG
+ ****************************************************************************************/
+long	lLoad_ProConfig(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	char	*pszIdx = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbProCfg	stPro;
+	char		szDate[10];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, sGetLastYear(pszSettleDate), 8);
+
+   	EXEC SQL DECLARE Cur_pro_config CURSOR FOR 
+		SELECT NVL(ID, ' '), NVL(TX_DATE, ' '), NVL(SERVICE_CODE, ' '), 
+			NVL(PAY_DAY, 0), NVL(TX_SEQ, 0), NVL(STLM_DATE, ' '), NVL(FLAG, ' '), 
+			NVL(PRO_RATE, ' '), NVL(PRO_FIX, ' ') 
+		FROM TBL_PRO_CONFIG WHERE TX_DATE >= :szDate;
+	
+	EXEC SQL OPEN Cur_pro_config;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stPro, 0, sizeof(stPro));
+		EXEC SQL FETCH Cur_pro_config INTO :stPro.id, :stPro.tx_date, :stPro.service_code,
+			:stPro.pay_day, :stPro.tx_seq, :stPro.stlm_date, :stPro.flag, :stPro.pro_rate,
+			:stPro.pro_fix;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_pro_config;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+			break;
+
+		sTrimAll(stPro.id);	
+		sTrimAll(stPro.tx_date);	
+		sTrimAll(stPro.service_code);	
+		sTrimAll(stPro.stlm_date);
+		sTrimAll(stPro.flag);
+		sTrimAll(stPro.pro_rate);
+		sTrimAll(stPro.pro_fix);
+		stPro.pay_day = lSetEXLong(stPro.pay_day);
+		stPro.tx_seq  = lSetEXLong(stPro.tx_seq);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stPro.id, ++(pGetTblDef(t)->lTreeNode),
+			dbProCfg, id, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载服务费模型(%d)失败, 原因:%s", stPro.id, sGetError());
+			EXEC SQL CLOSE Cur_pro_config;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != IBPInsertData(t, &stPro, sizeof(stPro)))
+		{
+			HtLog(ERR_PARAM, "新增表(%d)数据(%s)失败, 原因:%s", sGetTableName(t),
+				stPro.id, sGetError());
+			EXEC SQL CLOSE Cur_pro_config;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_pro_config;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

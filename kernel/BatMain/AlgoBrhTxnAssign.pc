@@ -1,0 +1,152 @@
+/*************************************************************************************************
+ *  功能: 代理服务费清分子任务参数配置
+ *
+ *  Edit History:
+ ************************************************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "load.h"
+#include "DbsApi.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_bat_task.h"
+EXEC SQL END DECLARE SECTION;
+
+int nAlgoBrhTxnAssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId, int lChdCount)
+{
+	long		lRet;
+	dbBrhInfo	stBrh;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+	RunTime		*pstRun = NULL;
+
+	if(!(pstRun = (RunTime *)pInitRunTime(TBL_BRH_INFO)))
+		return RC_FAIL;
+
+	memset(&stBrh, 0, sizeof(stBrh));
+	pstRun->lFind = CHK_SELECT;
+	pstRun->tblName = TBL_BRH_INFO;
+	stBrh.brh_stlm_flag[0] = BRH_STLM_YES;
+	pstRun->lSize = sizeof(stBrh);
+	pstRun->pstVoid = &stBrh;
+
+	lRet = lTableDeclare(pstRun);
+	if(RC_SUCC != lRet)
+	{
+		HtLog(ERR_PARAM, "打开表TBL_BRH_INFO标失败, 原因:%s", sGetError());
+		return RC_FAIL;
+	}
+	
+	while(1)
+	{
+		memset(&stBrh, 0, sizeof(stBrh));
+		lRet = lTableFetch(TBL_BRH_INFO, &stBrh, sizeof(stBrh));
+		if(RC_FAIL == lRet)
+		{
+			HtLog(ERR_PARAM, "查询表TBL_BRH_INFO错误, 原因:%s", sGetError());
+			vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+			return RC_FAIL;
+		}
+		else if(RC_NOTFOUND == lRet)
+			break;
+
+		lGetEXLong(&stBrh.brh_id);
+		lGetEXLong(&stBrh.brh_level);
+
+		memset(&stTask, 0, sizeof(stTask));
+		memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+		memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+		memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1); 
+		strcpy(stTask.matchstr, stBrh.brh_code);
+		sTrimAll(stTask.matchstr);
+		stTask.task_state[0] = TASK_RUN_STA_PRE;
+		memcpy(stTask.task_id, "  ", 2); 
+		memcpy(stTask.commit_point, "0", 1);
+		memcpy(stTask.fail_point, "0", 1);
+		memcpy(stTask.rec_opr_id, "I", 1);
+		memcpy(stTask.rec_upd_opr, "bat", 3);
+		memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+
+		EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+			return RC_FAIL;
+		}
+	}	
+	vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}
+
+int		nBrhServiceAssignTask(char *pszStlmDate, char *pszStlmNum, char *pszBatId, int lChdCount)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask	stTask;
+	EXEC SQL END DECLARE SECTION;
+	dbSvceCfg	stCfg;
+	long		lRet = 0;
+	RunTime		*pstRun = NULL;
+
+	if(!(pstRun = (RunTime *)pInitRunTime(TBL_SERVICE_CONFIG)))
+		return RC_FAIL;
+
+  	memset(&stCfg, 0, sizeof(stCfg));
+	pstRun->lFind = CHK_SELECT;
+	pstRun->tblName = TBL_SERVICE_CONFIG;
+	stCfg.profile_flag[0] = BRH_STLM_YES;
+	pstRun->lSize = sizeof(stCfg);
+  	pstRun->pstVoid = &stCfg;
+
+	lRet = lTableDeclare(pstRun);
+	if(RC_SUCC != lRet)
+	{
+		HtLog(ERR_PARAM, "打开表TBL_SERVICE_CONFIG标失败, 原因:%s", sGetError());
+		return RC_FAIL;
+	}
+	
+	while(1)
+	{
+  		memset(&stCfg, 0, sizeof(stCfg));
+		lRet = lTableFetch(TBL_SERVICE_CONFIG, &stCfg, sizeof(stCfg));
+		if(RC_FAIL == lRet)
+		{
+			HtLog(ERR_PARAM, "查询表TBL_SERVICE_CONFIG错误, 原因:%s", sGetError());
+			vTableClose(TBL_SERVICE_CONFIG, SHM_DISCONNECT);
+			return RC_FAIL;
+		}
+		else if(RC_NOTFOUND == lRet)
+			break;
+
+		memset(&stTask, 0, sizeof(stTask));
+		memcpy(stTask.date_settlmt, pszStlmDate, sizeof(stTask.date_settlmt) - 1);
+		memcpy(stTask.settle_num, pszStlmNum, sizeof(stTask.settle_num) - 1);
+		memcpy(stTask.bat_id, pszBatId, sizeof(stTask.bat_id) - 1); 
+		strcpy(stTask.matchstr, stCfg.profile_flag);
+		sTrimAll(stTask.matchstr);
+		stTask.task_state[0] = TASK_RUN_STA_PRE;
+		memcpy(stTask.task_id, "  ", 2); 
+		memcpy(stTask.commit_point, "0", 1);
+		memcpy(stTask.fail_point, "0", 1);
+		memcpy(stTask.rec_opr_id, "I", 1);
+		memcpy(stTask.rec_upd_opr, "bat", 3);
+		memcpy(stTask.rec_crt_ts, sGetCurrentTime(), sizeof(stTask.rec_crt_ts) - 1);
+
+		EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stTask);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			vTableClose(TBL_SERVICE_CONFIG, SHM_DISCONNECT);
+			return RC_FAIL;
+		}
+	}	
+	vTableClose(TBL_SERVICE_CONFIG, SHM_DISCONNECT);
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}

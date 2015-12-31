@@ -1,0 +1,290 @@
+/*****************************************************************
+ *文 件 名: LoadHxnpFile.c
+ *功	能: 加载渠道流水文件
+******************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+#define FILE_NAME_LEN_MAX   512
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_txn_succ.h"
+#include "tbl_cup_succ.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   函数名：						装载渠道流水主函数								*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*  返回值 ： RC_SUCC	--	成功													*/
+/*			  RC_FAIL	--	失败													*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	int		iRet;
+	char	szCmd[100];
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szStlmDate[9], szCupsNo[5];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "LoadWchtFile.log");
+	
+	if(5 > argc)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memcpy(szStlmDate, argv[1], 8);
+	strcpy(szCupsNo, "wcht");
+
+	snprintf(szCmd, sizeof(szCmd), "sed 's/`//g' -i %s/wcht/%s", getenv("FILEDIR"), argv[4]);
+	system(szCmd);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "dbsconnect error:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+   
+	/*删除当天加载数据*/
+	EXEC SQL DELETE FROM TBL_CUP_SUCC WHERE STLM_DATE = :szStlmDate AND CUPS_NO = :szCupsNo;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "删除渠道(%s)流水失败, err:(%d)(%s)", szCupsNo, SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	//	微信支付  支付账单类文件格式装载	
+	if(!memcmp("*", argv[4], 1))	//  非FileScan调启，可能人工或者页面发起
+	{
+		HtLog(NML_PARAM, "参数*, 未指明文件名, 程序自动FTP获取文件");
+		iRet = nGetCupsFile(szStlmDate);
+	}
+	else
+	{
+		HtLog(NML_PARAM, "指明装载文件名[%s]", argv[4]);
+		iRet = nLoadWchtFile(szStlmDate, argv[4]);
+	}
+	if(iRet)
+	{
+		vDbsDisconnect(); 
+		HtLog(ERR_PARAM, "装载微信渠道对账文件失败, err:(%d)", iRet);
+		return RC_FAIL;
+	}
+	vDbsDisconnect();		
+
+	return RC_SUCC;
+}	  
+
+/************************************************************************************/
+/*   声明  ： int nGetCupsFile														*/
+/*   功能  ： 获取渠道文件															*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int	nGetCupsFile(char *pszDate, char *pszOutFile)
+{
+	int		i = 0, iRet = 0;
+	char	szCmd[512], szYDay[9], szFile[1024];
+
+	memset(szYDay, 0, sizeof(szYDay));
+	strcpy(szYDay, sGetChgDate(pszDate, -1));
+
+	memset(szCmd, 0, sizeof(szCmd));
+	snprintf(szCmd, sizeof(szCmd), "sh %s/sbin/wcht_down.sh %s", getenv("HOME"), szYDay);
+	system(szCmd);
+	HtLog(NML_PARAM, "system cmd [%s]", szCmd);
+
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "wcht_%s", szYDay);
+	sTrimAll(szFile);
+	
+ 	iRet = nLoadWchtFile(pszDate, szFile);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "装载微信渠道对账文件失败, err:(%d)", iRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nLoadWchtFile(char *pszStlmDate, char *pszFile)					*/
+/*   功能  ： 从渠道给的文件中加载渠道流水表										*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*		   :  pszFile				--渠道文件名									*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int nLoadWchtFile(char *pszDate, char *pszFile)
+{
+	int	 iRet = 0, lSeqNo = 0, lLine = 0, lVaild = 0;
+	double	dRate; 
+	char	szPath[512], szLine[RECORD_LEN_MAX + 1], szTemp[100], szRate[20];
+	FILE	*fp = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TCupSucc	stCups;
+	EXEC SQL END DECLARE SECTION;
+	dbMchtCupsInf stCupsInf;
+	
+	memset(szPath, 0, sizeof(szPath));
+	snprintf(szPath, sizeof(szPath), "%s/wcht/%s", getenv("FILEDIR"), pszFile);
+	sTrimAll(szPath);
+
+	HtLog(NML_PARAM, "微信对账文件:%s", szPath);
+	iRet = access(szPath, R_OK);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "文件[%s]不存在，请查看!, strerr[%s]", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+ 
+	if(NULL == (fp = fopen(szPath, "r")))
+	{
+		HtLog(ERR_PARAM, "fopen %s error, :%s.", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+  
+	/* get file record */
+	memset(szLine, 0, sizeof(szLine));
+	while(fgets(szLine, RECORD_LEN_MAX, fp))	
+	{
+		lLine ++;   
+		if(strlen(szLine) == 0 || szLine[0] > '9' || szLine[0] < '0')
+		{
+			memset(szLine, 0, sizeof(szLine));
+			continue;
+		}
+
+		memset(&stCups, 0, sizeof(stCups));
+
+		strcpy(stCups.fill, sGetValueByIdx(szLine, ",", 3));	  //商户号
+		sTrimAll(stCups.fill);
+		/* 第三方KEY */
+
+		memset(szTemp, 0, sizeof(szTemp)); 
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 7));	//商户订单号
+		sTrimAll(szTemp);
+		/*检查商户是否在本平台注册，对注册的处理，对未注册的不处理*/
+/*
+		if(memcmp(szTemp, "99", 2) || 20 != strlen(szTemp))
+		{
+			memset(szLine, 0, sizeof(szLine));
+			HtLog(NML_PARAM, "渠道商户(%s)在本平台未注册, 不予装载!", stCups.fill);
+			continue;
+		}
+*/
+		if (strlen(szTemp) != 20) {
+			memset(szLine, 0, sizeof(szLine));
+			HtLog(NML_PARAM, "---渠道商户(%s)在本平台未注册, 不予装载!", stCups.fill);
+			continue;
+		}
+
+		memcpy(stCups.cups_no, "wcht", 4);			   //银商或银行编号
+		/* 唯一键值   */
+		sprintf(stCups.cup_key, "%s%s", stCups.cups_no, szTemp);
+		sprintf(stCups.id, "%s%s", stCups.cups_no, szTemp);
+		
+		memcpy(stCups.stlm_date, pszDate, 8);			//对帐日期
+
+		memset(szTemp, 0, sizeof(szTemp));					//交易日期
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 1));
+		sTrimAll(szTemp);
+		memcpy(stCups.tx_date, szTemp, 4);
+		memcpy(stCups.tx_date + 4, szTemp + 5, 2);
+		memcpy(stCups.tx_date + 6, szTemp + 8, 2);
+
+		memcpy(stCups.tx_time, szTemp + 10, 2);			//交易时间
+		memcpy(stCups.tx_time + 2, szTemp + 13, 2);
+		memcpy(stCups.tx_time + 4, szTemp + 16, 2);
+		
+		strcpy(stCups.res, sGetValueByIdx(szLine, ",", 10));		//交易类型
+		sTrimAll(stCups.res);
+
+		memset(szTemp, 0, strlen(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 13));				//交易金额
+		sTrimAll(szTemp);
+		stCups.tx_amt= atof(szTemp);
+		
+		memset(szTemp, 0, strlen(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 17));				//手续费
+		sTrimAll(szTemp);
+		stCups.cup_fee = atof(szTemp);
+		
+		memset(szTemp, 0, strlen(szTemp));
+		memset(szRate, 0, strlen(szRate));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 18));				//费率
+		sTrimAll(szTemp);
+		memcpy(szRate, szTemp, 4);
+		dRate = atof(szRate) / 100;
+
+		if(0 == memcmp(stCups.res, "SUCCESS", 7))
+		{
+			memcpy(stCups.tx_code, "微信消费", 8);
+			stCups.result_flag[0] = TRADE_TXN_INIT;
+		}
+		else
+			stCups.result_flag[0] = TRADE_TXN_REVERSED;
+
+/*
+		if(fabs(stCups.tx_amt * dRate - stCups.cup_fee) > 0.0051)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "error:(%d),(%f)!=(%f)", lLine, stCups.tx_amt * 0.006, stCups.cup_fee);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+*/
+		
+		lVaild ++;
+		snprintf(stCups.sys_ref_no, sizeof(stCups.sys_ref_no), "%012d", lVaild);		//系统检索号
+		snprintf(stCups.trace_no, sizeof(stCups.trace_no), "%012d", lVaild);		//系统检索号
+		memcpy(stCups.rec_crt_ts, sGetCurrentTime(), sizeof(stCups.rec_crt_ts) - 1);
+		
+		EXEC SQL INSERT INTO TBL_CUP_SUCC VALUES(:stCups);
+		if(SQLCODE)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "新增渠道(%s)流水(%s)失败, err:(%d)(%s), Line(%d)", stCups.cups_no,
+				stCups.id, SQLCODE, sDbsError(), lLine);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+		if(lVaild % 1000 == 0)
+			lDbsCommit();
+	}
+	lDbsCommit();
+	fclose(fp);
+	HtLog(NML_PARAM, "装载微信渠道流水完成，装载日期(%s),本地装载有效条数(%d)", pszDate, lVaild);
+
+	return RC_SUCC;
+}

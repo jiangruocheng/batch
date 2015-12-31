@@ -1,0 +1,133 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取系统启动所需表大小	
+ ****************************************************************************************/
+long	lDefine_RegionCode(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_REGION_CODE WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbReginCode), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbReginCode, id, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(region_code)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbReginCode, region_code, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(region_code)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+	return lSize;
+}
+
+/****************************************************************************************
+	创建客户表
+ ****************************************************************************************/
+long	lLoad_RegionCode(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbReginCode	 stReg;
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL DECLARE Cur_region_code CURSOR FOR 
+		SELECT NVL(ID, 0), NVL(REGION_CODE, ' '), NVL(REGION_NAME, ' ') 
+		FROM TBL_REGION_CODE ORDER BY REGION_CODE;
+
+	EXEC SQL OPEN Cur_region_code;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stReg, 0, sizeof(stReg));
+		EXEC SQL FETCH Cur_region_code INTO :stReg.id, :stReg.region_code, 
+			:stReg.region_name;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_region_code;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载(%d)<(%d)!", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_region_code;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		sTrimAll(stReg.region_code);
+		sTrimAll(stReg.region_name);
+		stReg.id = lSetEXLong(stReg.id);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stReg.region_code, ++(pGetTblDef(t)->lTreeNode),
+			dbReginCode, region_code, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载地区编号(%s)失败, 原因:%s", stReg.region_code, sGetError());
+			EXEC SQL CLOSE Cur_region_code;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != IBPInsertData(t, &stReg, sizeof(stReg)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t),
+				stReg.region_code, sGetError());
+			EXEC SQL CLOSE Cur_region_code;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_region_code;
+
+	*pstNode = pstRoot;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t),
+		pGetTblDef(t)->lValid);
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

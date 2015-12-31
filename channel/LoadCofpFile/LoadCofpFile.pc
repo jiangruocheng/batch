@@ -1,0 +1,327 @@
+/*****************************************************************
+ *ÎÄ ¼þ Ãû: LoadCofpFile.c
+ *¹¦	ÄÜ: ¼ÓÔØÇþµÀÁ÷Ë®ÎÄ¼þ
+******************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+#define FILE_NAME_LEN_MAX   512
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_txn_succ.h"
+#include "tbl_cup_succ.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************/
+/*   ÉùÃ÷  £º vPrintVersion(char *pszParm)											*/
+/*   ¹¦ÄÜ  £º																		*/
+/*  ·µ»ØÖµ £º ÎÞ																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   º¯ÊýÃû£º						×°ÔØÇþµÀÁ÷Ë®Ö÷º¯Êý								*/
+/************************************************************************************/
+/*   ÉùÃ÷  £º int main(int argc  , char ** argv )									*/
+/*   ¹¦ÄÜ  £º Íê³ÉÇåËãÈ«Á÷³Ì														*/
+/*   ²ÎÊý  £º argc (²ÎÊý¸öÊý -- ÊäÈë)												*/
+/*  ·µ»ØÖµ £º RC_SUCC	--	³É¹¦													*/
+/*			  RC_FAIL	--	Ê§°Ü													*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	int		iRet;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szStlmDate[9], szCupsNo[5];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "LoadCofpFile.log");
+	if(5 > argc)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);	
+		return RC_FAIL;
+	}
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memcpy(szStlmDate, argv[1], 8);
+	strcpy(szCupsNo, "cofp");	
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "dbsconnect error:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+   
+	/*É¾³ýµ±Ìì¼ÓÔØÊý¾Ý*/
+	EXEC SQL DELETE FROM TBL_CUP_SUCC WHERE STLM_DATE = :szStlmDate AND CUPS_NO = :szCupsNo;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "É¾³ýÇþµÀ(%s)Á÷Ë®Ê§°Ü, err:(%d)(%s)", szCupsNo, SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	/*¼ÓÔØÒ»°ã½»Ò×Á÷Ë®ÎÄ¼þ*/
+	if(!memcmp("*", argv[4], 1))	//  ·ÇFileScanµ÷Æô£¬¿ÉÄÜÈË¹¤»òÕßÒ³Ãæ·¢Æð
+	{
+		HtLog(NML_PARAM, "²ÎÊý*, Î´Ö¸Ã÷ÎÄ¼þÃû, ³ÌÐò×Ô¶¯FTP»ñÈ¡ÎÄ¼þ");
+		iRet = nGetCupsFile(szStlmDate);
+	}
+	else
+	{
+		HtLog(NML_PARAM, "Ö¸Ã÷×°ÔØÎÄ¼þÃû[%s]", argv[4]);
+		iRet = nLoadCofpFile(szStlmDate, argv[4]);
+	}
+	if(iRet)
+	{
+		vDbsDisconnect(); 
+		HtLog(ERR_PARAM, "×°ÔØ¿¨¸»Í¨ÇþµÀ¶ÔÕËÎÄ¼þÊ§°Ü, err:(%d)", iRet);
+		return RC_FAIL;
+	}
+	vDbsDisconnect();		
+
+	return RC_SUCC;
+}	  
+
+/************************************************************************************/
+/*   ÉùÃ÷  £º int nCheckCupsFee(TCupSucc *pstCupTxn, dbMchtCupsInf *pstCupsInf)		*/
+/*   ¹¦ÄÜ  £º ºË¶ÔÇþµÀÊÖÐø·Ñ														*/
+/*   ²ÎÊý  £º pstCupTxn			--ÇþµÀÁ÷Ë®½á¹¹										*/
+/*		   £º pstCupsInf		--ÇþµÀÉÌ»§·ÑÂÊ½á¹¹									*/
+/*  ·µ»ØÖµ £º RC_SUCC		--	³É¹¦												*/
+/*			  RC_FAIL		--	Ê§°Ü												*/
+/************************************************************************************/
+int	nCheckCupsFee(struct tbl_cup_succ_c *pstCupTxn, dbMchtCupsInf *pstCupsInf)
+{
+	int	  iRet = 0;
+	double   dFee = 0.00; 
+
+	if(TRADE_TXN_INIT != pstCupTxn->result_flag[0])
+		return RC_SUCC;  
+
+	dFee = pstCupsInf->fee_rate * pstCupTxn->tx_amt / 100;
+	if(pstCupsInf->fee_val > 0.00)
+	{
+		dFee = (dFee >= pstCupsInf->fee_val)?pstCupsInf->fee_val:dFee;
+		//  ËÄÉáÎåÈëÔ­Ôò0.005 ×Ô¶¯½øÎ»0.01
+		//  if(fabs(dFee - pstCupTxn->cup_fee) - 0.005 < 10e-7)
+		if(fabs(dFee - pstCupTxn->cup_fee) < 0.0051)
+			return RC_SUCC;
+		HtLog(ERR_PARAM, "½»Ò×½ð¶î:%.2f, ·â¶¥ÊÖÐø·Ñ(%.2f), ÊÖÐø·Ñ²»ÏàµÈ:%.2f != %.2f", pstCupTxn->tx_amt,
+			pstCupsInf->fee_val, pstCupTxn->cup_fee, dFee);
+	}
+	else
+	{
+		//  ËÄÉáÎåÈëÔ­Ôò0.005 ×Ô¶¯½øÎ»0.01
+		if(fabs(dFee - pstCupTxn->cup_fee) < 0.0051)
+			return RC_SUCC;
+		HtLog(ERR_PARAM, "½»Ò×½ð¶î:%.2f, ±ÈÂÊ·ÑÂÊ, ÊÖÐø·Ñ²»ÏàµÈ:%f!= %f, Diff:%f", pstCupTxn->tx_amt,
+			dFee, pstCupTxn->cup_fee, fabs(dFee - pstCupTxn->cup_fee));
+	}
+
+	return RC_FAIL;
+}
+
+/************************************************************************************/
+/*   ÉùÃ÷  £º int nGetCupsFile														*/
+/*   ¹¦ÄÜ  £º »ñÈ¡ÇþµÀÎÄ¼þ															*/
+/*   ²ÎÊý  £º pszStlmDate			--×°ÔØÈÕÆÚ										*/
+/*  ·µ»ØÖµ £º RC_SUCC		--	³É¹¦												*/
+/*			  RC_FAIL		--	Ê§°Ü												*/
+/************************************************************************************/
+int	nGetCupsFile(char *pszDate, char *pszOutFile)
+{
+	int		i = 0, iRet = 0;
+	char	szCmd[512], szYDay[9], szFile[1024];
+
+	memset(szYDay, 0, sizeof(szYDay));
+	strcpy(szYDay, sGetChgDate(pszDate, -1));
+
+	memset(szCmd, 0, sizeof(szCmd));
+	snprintf(szCmd, sizeof(szCmd), "sh %s/sbin/cofp_down.sh %s", getenv("HOME"), szYDay);
+	system(szCmd);
+	HtLog(NML_PARAM, "system cmd [%s]", szCmd);
+
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "cofpay_%s", szYDay);
+	sTrimAll(szFile);
+	
+ 	iRet = nLoadCofpFile(pszDate, szFile);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "×°ÔØ¿¨¸»Í¨ÇþµÀ¶ÔÕËÎÄ¼þÊ§°Ü, err:(%d)", iRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   ÉùÃ÷  £º int nLoadCofpFile(char *pszStlmDate, char *pszFile)					*/
+/*   ¹¦ÄÜ  £º ´ÓÇþµÀ¸øµÄÎÄ¼þÖÐ¼ÓÔØÇþµÀÁ÷Ë®±í										*/
+/*   ²ÎÊý  £º pszStlmDate			--×°ÔØÈÕÆÚ										*/
+/*		   :  pszFile				--ÇþµÀÎÄ¼þÃû									*/
+/*  ·µ»ØÖµ £º RC_SUCC		--	³É¹¦												*/
+/*			  RC_FAIL		--	Ê§°Ü												*/
+/************************************************************************************/
+int nLoadCofpFile(char *pszDate, char *pszFile)
+{
+	int	 iRet = 0, lSeqNo = 0, lLine = 0, lVaild = 0; 
+	char	szPath[512], szLine[RECORD_LEN_MAX + 1], szTemp[100];
+	FILE	*fp = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TCupSucc	stCups;
+	EXEC SQL END DECLARE SECTION;
+	dbMchtCupsInf stCupsInf;
+	
+	memset(szPath, 0, sizeof(szPath));
+	snprintf(szPath, sizeof(szPath), "%s/cofp/%s", getenv("FILEDIR"), pszFile);
+	sTrimAll(szPath);
+
+	HtLog(NML_PARAM, "¿¨¸»Í¨¶ÔÕËÎÄ¼þþ:%s", szPath);
+	iRet = access(szPath, R_OK);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "ÎÄ¼þ[%s]²»´æÔÚ£¬Çë²é¿´!, strerr[%s]", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+ 
+	if(NULL == (fp = fopen(szPath, "r")))
+	{
+		HtLog(ERR_PARAM, "fopen %s error, :%s.", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+  
+	/* get file record */
+	memset(szLine, 0, sizeof(szLine));
+	while(fgets(szLine, RECORD_LEN_MAX, fp))	
+	{
+		lLine ++;   
+		if(strlen(szLine) == 0 || szLine[0] > '9' || szLine[0] < '0')
+		{
+			memset(szLine, 0, sizeof(szLine));
+			continue;
+		}
+
+		memset(&stCups, 0, sizeof(stCups));
+		strcpy(stCups.brf, sGetValueByIdx(szLine, ",",1));//ÐòºÅ
+		sTrimAll(stCups.brf);
+
+		strcpy(stCups.tx_date, sGetValueByIdx(szLine, ",", 2));//½»Ò×ÈÕÆÚ
+		sTrimAll(stCups.tx_date);
+		strcpy(stCups.tx_time, sGetValueByIdx(szLine, ",", 3));//Ê±¼ä
+		sTrimAll(stCups.tx_time);
+		strcpy(stCups.sys_ref_no, sGetValueByIdx(szLine, ",", 4));//¼ìË÷²Î¿¼ºÅ
+		sTrimAll(stCups.sys_ref_no);
+		
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 5));//ÖÕ¶ËÁ÷Ë®ºÅ
+		sTrimAll(szTemp);
+		lSeqNo = atol(szTemp);
+		sprintf(stCups.trace_no, "%012d", lSeqNo);
+
+		strcpy(stCups.term_no, sGetValueByIdx(szLine, ",", 6));//ÖÕ¶ËºÅ
+		sTrimAll(stCups.term_no);
+		strcpy(stCups.fill, sGetValueByIdx(szLine, ",", 7));//ÉÌ»§ºÅ
+		sTrimAll(stCups.fill);
+		
+		memset(szTemp, 0, strlen(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 8));//½»Ò×½ð¶î
+		sTrimAll(szTemp);
+		stCups.tx_amt= atof(szTemp);		
+
+		strcpy(stCups.ac_no, sGetValueByIdx(szLine, ",", 9));//¿¨ºÅ
+		sTrimAll(stCups.ac_no);
+
+		memset(szTemp, 0, strlen(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 10));//ÊÖÐø·Ñ
+		sTrimAll(szTemp);
+		stCups.cup_fee = atof(szTemp);
+
+		strcpy(stCups.res, sGetValueByIdx(szLine, ",", 11));//½»Ò×ÀàÐÍ
+		sTrimAll(stCups.res);
+		sTrimCRLF(stCups.res);
+		
+		memcpy(stCups.cups_no, "cofp", 4);			   //  ÒøÉÌ»òÒøÐÐ±àºÅ
+
+		/*¼ì²éÉÌ»§ÊÇ·ñÔÚ±¾Æ½Ì¨×¢²á£¬¶Ô×¢²áµÄ´¦Àí£¬¶ÔÎ´×¢²áµÄ²»´¦Àí*/
+		memset(&stCupsInf, 0, sizeof(stCupsInf));
+		iRet = lGetMchtRoute(&stCupsInf, stCups.cups_no, stCups.fill, stCups.term_no);
+		if(RC_NOTFOUND == iRet)
+		{
+			memset(szLine, 0, sizeof(szLine));
+			HtLog(NML_PARAM, "ÇþµÀÉÌ»§(%s)(%s)ÔÚ±¾Æ½Ì¨Î´×¢²á, ²»Óè×°ÔØ!", stCups.fill,
+				stCups.term_no);
+			continue;
+		}
+		else if(iRet)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "²éÕÒÂ·ÓÉ±íÉÌ»§ÐÅÏ¢´íÎó:(%d)(%s)", iRet, sGetError());
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		memcpy(stCups.stlm_date, pszDate, 8);			//  ¶ÔÕÊÈÕÆÚ
+
+		/* Î¨Ò»¼üÖµ   */
+		sprintf(stCups.id, "%s%s%s", stCups.cups_no, stCups.tx_date, stCups.trace_no);
+
+		/* µÚÈý·½KEY */
+		sprintf(stCups.cup_key, "%s%s%s", stCups.cups_no, stCups.tx_date, stCups.trace_no);
+		/* ½á¹û±êÊ¾*/
+		if(0 == memcmp(stCups.res, "N", 1))
+		{
+			memcpy(stCups.tx_code, "POSÏû·Ñ", 7);
+			stCups.result_flag[0] = TRADE_TXN_INIT;
+		}
+		else	//	NÏû·Ñ³É¹¦ C³åÕý³É¹¦ R³·Ïú³É¹¦ PÔ¤ÊÚÈ¨³É¹¦ TÍË»õ³É¹¦
+			stCups.result_flag[0] = TRADE_TXN_REVERSED;
+
+		memcpy(stCups.rec_crt_ts, sGetCurrentTime(), sizeof(stCups.rec_crt_ts) - 1);
+
+		iRet = nCheckCupsFee(&stCups, &stCupsInf);
+		if(iRet)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "nCheckCupsFee err:(%d), Line(%d)fill(%s)(%s)", iRet, lLine,
+				stCups.fill, stCups.term_no);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		lVaild ++;
+
+		EXEC SQL INSERT INTO TBL_CUP_SUCC VALUES(:stCups);
+		if(SQLCODE)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "ÐÂÔöÇþµÀ(%s)Á÷Ë®(%s)Ê§°Ü, err:(%d)(%s), Line(%d)", stCups.cups_no,
+				stCups.id, SQLCODE, sDbsError(), lLine);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		if(lVaild % 1000 == 0)
+			lDbsCommit();
+	}
+	lDbsCommit();
+	fclose(fp);
+	HtLog(NML_PARAM, "×°ÔØ¿¨¸»Í¨ÇþµÀÁ÷Ë®Íê³É£¬×°ÔØÈÕÆÚ(%s),±¾µØ×°ÔØÓÐÐ§ÌõÊý(%d)", pszDate, lVaild);
+
+	return RC_SUCC;
+}

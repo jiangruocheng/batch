@@ -1,0 +1,3351 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	全局变量
+ ****************************************************************************************/
+TblDef	g_stTblDef[SHM_TABLE_NUM] = {0};
+long	g_LoadSize = 0;
+
+/****************************************************************************************
+	对整形0的转换
+ ****************************************************************************************/
+long	lSetEXLong(long n)
+{
+	if(n <= 0)
+		n += LONG_ZERO;
+	return n;
+}
+
+/****************************************************************************************
+	对整形0的转换
+ ****************************************************************************************/
+long	lGetEXLong(long *pn)
+{
+	if(*pn <= LONG_ZERO)
+		*pn -= LONG_ZERO;
+	return *pn;
+}
+
+/****************************************************************************************
+	获取表指针节点
+ ****************************************************************************************/
+TblDef*	pGetTblDef(TABLE table)
+{
+	return &g_stTblDef[table];
+}
+
+/****************************************************************************************
+	获取表的索引位置
+ ****************************************************************************************/
+long	lGetTblPos(TABLE table)
+{
+	return pGetTblDef(table)->lOffSet;
+}
+
+/****************************************************************************************
+	AVL快速查找root节点
+ ****************************************************************************************/
+long	lGetShmPos(TABLE table)
+{
+	return pGetTblDef(table)->lShmPos;
+}
+
+/****************************************************************************************
+	获取表有效数据条数
+ ****************************************************************************************/
+long	lGetTblValid(TABLE	table)
+{
+	return pGetTblDef(table)->lValid;
+}
+
+/****************************************************************************************
+	获取表有效数据条数
+ ****************************************************************************************/
+long	lGetTblCount(TABLE	table)
+{
+	return pGetTblDef(table)->lCount;
+}
+
+/****************************************************************************************
+	获取表索引起始定义
+ ****************************************************************************************/
+TblKey* pGetTblIdx(TABLE table)
+{
+	return  pGetTblDef(table)->m_stKeyIdx;
+}
+
+/****************************************************************************************
+	获取表索引的个数
+ ****************************************************************************************/
+long	lGetIdxNum(TABLE table)
+{
+	return  pGetTblDef(table)->m_lIdxNum;
+}
+
+/****************************************************************************************
+	获取表索引的个数
+ ****************************************************************************************/
+long	lTblIsNExist(TABLE table)
+{
+	if(0x00 > table || table >= SHM_TABLE_NUM)
+	{
+		vSetErrMsg("表序号(%d)不存在", table);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+ *  功能  :设置表索引
+ *  参数  :
+ ****************************************************************************************/
+long	lSetTableIdx(TABLE table, long lKeyOffSet, long lKeyLen, long lKeyAttr, long lKeyType)
+{
+	long	i = 0;
+	TblKey  *pstIdx = pGetTblIdx(table);
+
+	for(i = 0; i < lGetIdxNum(table); i++)
+	{
+		//  如果设置了，就直接返回成功
+		if((pstIdx[i].m_lKeyOffSet == lKeyOffSet) && pstIdx[i].m_lKeyLen == lKeyLen)
+			return RC_SUCC;
+	}
+
+	if(lGetIdxNum(table) >= MAX_KEY_IDX)
+	{
+		HtLog(ERR_PARAM, "表(%d)索引个数设置超限, 最大(%d)", table, SHM_TABLE_NUM);
+		vSetErrMsg("表(%d)索引个数设置超限, 最大(%d)", table, SHM_TABLE_NUM);
+		return RC_FAIL;
+	}
+
+	pstIdx[lGetIdxNum(table)].m_lKeyOffSet = lKeyOffSet;
+	pstIdx[lGetIdxNum(table)].m_lKeyLen = lKeyLen;
+	pstIdx[lGetIdxNum(table)].m_lKeyAttr = lKeyAttr;
+	pstIdx[lGetIdxNum(table)].m_lIsPk = lKeyType;
+	pGetTblDef(table)->m_lIdxNum ++;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	设置结构体数据
+ ****************************************************************************************/
+void	vSetTblDef(char *pszAddr)
+{
+	memcpy(&g_stTblDef, (char *)pszAddr, sizeof(TblDef) * SHM_TABLE_NUM);
+}
+
+/****************************************************************************************
+	设置表结构属性  
+ ****************************************************************************************/
+long	lInitTblSize(TABLE table, long lCount, long lTblSize, long *plSize)
+{
+	if(RC_SUCC != lTblIsNExist(table))
+		return RC_FAIL;
+
+	lCount += EXT_TABLE_GAP;							//  防止在导入内存中时候又有新的数据。
+	pGetTblDef(table)->lShmPos = (*plSize);			 //  查找Root节点位置
+	(*plSize) += lCount * sizeof(SHTree);			   //  节点最大个数
+	pGetTblDef(table)->lOffSet = *plSize;			   //  偏移量
+	pGetTblDef(table)->lCount = lCount;				 //  记录数
+	(*plSize) += lCount * lTblSize;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	计算需要内存大小
+ ****************************************************************************************/
+long	lGetLoadSize(char *pszSettleNum)
+{
+	long	 lSize = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lDefault = 1, lAppType = 1;
+	char	szOne[10], szTwo[10], szThree[10];
+	EXEC SQL END DECLARE SECTION;
+
+	if(RC_SUCC != lDbsConnect(DBS_BUSS))
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%s)", sDbsError());
+		vSetErrMsg("连接数据库失败, err:(%s)", sDbsError());
+		return RC_FAIL;
+	}
+
+	lSize += sizeof(g_stTblDef);
+	
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_REGION_CODE WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_REGION_CODE, lCount, sizeof(dbReginCode), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_BRH_INFO WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_BRH_INFO, lCount, sizeof(dbBrhInfo), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_BRH_PROFIT_INFO WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_BRH_PROFIT_INFO, lCount, sizeof(dbPfitInfo), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MCHT_MCC_INF WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_MCHT_MCC_INF, lCount, sizeof(dbMchtMccInf), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_BRH_PROFIT_DEF WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_BRH_PROFIT_DEF, lCount, sizeof(dbPfitDef), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_BRH_PROFIT_ALGO WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_BRH_PROFIT_ALGO, lCount, sizeof(dbBrhAlgo), &lSize))
+		return RC_FAIL;
+
+	lDefault = lAppType = 1;
+	memset(szOne, 0, sizeof(szOne));
+	memset(szTwo, 0, sizeof(szTwo));
+	memcpy(szTwo, pszSettleNum, 4);
+	szOne[0] = '0';
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM
+		(SELECT * FROM TBL_ACCT_INFO WHERE (APP_ID IN 
+			(SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szTwo)) 
+			AND ACCT_FLAG = :szOne AND ACCT_DEFAULT = :lDefault
+		UNION
+		SELECT * FROM TBL_ACCT_INFO WHERE APP_TYPE = :lAppType AND ACCT_FLAG = :szOne 
+			AND ACCT_DEFAULT = :lDefault);
+   	if(RC_SUCC != lInitTblSize(TBL_ACCT_INFO, lCount, sizeof(dbAcctInfo), &lSize))
+	   	return RC_FAIL;
+
+	memset(szTwo, 0, sizeof(szTwo));
+	memcpy(szTwo, pszSettleNum, 4);
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_OPR_INFO WHERE OPR_ID IN 
+		(SELECT MCHT_EXPAND FROM TBL_MCHT_BASE WHERE MCHT_NO IN 
+			(SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szTwo));
+	if(RC_SUCC != lInitTblSize(TBL_OPR_INFO, lCount, sizeof(dbOprInf), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_SPDB_BRH WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_SPDB_BRH, lCount, sizeof(dbSpdbBrh), &lSize))
+		return RC_FAIL;
+
+	memset(szTwo, 0, sizeof(szTwo));
+	memcpy(szTwo, pszSettleNum, 4);
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szTwo;
+	if(RC_SUCC != lInitTblSize(TBL_MCHT_BASE, lCount, sizeof(dbMchtBase), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MCHT_ALGO WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_MCHT_ALGO, lCount, sizeof(dbMchtAlgo), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_PUB_DISC_ALGO WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_PUB_DISC_ALGO, lCount, sizeof(dbDiscAlgo), &lSize))
+		return RC_FAIL;
+
+	memset(szTwo, 0, sizeof(szTwo));
+	memcpy(szTwo, pszSettleNum, 4);
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szTwo;
+	if(RC_SUCC != lInitTblSize(TBL_MCHT_USER, lCount, sizeof(dbMchtUser), &lSize))
+		return RC_FAIL;
+
+	memset(szOne, 0, sizeof(szOne));
+	szOne[0] = '1';
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_SERVICE_CONFIG WHERE TASK_STATUS = :szOne;
+	if(RC_SUCC != lInitTblSize(TBL_SERVICE_CONFIG, lCount, sizeof(dbSvceCfg), &lSize))
+		return RC_FAIL;
+
+	memset(szOne, 0, sizeof(szOne));
+	szOne[0] = '0';
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_DISC_ALGO WHERE DISC_ID IN (
+		SELECT DISC_ID FROM TBL_DISC_INFO WHERE DISC_FLAG = :szOne );
+	if(RC_SUCC != lInitTblSize(TBL_DISC_ALGO, lCount, sizeof(dbDisc), &lSize))
+		return RC_FAIL;
+
+	lCount = 0;
+	if(RC_SUCC != lInitTblSize(TBL_SERVICE_REGISTER, lCount, sizeof(dbResigter), &lSize))
+		return RC_FAIL;
+
+	vDbsDisconnect();
+
+	//	连接路由数据库
+	if(RC_SUCC != lDbsConnect(DBS_ROUTE))
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%s)", sDbsError());
+		vSetErrMsg("连接数据库失败, err:(%s)", sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MCHT_CUPS_INF WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_MCHT_CUPS_INF, lCount, sizeof(dbMchtCupsInf), &lSize))
+		return RC_FAIL;
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_N_MCHT_MATCH WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(TBL_N_MCHT_MATCH, lCount, sizeof(dbNMchtMatch), &lSize))
+		return RC_FAIL;
+
+	vDbsDisconnect();
+
+	lCount = EXT_TABLE_GAP * 2;
+	if(RC_SUCC != lInitTblSize(TBL_CUPS_AMT, lCount, sizeof(EXTCupAmt), &lSize))
+		return RC_FAIL;
+
+	HtLog(NML_PARAM, "表空间所需内存大小(%d)", lSize);
+	return  lSize;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_REGION_CODE
+ ****************************************************************************************/
+long	lLoadTblRegionCode()
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbReginCode		stDbReg;
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+ 		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_region_code CURSOR FOR SELECT NVL(ID, 0), NVL(REGION_CODE, ' '),
+		NVL(REGION_NAME, ' ') FROM TBL_REGION_CODE ORDER BY REGION_CODE;
+
+	EXEC SQL OPEN Cur_region_code;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_region_code错误, (%s)", sDbsError());
+		vSetErrMsg("定义表Tbl_region_code错误, (%s)", sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_REGION_CODE)->lValid = 0;
+	pGetTblDef(TBL_REGION_CODE)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbReg, 0, sizeof(stDbReg));
+		EXEC SQL FETCH Cur_region_code INTO :stDbReg.id, :stDbReg.region_code, :stDbReg.region_name;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_region_code;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_REGION_CODE) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_REGION_CODE), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_REGION_CODE), lCount);
+			vDestroyTree(pstRoot);
+			EXEC SQL CLOSE Cur_region_code;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbReg.region_code);	
+		sTrimAll(stDbReg.region_name);	
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stDbReg.region_code, ++(pGetTblDef(TBL_REGION_CODE)->lTreeNode),
+			dbReginCode, region_code, lGetTblPos(TBL_REGION_CODE) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载地区编号(%s)失败, 原因:%s", stDbReg.region_code, sGetError());
+			EXEC SQL CLOSE Cur_region_code;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		stDbReg.id = lSetEXLong(stDbReg.id);
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_REGION_CODE)), &stDbReg, sizeof(stDbReg));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbReg);
+		pGetTblDef(TBL_REGION_CODE)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_region_code;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "TBL_REGION_CODE装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_REGION_CODE), 
+		pGetTblDef(TBL_REGION_CODE)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_REGION_CODE表建立字段region_code快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_REGION_CODE)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_REGION_CODE)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_REGION_CODE)索引(id)");
+	lRet = IBPSetUnIdx(TBL_REGION_CODE, dbReginCode, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_REGION_CODE)字段id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_REGION_CODE)字段id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_REGION_CODE)索引(region_code)");
+	lRet = IBPSetUnIdx(TBL_REGION_CODE, dbReginCode, region_code, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_REGION_CODE)字段region_code失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_REGION_CODE)字段region_code失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_BRH_INFO
+ ****************************************************************************************/
+long	lLoadTblBrhInfo()
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szTemp[1025];
+	dbBrhInfo	stDbBrh;
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_brh_info CURSOR FOR SELECT NVL(BRH_ID, 0), NVL(BRH_LEVEL, 0), 
+		NVL(BRH_CODE, ' '), NVL(BRH_NAME, ' '), NVL(BRH_STLM_FLAG, ' '), NVL(BRH_DISC_ID, ' '), 
+		NVL(BRH_TAG, ' '), NVL(BRH_FILE_FLAG, ' ') FROM TBL_BRH_INFO ORDER BY BRH_CODE;
+
+	EXEC SQL OPEN Cur_brh_info;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_brh_info错误, (%d)(%s)", SQLCODE, sDbsError());
+		vSetErrMsg("定义表Tbl_brh_info错误, (%d)(%s)", SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_BRH_INFO)->lValid = 0;
+	pGetTblDef(TBL_BRH_INFO)->lTreeNode = 0;
+	while(1)
+	{
+		memset(szTemp, 0, sizeof(szTemp));
+		memset(&stDbBrh, 0, sizeof(stDbBrh));
+		EXEC SQL FETCH Cur_brh_info INTO :stDbBrh.brh_id, :stDbBrh.brh_level, 
+			:stDbBrh.brh_code, :szTemp, :stDbBrh.brh_stlm_flag, :stDbBrh.brh_disc_id, 
+			:stDbBrh.brh_tag, :stDbBrh.brh_file_flag;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_brh_info;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_BRH_INFO) <= lCount)
+		{
+			break;
+/*
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_BRH_INFO), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_BRH_INFO), lCount);
+			Tbl_brh_info_Clo_Sel();
+			vDbsDisconnect();
+			return RC_FAIL;
+*/
+		}
+
+		sTrimAll(szTemp);	
+		sTrimAll(stDbBrh.brh_code);	
+		sTrimAll(stDbBrh.brh_stlm_flag);	
+		sTrimAll(stDbBrh.brh_disc_id);	
+		sTrimAll(stDbBrh.brh_tag);	
+		sTrimAll(stDbBrh.brh_file_flag);	
+
+		memcpy(stDbBrh.brh_name, szTemp, sizeof(stDbBrh.brh_name) - 1);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stDbBrh.brh_code, ++(pGetTblDef(TBL_BRH_INFO)->lTreeNode),
+			dbBrhInfo, brh_code, lGetTblPos(TBL_BRH_INFO) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载机构号(%s)失败, 原因:%s", stDbBrh.brh_code, sGetError());
+			EXEC SQL CLOSE Cur_brh_info;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		stDbBrh.brh_id = lSetEXLong(stDbBrh.brh_id);
+		stDbBrh.brh_level = lSetEXLong(stDbBrh.brh_level);
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_BRH_INFO)), &stDbBrh, sizeof(stDbBrh));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbBrh);
+		pGetTblDef(TBL_BRH_INFO)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_brh_info;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_BRH_INFO)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_BRH_INFO), 
+		pGetTblDef(TBL_BRH_INFO)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_BRH_INFO表建立字段brh_code快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_BRH_INFO)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_BRH_INFO)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_INFO)索引(brh_id)");
+	lRet = IBPSetUnIdx(TBL_BRH_INFO, dbBrhInfo, brh_id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_INFO)字段brh_id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_INFO)字段brh_id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_INFO)索引(brh_code)");
+	lRet = IBPSetUnIdx(TBL_BRH_INFO, dbBrhInfo, brh_code, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_INFO)字段brh_code失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_INFO)字段brh_code失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_INFO)查询索引(brh_level)");
+	lRet = IBPSetIdx(TBL_BRH_INFO, dbBrhInfo, brh_level, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_INFO)字段brh_level失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_INFO)字段brh_level失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_INFO)查询索引(brh_stlm_flag)");
+	lRet = IBPSetIdx(TBL_BRH_INFO, dbBrhInfo, brh_stlm_flag, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_INFO)字段brh_stlm_flag失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_INFO)字段brh_stlm_flag失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_INFO)查询索引(brh_disc_id)");
+	lRet = IBPSetIdx(TBL_BRH_INFO, dbBrhInfo, brh_disc_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_INFO)字段brh_disc_id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_INFO)字段brh_disc_id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_INFO)查询索引(brh_tag)");
+	lRet = IBPSetIdx(TBL_BRH_INFO, dbBrhInfo, brh_tag, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_INFO)字段brh_tag失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_INFO)字段brh_tag失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_BRH_PROFIT_INFO
+ ****************************************************************************************/
+long	lLoadBrhPfitInfo()
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbPfitInfo	stDbPfitInfo;		
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_brh_profit_info CURSOR FOR SELECT NVL(MODEL_ID, 0), NVL(TREATY_ID, ' '),
+		NVL(STANDARD_ID, ' '), NVL(OTHER_ID, ' ') FROM TBL_BRH_PROFIT_INFO WHERE 1 = 1 ORDER BY MODEL_ID;
+
+	EXEC SQL OPEN Cur_brh_profit_info;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表tbl_brh_profit_info错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表tbl_brh_profit_info错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();	
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_BRH_PROFIT_INFO)->lValid = 0;
+	pGetTblDef(TBL_BRH_PROFIT_INFO)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbPfitInfo, 0, sizeof(stDbPfitInfo));
+		EXEC SQL FETCH Cur_brh_profit_info INTO :stDbPfitInfo.model_id, :stDbPfitInfo.treaty_id, 
+			:stDbPfitInfo.standard_id, :stDbPfitInfo.other_id;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_brh_profit_info;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_BRH_PROFIT_INFO) <= lCount)
+		{
+			break;
+/*
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_BRH_PROFIT_INFO), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_BRH_PROFIT_INFO), lCount);
+			EXEC SQL CLOSE Cur_brh_profit_info;
+			vDbsDisconnect();
+			return RC_FAIL;
+*/
+		}
+
+		sTrimAll(stDbPfitInfo.model_id);	
+		sTrimAll(stDbPfitInfo.treaty_id);	
+		sTrimAll(stDbPfitInfo.standard_id);	
+		sTrimAll(stDbPfitInfo.other_id);	
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stDbPfitInfo.model_id, ++(pGetTblDef(TBL_BRH_PROFIT_INFO)->lTreeNode),
+			dbPfitInfo, model_id, lGetTblPos(TBL_BRH_PROFIT_INFO) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载分润模型ID(%s)失败, 原因:%s", stDbPfitInfo.model_id, sGetError());
+			EXEC SQL CLOSE Cur_brh_profit_info;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_BRH_PROFIT_INFO)), &stDbPfitInfo, sizeof(stDbPfitInfo));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbPfitInfo);
+		pGetTblDef(TBL_BRH_PROFIT_INFO)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_brh_profit_info;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_BRH_PROFIT_INFO)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_BRH_PROFIT_INFO), 
+		pGetTblDef(TBL_BRH_PROFIT_INFO)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_BRH_PROFIT_INFO表建立字段model_id快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_BRH_PROFIT_INFO)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_BRH_PROFIT_INFO)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_INFO)索引(model_id)");
+	lRet = IBPSetUnIdx(TBL_BRH_PROFIT_INFO, dbPfitInfo, model_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_INFO)字段model_id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_INFO)字段model_id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_INFO)索引(treaty_id)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_INFO, dbPfitInfo, treaty_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_INFO)字段treaty_id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_INFO)字段treaty_id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_INFO)查询索引(standard_id)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_INFO, dbPfitInfo, standard_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_INFO)字段standard_id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_INFO)字段standard_id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_INFO)查询索引(other_id)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_INFO, dbPfitInfo, other_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_INFO)字段other_id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_INFO)字段other_id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+/****************************************************************************************
+	将数据导入共享内存中	TBL_MCHT_MCC_INF
+ ****************************************************************************************/
+long	lLoadTblMchtMccInfo()
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMchtMccInf	stDbMcc;
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_mcht_mcc_inf CURSOR FOR SELECT NVL(ID, 0), NVL(MCHNT_TP, ' '),
+		NVL(MCHNT_TP_GRP, ' ') FROM TBL_MCHT_MCC_INF ORDER BY MCHNT_TP;
+
+	EXEC SQL OPEN Cur_mcht_mcc_inf;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表tbl_mcht_mcc_inf错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表tbl_mcht_mcc_inf错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_MCHT_MCC_INF)->lValid = 0;
+	pGetTblDef(TBL_MCHT_MCC_INF)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbMcc, 0, sizeof(stDbMcc));
+		EXEC SQL FETCH Cur_mcht_mcc_inf INTO :stDbMcc.id, :stDbMcc.mchnt_tp, :stDbMcc.mchnt_tp_grp;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_mcc_inf;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_MCHT_MCC_INF) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_MCC_INF), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_MCC_INF), lCount);
+			EXEC SQL CLOSE Cur_mcht_mcc_inf;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbMcc.mchnt_tp);	
+		sTrimAll(stDbMcc.mchnt_tp_grp);	
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stDbMcc.mchnt_tp, ++(pGetTblDef(TBL_MCHT_MCC_INF)->lTreeNode),
+			dbMchtMccInf, mchnt_tp, lGetTblPos(TBL_MCHT_MCC_INF) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载MCC号(%s)失败, 原因:%s", stDbMcc.mchnt_tp, sGetError());
+			EXEC SQL CLOSE Cur_mcht_mcc_inf;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		stDbMcc.id = lSetEXLong(stDbMcc.id);
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_MCHT_MCC_INF)), &stDbMcc, sizeof(stDbMcc));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbMcc);
+		pGetTblDef(TBL_MCHT_MCC_INF)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_mcht_mcc_inf;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_MCHT_MCC_INF)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_MCHT_MCC_INF), 
+		pGetTblDef(TBL_MCHT_MCC_INF)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_MCHT_MCC_INF表建立字段mchnt_tp快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_MCC_INF)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_MCC_INF)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_MCC_INF)索引(id)");
+	lRet = IBPSetUnIdx(TBL_MCHT_MCC_INF, dbMchtMccInf, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_MCC_INF)字段id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_MCC_INF)字段id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_MCC_INF)索引(mchnt_tp)");
+	lRet = IBPSetUnIdx(TBL_MCHT_MCC_INF, dbMchtMccInf, mchnt_tp, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_MCC_INF)字段mchnt_tp失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_MCC_INF)字段mchnt_tp失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_MCC_INF)索引(mchnt_tp_grp)");
+	lRet = IBPSetIdx(TBL_MCHT_MCC_INF, dbMchtMccInf, mchnt_tp_grp, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_MCC_INF)字段mchnt_tp_grp失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_MCC_INF)字段mchnt_tp_grp失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_BRH_PROFIT_DEF
+ ****************************************************************************************/
+long	lLoadBrhPorfitDef()
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbPfitDef	stDbPfitDef;
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_brh_profit_def CURSOR FOR SELECT NVL(MODEL_ID, ' '), NVL(MODEL_BRH, ' '),
+		NVL(MODEL_FLAG, ' '), NVL(UNITE_RATIO, ' '), NVL(PROFIT_RATIO, ' ') FROM TBL_BRH_PROFIT_DEF 
+		ORDER BY MODEL_ID;
+
+	EXEC SQL OPEN Cur_brh_profit_def;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表tbl_brh_profit_def错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表tbl_brh_profit_def错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_BRH_PROFIT_DEF)->lValid = 0;
+	pGetTblDef(TBL_BRH_PROFIT_DEF)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbPfitDef, 0, sizeof(stDbPfitDef));
+		EXEC SQL FETCH Cur_brh_profit_def INTO :stDbPfitDef.model_id, :stDbPfitDef.model_brh, 
+			:stDbPfitDef.model_flag, :stDbPfitDef.unite_ratio, :stDbPfitDef.profit_ratio;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_brh_profit_def;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_BRH_PROFIT_DEF) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_BRH_PROFIT_DEF), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_BRH_PROFIT_DEF), lCount);
+			EXEC SQL CLOSE Cur_brh_profit_def;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbPfitDef.model_id);
+		sTrimAll(stDbPfitDef.model_brh);	
+		sTrimAll(stDbPfitDef.model_flag);	
+		sTrimAll(stDbPfitDef.unite_ratio);	
+		sTrimAll(stDbPfitDef.profit_ratio);	
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stDbPfitDef.model_id, ++(pGetTblDef(TBL_BRH_PROFIT_DEF)->lTreeNode),
+			dbPfitDef, model_id, lGetTblPos(TBL_BRH_PROFIT_DEF) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载分润定义模型ID(%s)失败, 原因:%s", stDbPfitDef.model_id, sGetError());
+			EXEC SQL CLOSE Cur_brh_profit_def;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_BRH_PROFIT_DEF)), &stDbPfitDef, sizeof(stDbPfitDef));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbPfitDef);
+		pGetTblDef(TBL_BRH_PROFIT_DEF)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_brh_profit_def;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_BRH_PROFIT_DEF)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_BRH_PROFIT_DEF), 
+		pGetTblDef(TBL_BRH_PROFIT_DEF)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_BRH_PROFIT_DEF表建立字段model_id快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_BRH_PROFIT_DEF)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_BRH_PROFIT_DEF)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_DEF)索引(model_id)");
+	lRet = IBPSetUnIdx(TBL_BRH_PROFIT_DEF, dbPfitDef, model_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_DEF)字段model_id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_DEF)字段model_id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_DEF)索引(model_brh)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_DEF, dbPfitDef, model_brh, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_DEF)字段model_brh失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_DEF)字段model_brh失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_DEF)索引(model_flag)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_DEF, dbPfitDef, model_flag, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_DEF)字段model_flag失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_DEF)字段model_flag失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_DEF)索引(unite_ratio)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_DEF, dbPfitDef, unite_ratio, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_DEF)字段unite_ratio失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_DEF)字段unite_ratio失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_DEF)索引(profit_ratio)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_DEF, dbPfitDef, profit_ratio, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_DEF)字段profit_ratio失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_DEF)字段profit_ratio失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_BRH_PROFIT_ALGO
+ ****************************************************************************************/
+long	lLoadBrhPorfitAlgo()
+{
+	long	lRet = 0, lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbBrhAlgo	stDbBrhAlgo;
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_brh_profit_algo CURSOR FOR SELECT NVL(MODEL_ID, 0), NVL(TRANS_TYPE, ' '),
+		NVL(MCHT_GRP, ' '), NVL(CARD_TYPE, 0), NVL(BASE_FEE, ' '), NVL(PROFIT_RATIO, ' ') FROM
+		TBL_BRH_PROFIT_ALGO ORDER BY MODEL_ID;
+
+	EXEC SQL OPEN Cur_brh_profit_algo;	
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表tbl_brh_profit_def错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表tbl_brh_profit_def错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_BRH_PROFIT_ALGO)->lValid = 0;
+	pGetTblDef(TBL_BRH_PROFIT_ALGO)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbBrhAlgo, 0, sizeof(stDbBrhAlgo));
+		EXEC SQL FETCH Cur_brh_profit_algo INTO :stDbBrhAlgo.model_id, :stDbBrhAlgo.trans_type, 
+			:stDbBrhAlgo.mcht_grp, :stDbBrhAlgo.card_type, :stDbBrhAlgo.base_fee, :stDbBrhAlgo.profit_ratio;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_brh_profit_algo;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_BRH_PROFIT_ALGO) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_BRH_PROFIT_ALGO), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_BRH_PROFIT_ALGO), lCount);
+			EXEC SQL CLOSE Cur_brh_profit_algo;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbBrhAlgo.model_id);
+		sTrimAll(stDbBrhAlgo.trans_type);	
+		sTrimAll(stDbBrhAlgo.mcht_grp);	
+		sTrimAll(stDbBrhAlgo.base_fee);	
+		sTrimAll(stDbBrhAlgo.profit_ratio);	
+		stDbBrhAlgo.card_type = lSetEXLong(stDbBrhAlgo.card_type);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_BRH_PROFIT_ALGO)), &stDbBrhAlgo, sizeof(stDbBrhAlgo));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbBrhAlgo);
+		pGetTblDef(TBL_BRH_PROFIT_ALGO)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_brh_profit_algo;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_BRH_PROFIT_ALGO)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_BRH_PROFIT_ALGO), 
+		pGetTblDef(TBL_BRH_PROFIT_ALGO)->lValid);
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_BRH_PROFIT_ALGO)), (char *)pInitSHTree(NULL), sizeof(SHTree));
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_ALGO)索引(model_id)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_ALGO, dbBrhAlgo, model_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_ALGO)字段model_id失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_ALGO)字段model_id失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_ALGO)索引(trans_type)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_ALGO, dbBrhAlgo, trans_type, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_ALGO)字段trans_type失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_ALGO)字段trans_type失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_ALGO)索引(mcht_grp)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_ALGO, dbBrhAlgo, mcht_grp, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_ALGO)字段mcht_grp失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_ALGO)字段mcht_grp失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_ALGO)索引(card_type)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_ALGO, dbBrhAlgo, card_type, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_ALGO)字段card_type失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_ALGO)字段card_type失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_ALGO)索引(base_fee)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_ALGO, dbBrhAlgo, base_fee, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_ALGO)字段base_fee失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_ALGO)字段base_fee失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_BRH_PROFIT_ALGO)索引(profit_ratio)");
+	lRet = IBPSetIdx(TBL_BRH_PROFIT_ALGO, dbBrhAlgo, profit_ratio, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_BRH_PROFIT_ALGO)字段profit_ratio失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_BRH_PROFIT_ALGO)字段profit_ratio失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+/****************************************************************************************
+	将数据导入共享内存中	TBL_ACCT_INFO
+ ****************************************************************************************/
+long	lLoadTblAcctInfo(char *pszSettleNum)
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	char	*pszIdx = NULL;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	long			lDefault = 1, lAppType = 1;	
+	dbAcctInfo		stDbAct;
+	char			szFlag[2], szSettleNum[5];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleNum, pszSettleNum, 4);
+	szFlag[0] = '0';
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_acct_info CURSOR FOR SELECT NVL(ACCT_ID, 0), NVL(APP_TYPE, 0), 
+		NVL(APP_ID, ' '),  NVL(ACCT_DEFAULT, 1), NVL(ACCT_TYPE, 0), NVL(ACCT_NO, ' '), 
+		NVL(ACCT_NM, ' '), NVL(ACCT_BANK_NO, ' '), NVL(ACCT_BANK_NM, ' '), NVL(ACCT_ZBANK_NO, ' '), NVL(ACCT_ZBANK_NM, ' '), 
+		NVL(ACCT_ZBANK_ADDR, ' '), NVL(ACCT_ZBANK_CODE, ' '), NVL(ACCT_NET_NO, ' '), NVL(ACCT_UNION_NO, ' ')
+		FROM 
+		(SELECT * FROM TBL_ACCT_INFO WHERE (APP_ID IN (SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum))
+	  		AND ACCT_FLAG = :szFlag AND ACCT_DEFAULT = :lDefault
+ 		UNION
+ 		SELECT * FROM TBL_ACCT_INFO WHERE APP_TYPE = :lAppType AND ACCT_FLAG = :szFlag AND ACCT_DEFAULT = :lDefault)
+		ORDER BY APP_ID;
+
+	EXEC SQL OPEN Cur_acct_info;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_acct_info错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表Tbl_acct_info错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_ACCT_INFO)->lValid = 0;
+	pGetTblDef(TBL_ACCT_INFO)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbAct, 0, sizeof(stDbAct));
+		EXEC SQL FETCH Cur_acct_info INTO :stDbAct.acct_id, :stDbAct.app_type, :stDbAct.app_id, :stDbAct.acct_default, 
+			:stDbAct.acct_type, :stDbAct.acct_no, :stDbAct.acct_nm, :stDbAct.acct_bank_no, :stDbAct.acct_bank_nm, 
+			:stDbAct.acct_zbank_no, :stDbAct.acct_zbank_nm, :stDbAct.acct_zbank_addr, :stDbAct.acct_zbank_code, 
+			:stDbAct.acct_net_no, :stDbAct.acct_union_no;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_acct_info; 
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;	
+
+		lCount ++;
+		if(lGetTblCount(TBL_ACCT_INFO) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_ACCT_INFO), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_ACCT_INFO), lCount);
+			EXEC SQL CLOSE Cur_acct_info; 
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		
+		sTrimAll(stDbAct.app_id);	
+		sTrimAll(stDbAct.acct_type);	
+		sTrimAll(stDbAct.acct_no);	
+		sTrimAll(stDbAct.acct_nm);	
+		sTrimAll(stDbAct.acct_bank_no);	
+		sTrimAll(stDbAct.acct_bank_nm);	
+		sTrimAll(stDbAct.acct_zbank_no);	
+		sTrimAll(stDbAct.acct_zbank_nm);	
+		sTrimAll(stDbAct.acct_zbank_addr);	
+		sTrimAll(stDbAct.acct_zbank_code);	
+		sTrimAll(stDbAct.acct_net_no);	
+		sTrimAll(stDbAct.acct_union_no);	
+
+		//	deubg
+		if(0 == strlen(stDbAct.acct_zbank_no))
+			HtLog(ERR_PARAM, "APPID(%s)账号(%s)支行号为空(%s)", stDbAct.app_id, stDbAct.acct_no, stDbAct.acct_zbank_no);
+
+		pszIdx = sGetComIdx(stDbAct.app_id, sizeof(stDbAct.app_id) - 1, stDbAct.app_type, stDbAct.acct_default);
+		if(!pszIdx)
+		{
+			HtLog(ERR_PARAM, "设置组合索引错误:(%s)", sGetError());
+			vDestroyTree(pstRoot);
+			EXEC SQL CLOSE Cur_acct_info; 
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		pstRoot = (Tree *)pInsertTree(pstRoot, pszIdx, ++(pGetTblDef(TBL_ACCT_INFO)->lTreeNode), 0, 
+			MAX_INDEX_LEN, lGetTblPos(TBL_ACCT_INFO) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载账号(%s)失败, 原因:%s", stDbAct.app_id, sGetError());
+			EXEC SQL CLOSE Cur_acct_info; 
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		stDbAct.acct_id = lSetEXLong(stDbAct.acct_id);
+		stDbAct.app_type = lSetEXLong(stDbAct.app_type);
+		stDbAct.acct_default = lSetEXLong(stDbAct.acct_default);
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_ACCT_INFO)), &stDbAct, sizeof(stDbAct));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbAct);
+		pGetTblDef(TBL_ACCT_INFO)->lValid ++;
+	}  
+	EXEC SQL CLOSE Cur_acct_info; 
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_ACCT_INFO)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_ACCT_INFO), 
+		pGetTblDef(TBL_ACCT_INFO)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_ACCT_INFO表建立字段app_id, app_type, acct_default快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_ACCT_INFO)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_ACCT_INFO)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot); 
+//	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_ACCT_INFO)), (char *)pInitSHTree(NULL), sizeof(SHTree));
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_id)");
+	lRet = IBPSetUnIdx(TBL_ACCT_INFO, dbAcctInfo, acct_id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(app_type)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, app_type, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(app_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(app_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(app_id)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, app_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(app_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(app_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_type)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, acct_type, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_default)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, acct_default, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_default)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_default)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_no)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, acct_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_bank_no)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, acct_bank_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_bank_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_bank_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_zbank_no)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, acct_zbank_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_zbank_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_zbank_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_zbank_code)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, acct_zbank_code, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_zbank_code)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_zbank_code)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_net_no)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, acct_net_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_net_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_net_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_ACCT_INFO)索引(acct_union_no)");
+	lRet = IBPSetIdx(TBL_ACCT_INFO, dbAcctInfo, acct_union_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_ACCT_INFO)字段(acct_union_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_ACCT_INFO)字段(acct_union_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_OPR_INFO
+ ****************************************************************************************/
+long	lLoadTblOprInfo(char *pszSettleNum)
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbOprInf	stOprInf;
+	char		szSettleNum[5];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleNum, pszSettleNum, 4);
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_opr_info CURSOR FOR 
+		SELECT NVL(OPR_ID, 0), NVL(OPR_CODE, ' '), NVL(OPR_NAME, ' ') FROM TBL_OPR_INFO 
+			WHERE OPR_ID IN (SELECT MCHT_EXPAND FROM TBL_MCHT_BASE WHERE MCHT_NO IN 
+				(SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum));
+
+	EXEC SQL OPEN Cur_opr_info;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表TBL_OPR_INFO错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表TBL_OPR_INFO错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_OPR_INFO)->lValid = 0;
+	pGetTblDef(TBL_OPR_INFO)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stOprInf, 0, sizeof(stOprInf));
+		EXEC SQL FETCH Cur_opr_info INTO :stOprInf.opr_id, :stOprInf.opr_code, :stOprInf.opr_name;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_opr_info;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_OPR_INFO) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_OPR_INFO), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_OPR_INFO), lCount);
+			EXEC SQL CLOSE Cur_opr_info;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stOprInf.opr_code);	
+		sTrimAll(stOprInf.opr_name);	
+		stOprInf.opr_id = lSetEXLong(stOprInf.opr_id);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, (void *)&stOprInf.opr_id, ++(pGetTblDef(TBL_OPR_INFO)->lTreeNode),
+			dbOprInf, opr_id, lGetTblPos(TBL_OPR_INFO) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载操作员ID(%d)失败, 原因:%s", stOprInf.opr_id, sGetError());
+			EXEC SQL CLOSE Cur_opr_info;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_OPR_INFO)), &stOprInf, sizeof(dbOprInf));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(dbOprInf);
+		pGetTblDef(TBL_OPR_INFO)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_opr_info;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_OPR_INFO)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_OPR_INFO), 
+		pGetTblDef(TBL_OPR_INFO)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_OPR_INFO表建立字段opr_id快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_OPR_INFO)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_OPR_INFO)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_OPR_INFO)索引(opr_id)");
+	lRet = IBPSetUnIdx(TBL_OPR_INFO, dbOprInf, opr_id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_OPR_INFO)字段(opr_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_OPR_INFO)字段(opr_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_OPR_INFO)索引(opr_code)");
+	lRet = IBPSetIdx(TBL_OPR_INFO, dbOprInf, opr_code, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_OPR_INFO)字段(opr_code)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_OPR_INFO)字段(opr_code)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_OPR_INFO)索引(opr_name)");
+	lRet = IBPSetIdx(TBL_OPR_INFO, dbOprInf, opr_name, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_OPR_INFO)字段(opr_name)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_OPR_INFO)字段(opr_name)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_SPDB_BRH
+ ****************************************************************************************/
+long	lLoadTblSpdbBrh()
+{
+	long	lRet = 0, lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbSpdbBrh	stDbSpdb;
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_spdb_brh CURSOR FOR SELECT NVL(ID, 0), NVL(REGION_NAME, ' '),
+		NVL(BRH_AREA_NO, ' ') FROM TBL_SPDB_BRH WHERE 1 = 1 ORDER BY ID;
+
+	EXEC SQL OPEN Cur_spdb_brh;	
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_spdb_brh错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表Tbl_spdb_brh错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_SPDB_BRH)->lValid = 0;
+	pGetTblDef(TBL_SPDB_BRH)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbSpdb, 0, sizeof(stDbSpdb));
+		EXEC SQL FETCH Cur_spdb_brh INTO :stDbSpdb.id, :stDbSpdb.region_name, :stDbSpdb.brh_area_no;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_spdb_brh;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_SPDB_BRH) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_SPDB_BRH), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_SPDB_BRH), lCount);
+			EXEC SQL CLOSE Cur_spdb_brh;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbSpdb.region_name);	
+		sTrimAll(stDbSpdb.brh_area_no);	
+		stDbSpdb.id = lSetEXLong(stDbSpdb.id);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_SPDB_BRH)), &stDbSpdb, sizeof(stDbSpdb));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbSpdb);
+		pGetTblDef(TBL_SPDB_BRH)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_spdb_brh;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_SPDB_BRH)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_SPDB_BRH), 
+		pGetTblDef(TBL_SPDB_BRH)->lValid);
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_SPDB_BRH)), (char *)pInitSHTree(NULL), sizeof(SHTree));
+
+	HtLog(NML_PARAM, "初始化表(TBL_SPDB_BRH)索引(id)");
+	lRet = IBPSetUnIdx(TBL_SPDB_BRH, dbSpdbBrh, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SPDB_BRH)字段(id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SPDB_BRH)字段(id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SPDB_BRH)索引(brh_area_no)");
+	lRet = IBPSetIdx(TBL_SPDB_BRH, dbSpdbBrh, brh_area_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SPDB_BRH)字段(brh_area_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SPDB_BRH)字段(brh_area_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_MCHT_BASE
+ ****************************************************************************************/
+long	lLoadTblMchtBase(char *pszSettleNum)
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMchtBase		stDbBase;
+	char			szSettleNum[5];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleNum, pszSettleNum, 4);
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_mcht_base CURSOR FOR SELECT NVL(id, 0), NVL(MCHT_NO, ' '), NVL(MCHT_NM, ' '), 
+		NVL(MCHT_STATUS, ' '), NVL(MCHT_KIND, ' '), NVL(MCHT_TYPE, ' '), NVL(MCHT_UP_NO, ' '), 
+		NVL(MCHT_AREA_NO, ' '), NVL(MCHT_ADDR, ' '), NVL(MCHT_GRP, ' '), NVL(MCHT_MCC, ' '), NVL(MCHT_BRH, ' '), 
+		NVL(MCHT_STLM_BRH, ' '), NVL(MCHT_DISC_ID0, ' '), NVL(MCHT_DISC_ID, ' '), NVL(MCHT_DISC_THIS, ' '), 
+		NVL(MCHT_OPR_FLAG, ' '), NVL(MCHT_RESV1, 0), NVL(MCHT_EXPAND, 0) FROM TBL_MCHT_BASE
+		WHERE MCHT_NO IN (SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum) 
+		ORDER BY MCHT_NO, MCHT_STLM_BRH;
+
+	EXEC SQL OPEN Cur_mcht_base;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_mcht_base错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表Tbl_mcht_base错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_MCHT_BASE)->lValid = 0;
+	pGetTblDef(TBL_MCHT_BASE)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbBase, 0, sizeof(stDbBase));
+	   	EXEC SQL FETCH Cur_mcht_base INTO :stDbBase.id, :stDbBase.mcht_no, :stDbBase.mcht_nm, :stDbBase.mcht_status,
+		   	:stDbBase.mcht_kind, :stDbBase.mcht_type, :stDbBase.mcht_up_no, :stDbBase.mcht_area_no, :stDbBase.mcht_addr,
+			:stDbBase.mcht_grp, :stDbBase.mcht_mcc, :stDbBase.mcht_brh, :stDbBase.mcht_stlm_brh, :stDbBase.mcht_disc_id0,
+			:stDbBase.mcht_disc_id, :stDbBase.mcht_disc_this, :stDbBase.mcht_opr_flag, :stDbBase.mcht_resv1, 
+			:stDbBase.mcht_expand;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+		   	EXEC SQL CLOSE Cur_mcht_base;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		lCount ++;
+		if(lGetTblCount(TBL_MCHT_BASE) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_BASE), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_BASE), lCount);
+		   	EXEC SQL CLOSE Cur_mcht_base;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbBase.mcht_no);
+		sTrimAll(stDbBase.mcht_nm);
+		sTrimAll(stDbBase.mcht_status);
+		sTrimAll(stDbBase.mcht_kind);
+		sTrimAll(stDbBase.mcht_type);
+		sTrimAll(stDbBase.mcht_up_no);
+		sTrimAll(stDbBase.mcht_area_no);
+		sTrimAll(stDbBase.mcht_addr);
+		sTrimAll(stDbBase.mcht_grp);
+		sTrimAll(stDbBase.mcht_mcc);
+		sTrimAll(stDbBase.mcht_brh);
+		sTrimAll(stDbBase.mcht_stlm_brh);
+		sTrimAll(stDbBase.mcht_disc_id0);
+		sTrimAll(stDbBase.mcht_disc_id);
+		sTrimAll(stDbBase.mcht_disc_this);
+		sTrimAll(stDbBase.mcht_opr_flag);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stDbBase.mcht_no, ++(pGetTblDef(TBL_MCHT_BASE)->lTreeNode),
+			dbMchtBase, mcht_no, lGetTblPos(TBL_MCHT_BASE) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载商户(%s)失败, 原因:%s", stDbBase.mcht_no, sGetError());
+		   	EXEC SQL CLOSE Cur_mcht_base;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		stDbBase.id = lSetEXLong(stDbBase.id);
+		stDbBase.mcht_resv1 = lSetEXLong(stDbBase.mcht_resv1);
+		stDbBase.mcht_expand = lSetEXLong(stDbBase.mcht_expand);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_MCHT_BASE)), &stDbBase, sizeof(stDbBase));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbBase);
+		pGetTblDef(TBL_MCHT_BASE)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_mcht_base;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_MCHT_BASE)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_MCHT_BASE), 
+		pGetTblDef(TBL_MCHT_BASE)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_MCHT_BASE表建立字段mcht_no快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_BASE)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_BASE)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(id)");
+	lRet = IBPSetUnIdx(TBL_MCHT_BASE, dbMchtBase, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_no)");
+	lRet = IBPSetUnIdx(TBL_MCHT_BASE, dbMchtBase, mcht_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_status)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_status, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_status)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_status)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_kind)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_kind, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_kind)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_kind)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_type)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_type, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_up_no)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_up_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_up_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_up_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_area_no)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_area_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_area_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_area_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_grp)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_grp, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_grp)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_grp)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_mcc)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_mcc, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_mcc)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_mcc)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_brh)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_brh, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_brh)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_brh)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_stlm_brh)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_stlm_brh, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_stlm_brh)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_stlm_brh)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_disc_id0)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_disc_id0, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_disc_id0)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_disc_id0)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_disc_id)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_disc_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_disc_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_disc_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_disc_this)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_disc_this, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_disc_this)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_disc_this)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_opr_flag)");
+	lRet = IBPSetIdx(TBL_MCHT_BASE, dbMchtBase, mcht_opr_flag, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_opr_flag)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_opr_flag)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_BASE)索引(mcht_resv1)");
+	lRet = IBPSetUnIdx(TBL_MCHT_BASE, dbMchtBase, mcht_resv1, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_BASE)字段(mcht_resv1)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_BASE)字段(mcht_resv1)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_MCHT_ALGO
+ ****************************************************************************************/
+long	lLoadTblMchtAlgo()
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMchtAlgo	stDbMchtAlgo;
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_mcht_algo CURSOR FOR SELECT NVL(MODEL_ID, ' '), NVL(MODEL_TYPE, ' '),
+		NVL(CYCLE_TYPE, ' '), NVL(STLM_FLAG, ' '), NVL(MODEL_FLAG, ' '), NVL(TRANS_TYPE, ' '),
+		NVL(MCHT_GRP, ' '), NVL(CARD_TYPE, 0) FROM TBL_MCHT_ALGO ORDER BY MODEL_ID;
+
+	EXEC SQL OPEN Cur_mcht_algo;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表tbl_mcht_algo错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表tbl_mcht_algo错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_MCHT_ALGO)->lValid = 0;
+	pGetTblDef(TBL_MCHT_ALGO)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbMchtAlgo, 0, sizeof(stDbMchtAlgo));
+		EXEC SQL FETCH Cur_mcht_algo INTO :stDbMchtAlgo.model_id, :stDbMchtAlgo.model_type, 
+			:stDbMchtAlgo.cycle_type, :stDbMchtAlgo.stlm_flag, :stDbMchtAlgo.model_flag, 
+			:stDbMchtAlgo.trans_type, :stDbMchtAlgo.mcht_grp, :stDbMchtAlgo.card_type;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_algo;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_MCHT_ALGO) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_ALGO), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_ALGO), lCount);
+			EXEC SQL CLOSE Cur_mcht_algo;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbMchtAlgo.model_id);	
+		sTrimAll(stDbMchtAlgo.model_type);	
+		sTrimAll(stDbMchtAlgo.cycle_type);	
+		sTrimAll(stDbMchtAlgo.stlm_flag);	
+		sTrimAll(stDbMchtAlgo.model_flag);	
+		sTrimAll(stDbMchtAlgo.trans_type);	
+		sTrimAll(stDbMchtAlgo.mcht_grp);	
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stDbMchtAlgo.model_id, ++(pGetTblDef(TBL_MCHT_ALGO)->lTreeNode),
+			dbMchtAlgo, model_id, lGetTblPos(TBL_MCHT_ALGO) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载商户模型(%s)失败, 原因:%s", stDbMchtAlgo.model_id, sGetError());
+			EXEC SQL CLOSE Cur_mcht_algo;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		stDbMchtAlgo.card_type = lSetEXLong(stDbMchtAlgo.card_type);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_MCHT_ALGO)), &stDbMchtAlgo, sizeof(stDbMchtAlgo));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbMchtAlgo);
+		pGetTblDef(TBL_MCHT_ALGO)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_mcht_algo;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_MCHT_ALGO)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_MCHT_ALGO), 
+		pGetTblDef(TBL_MCHT_ALGO)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_MCHT_ALGO表建立字段model_id快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_ALGO)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_ALGO)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_ALGO)索引(model_id)");
+	lRet = IBPSetUnIdx(TBL_MCHT_ALGO, dbMchtAlgo, model_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_ALGO)字段(model_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_ALGO)字段(model_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_ALGO)索引(model_type)");
+	lRet = IBPSetIdx(TBL_MCHT_ALGO, dbMchtAlgo, model_type, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_ALGO)字段(model_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_ALGO)字段(model_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_ALGO)索引(cycle_type)");
+	lRet = IBPSetIdx(TBL_MCHT_ALGO, dbMchtAlgo, cycle_type, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_ALGO)字段(cycle_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_ALGO)字段(cycle_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_ALGO)索引(stlm_flag)");
+	lRet = IBPSetIdx(TBL_MCHT_ALGO, dbMchtAlgo, stlm_flag, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_ALGO)字段(stlm_flag)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_ALGO)字段(stlm_flag)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_ALGO)索引(model_flag)");
+	lRet = IBPSetIdx(TBL_MCHT_ALGO, dbMchtAlgo, model_flag, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_ALGO)字段(model_flag)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_ALGO)字段(model_flag)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_ALGO)索引(trans_type)");
+	lRet = IBPSetIdx(TBL_MCHT_ALGO, dbMchtAlgo, trans_type, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_ALGO)字段(trans_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_ALGO)字段(trans_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_ALGO)索引(mcht_grp)");
+	lRet = IBPSetIdx(TBL_MCHT_ALGO, dbMchtAlgo, mcht_grp, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_ALGO)字段(mcht_grp)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_ALGO)字段(mcht_grp)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_ALGO)索引(card_type)");
+	lRet = IBPSetIdx(TBL_MCHT_ALGO, dbMchtAlgo, card_type, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_ALGO)字段(card_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_ALGO)字段(card_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_PUB_DISC_ALGO
+ ****************************************************************************************/
+long	lLoadTblDiscAlgo()
+{
+	long	lRet = 0, lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbDiscAlgo	stDbAlgo; 
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_pub_disc_algo CURSOR FOR SELECT NVL(ID, 0), NVL(DISC_ID, ' '),
+		NVL(INDEX_NUM, 0),  NVL(MIN_FEE, 0.00), NVL(MAX_FEE, 0.00), NVL(FLOOR_AMOUNT, 0.00),
+		NVL(UPPER_AMOUNT, 0.00), NVL(FLAG, 0), NVL(FEE_VALUE, 0), NVL(CARD_TYPE, 0)
+		FROM TBL_PUB_DISC_ALGO ORDER BY DISC_ID, UPPER_AMOUNT;
+
+	EXEC SQL OPEN Cur_pub_disc_algo;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_disc_algo错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表Tbl_disc_algo错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();	
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_PUB_DISC_ALGO)->lValid = 0;
+	pGetTblDef(TBL_PUB_DISC_ALGO)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbAlgo, 0, sizeof(stDbAlgo));
+		EXEC SQL FETCH Cur_pub_disc_algo INTO :stDbAlgo.id, :stDbAlgo.disc_id, :stDbAlgo.index_num,
+			:stDbAlgo.min_fee, :stDbAlgo.max_fee, :stDbAlgo.floor_amount, :stDbAlgo.upper_amount, 
+			:stDbAlgo.flag, :stDbAlgo.fee_value, :stDbAlgo.card_type;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_pub_disc_algo;
+			vDbsDisconnect();	
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_PUB_DISC_ALGO) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_PUB_DISC_ALGO), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_PUB_DISC_ALGO), lCount);
+			EXEC SQL CLOSE Cur_pub_disc_algo;
+			vDbsDisconnect();	
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbAlgo.disc_id);	
+		stDbAlgo.id = lSetEXLong(stDbAlgo.id);
+		stDbAlgo.index_num = lSetEXLong(stDbAlgo.index_num);
+		stDbAlgo.flag = lSetEXLong(stDbAlgo.flag);
+		stDbAlgo.card_type = lSetEXLong(stDbAlgo.card_type);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_PUB_DISC_ALGO)), &stDbAlgo, sizeof(stDbAlgo));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbAlgo);
+		pGetTblDef(TBL_PUB_DISC_ALGO)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_pub_disc_algo;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_PUB_DISC_ALGO)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_PUB_DISC_ALGO), 
+		pGetTblDef(TBL_PUB_DISC_ALGO)->lValid);
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_PUB_DISC_ALGO)), (char *)pInitSHTree(NULL), sizeof(SHTree));
+
+	HtLog(NML_PARAM, "初始化表(TBL_PUB_DISC_ALGO)索引(id)");
+	lRet = IBPSetUnIdx(TBL_PUB_DISC_ALGO, dbDiscAlgo, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_PUB_DISC_ALGO)字段(id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_PUB_DISC_ALGO)字段(id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_PUB_DISC_ALGO)索引(disc_id)");
+	lRet = IBPSetIdx(TBL_PUB_DISC_ALGO, dbDiscAlgo, disc_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_PUB_DISC_ALGO)字段(disc_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_PUB_DISC_ALGO)字段(disc_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_PUB_DISC_ALGO)索引(index_num)");
+	lRet = IBPSetIdx(TBL_PUB_DISC_ALGO, dbDiscAlgo, index_num, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_PUB_DISC_ALGO)字段(index_num)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_PUB_DISC_ALGO)字段(index_num)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_PUB_DISC_ALGO)索引(flag)");
+	lRet = IBPSetIdx(TBL_PUB_DISC_ALGO, dbDiscAlgo, flag, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_PUB_DISC_ALGO)字段(flag)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_PUB_DISC_ALGO)字段(flag)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_PUB_DISC_ALGO)索引(card_type)");
+	lRet = IBPSetIdx(TBL_PUB_DISC_ALGO, dbDiscAlgo, card_type, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_PUB_DISC_ALGO)字段(card_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_PUB_DISC_ALGO)字段(card_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+/****************************************************************************************
+	将数据导入共享内存中	TBL_MCHT_USER
+ ****************************************************************************************/
+long	lLoadTblMchtUser(char *pszSettleNum)
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMchtUser	stDbUser;
+	char		szSettleNum[5], szPrimary[2];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szPrimary, 0, sizeof(szPrimary));
+
+	memcpy(szSettleNum, pszSettleNum, 4);
+	szPrimary[0] = '1';
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_mcht_user CURSOR FOR 
+		SELECT NVL(USER_ID, 0), NVL(MCHT_NO, ' '), NVL(USER_NAME, ' '), 
+			NVL(USER_ENGNAME, ' '), NVL(USER_PHONE, ' '), NVL(USER_EMAIL, ' '), 
+			NVL(USER_CARD_NO, ' ') FROM TBL_MCHT_USER 
+		WHERE USER_PRIMARY = :szPrimary AND MCHT_NO IN 
+			(SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum);
+
+	EXEC SQL OPEN Cur_mcht_user;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表TBL_MCHT_USER错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表TBL_MCHT_USER错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_MCHT_USER)->lValid = 0;
+	pGetTblDef(TBL_MCHT_USER)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbUser, 0, sizeof(stDbUser));
+		EXEC SQL FETCH Cur_mcht_user INTO :stDbUser.user_id, :stDbUser.mcht_no, 
+			:stDbUser.user_name, :stDbUser.user_engname, :stDbUser.user_phone,
+			:stDbUser.user_email, :stDbUser.user_card_no;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_user;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_MCHT_USER) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_USER), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_USER), lCount);
+			EXEC SQL CLOSE Cur_mcht_user;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDbUser.mcht_no);
+		sTrimAll(stDbUser.user_name);
+		sTrimAll(stDbUser.user_engname);
+		sTrimAll(stDbUser.user_phone);
+		sTrimAll(stDbUser.user_email);
+		sTrimAll(stDbUser.user_card_no);
+		stDbUser.user_id = lSetEXLong(stDbUser.user_id);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, (void *)&stDbUser.user_id, ++(pGetTblDef(TBL_MCHT_USER)->lTreeNode),
+			dbMchtUser, user_id, lGetTblPos(TBL_MCHT_USER) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载操作员ID(%d)失败, 原因:%s", stDbUser.user_id, sGetError());
+			EXEC SQL CLOSE Cur_mcht_user;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_MCHT_USER)), &stDbUser, sizeof(dbMchtUser));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(dbMchtUser);
+		pGetTblDef(TBL_MCHT_USER)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_mcht_user;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_MCHT_USER)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_MCHT_USER), 
+		pGetTblDef(TBL_MCHT_USER)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_MCHT_ALGO表建立字段model_id快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_USER)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_USER)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_USER)索引(user_id)");
+	lRet = IBPSetUnIdx(TBL_MCHT_USER, dbMchtUser, user_id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_USER)字段(user_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_USER)字段(user_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_USER)索引(mcht_no)");
+	lRet = IBPSetIdx(TBL_MCHT_USER, dbMchtUser, mcht_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_USER)字段(mcht_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_USER)字段(mcht_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_USER)索引(user_phone)");
+	lRet = IBPSetIdx(TBL_MCHT_USER, dbMchtUser, user_phone, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_USER)字段(user_phone)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_USER)字段(user_phone)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_USER)索引(user_email)");
+	lRet = IBPSetIdx(TBL_MCHT_USER, dbMchtUser, user_email, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_USER)字段(user_email)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_USER)字段(user_email)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_USER)索引(user_card_no)");
+	lRet = IBPSetIdx(TBL_MCHT_USER, dbMchtUser, user_card_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_USER)字段(user_card_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_USER)字段(user_card_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_MCHT_CUPS_INF
+ ****************************************************************************************/
+long	lLoadTblMchtCupsInf()
+{
+	long	lRet = 0, lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMchtCupsInf	stDbCups;
+	EXEC SQL END DECLARE SECTION;
+
+	lRet = lDbsConnect(DBS_ROUTE);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_mcht_cups_inf CURSOR FOR SELECT NVL(ID, 0), NVL(CUPS_NO, ' '),
+		NVL(CUPS_NM, ' '), NVL(MCHT_CUPS_NO, ' '), NVL(TERM_CUPS_NO, ' '), NVL(FEE_RATE, 0.00), 
+		NVL(FEE_VAL, 0.00), NVL(CUP_STAMP, ' ') FROM TBL_MCHT_CUPS_INF ORDER BY CUPS_NO;
+
+	EXEC SQL OPEN Cur_mcht_cups_inf;	
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_mcht_cups_inf错误, (%d)(%s)", SQLCODE, sDbsError());
+		vSetErrMsg("定义表Tbl_mcht_cups_inf错误, (%d)(%s)", SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_MCHT_CUPS_INF)->lValid = 0;
+	pGetTblDef(TBL_MCHT_CUPS_INF)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbCups, 0, sizeof(stDbCups));
+		EXEC SQL FETCH Cur_mcht_cups_inf INTO :stDbCups.id, :stDbCups.cups_no, :stDbCups.cups_nm, 
+			:stDbCups.mcht_cups_no, :stDbCups.term_cups_no, :stDbCups.fee_rate, :stDbCups.fee_val,
+			:stDbCups.cup_stamp;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_cups_inf;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_MCHT_CUPS_INF) <= lCount)
+		{
+			break;
+/*
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_CUPS_INF), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_MCHT_CUPS_INF), lCount);
+			EXEC SQL CLOSE Cur_mcht_cups_inf;
+			vDbsDisconnect();
+			return RC_FAIL;
+*/
+		}
+
+		sTrimAll(stDbCups.cups_no);	
+		sTrimAll(stDbCups.cups_nm);	
+		sTrimAll(stDbCups.mcht_cups_no);	
+		sTrimAll(stDbCups.term_cups_no);	
+		sTrimAll(stDbCups.cup_stamp);	
+		stDbCups.id = lSetEXLong(stDbCups.id);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_MCHT_CUPS_INF)), &stDbCups, sizeof(dbMchtCupsInf));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(dbMchtCupsInf);
+		pGetTblDef(TBL_MCHT_CUPS_INF)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_mcht_cups_inf;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_MCHT_CUPS_INF)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_MCHT_CUPS_INF), 
+		pGetTblDef(TBL_MCHT_CUPS_INF)->lValid);
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_MCHT_CUPS_INF)), (char *)pInitSHTree(NULL), sizeof(SHTree));
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_CUPS_INF)索引(id)");
+	lRet = IBPSetUnIdx(TBL_MCHT_CUPS_INF, dbMchtCupsInf, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_CUPS_INF)字段(id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_CUPS_INF)字段(id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_CUPS_INF)索引(cups_no)");
+	lRet = IBPSetIdx(TBL_MCHT_CUPS_INF, dbMchtCupsInf, cups_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_CUPS_INF)字段(cups_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_CUPS_INF)字段(cups_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_CUPS_INF)索引(mcht_cups_no)");
+	lRet = IBPSetIdx(TBL_MCHT_CUPS_INF, dbMchtCupsInf, mcht_cups_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_CUPS_INF)字段(mcht_cups_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_CUPS_INF)字段(mcht_cups_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_MCHT_CUPS_INF)索引(term_cups_no)");
+	lRet = IBPSetIdx(TBL_MCHT_CUPS_INF, dbMchtCupsInf, term_cups_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_MCHT_CUPS_INF)字段(term_cups_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_MCHT_CUPS_INF)字段(term_cups_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_N_MCHT_MATCH
+ ****************************************************************************************/
+long	lLoadTblNMchtMatch()
+{
+	long	lRet = 0, lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbNMchtMatch	stDbMatch;
+	EXEC SQL END DECLARE SECTION;
+
+	if(RC_SUCC != lDbsConnect(DBS_ROUTE))
+	{
+		vSetErrMsg("连接数据库失败, err:(%s)", sDbsError());
+		return RC_FAIL;
+	} 
+
+	EXEC SQL DECLARE Cur_n_mcht_match CURSOR FOR 
+		SELECT NVL(ID, 0), NVL(CUPS_NO, ' '), NVL(MCHT_STAT, ' '), NVL(EXPORT_STAT, ' '), 
+		NVL(LOCAL_MCHT_NO, ' '), NVL(CUPS_MCHT_SORT_NO, ' '), NVL(CUPS_MCHT_NO, ' '), 
+		NVL(REASON, ' '), NVL(RESV_0, 0), NVL(RESV_1, ' '), NVL(FEE_RATE, 0.00), NVL(FEE_VAL, 0.00), 
+		NVL(MCHT_NM, ' '), NVL(EXPORT_DATE, 0), NVL(MCHT_GRP, ' '), NVL(MCHT_MCC, ' '),
+		NVL(MCHT_DISC_ID, ' ') FROM TBL_N_MCHT_MATCH ORDER BY CUPS_NO;
+
+	EXEC SQL OPEN Cur_n_mcht_match;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_n_mcht_match错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表Tbl_n_mcht_match错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_N_MCHT_MATCH)->lValid = 0;
+	pGetTblDef(TBL_N_MCHT_MATCH)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbMatch, 0, sizeof(stDbMatch));
+		EXEC SQL FETCH Cur_n_mcht_match INTO :stDbMatch.id, :stDbMatch.cups_no, :stDbMatch.mcht_stat,
+			:stDbMatch.export_stat, :stDbMatch.local_mcht_no, :stDbMatch.cups_mcht_sort_no, 
+			:stDbMatch.cups_mcht_no, :stDbMatch.reason, :stDbMatch.resv_0, :stDbMatch.resv_1, 
+			:stDbMatch.fee_rate, :stDbMatch.fee_val, :stDbMatch.mcht_nm, :stDbMatch.export_date, 
+			:stDbMatch.mcht_grp, :stDbMatch.mcht_mcc, :stDbMatch.mcht_disc_id;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_n_mcht_match;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		lCount ++;
+		if(lGetTblCount(TBL_N_MCHT_MATCH) <= lCount)
+		{
+			break;
+/*
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_N_MCHT_MATCH), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_N_MCHT_MATCH), lCount);
+			EXEC SQL CLOSE Cur_n_mcht_match;
+			return RC_FAIL;
+*/
+		}
+
+		sTrimAll(stDbMatch.cups_no);
+		sTrimAll(stDbMatch.mcht_stat);
+		sTrimAll(stDbMatch.export_stat);
+		sTrimAll(stDbMatch.local_mcht_no);
+		sTrimAll(stDbMatch.cups_mcht_sort_no);
+		sTrimAll(stDbMatch.cups_mcht_no);
+		sTrimAll(stDbMatch.reason);
+		sTrimAll(stDbMatch.resv_1);
+		sTrimAll(stDbMatch.mcht_nm);
+		sTrimAll(stDbMatch.export_date);
+		sTrimAll(stDbMatch.mcht_grp);
+		sTrimAll(stDbMatch.mcht_mcc);
+		sTrimAll(stDbMatch.mcht_disc_id);		
+		stDbMatch.id = lSetEXLong(stDbMatch.id);
+		stDbMatch.resv_0 = lSetEXLong(stDbMatch.resv_0);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_N_MCHT_MATCH)), &stDbMatch, sizeof(stDbMatch));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbMatch);
+		pGetTblDef(TBL_N_MCHT_MATCH)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_n_mcht_match;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_N_MCHT_MATCH)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_N_MCHT_MATCH), 
+		pGetTblDef(TBL_N_MCHT_MATCH)->lValid);
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_N_MCHT_MATCH)), (char *)pInitSHTree(NULL), sizeof(SHTree));
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(id)");
+	lRet = IBPSetUnIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(cups_no)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, cups_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(cups_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(cups_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(mcht_stat)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, mcht_stat, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(mcht_stat)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(mcht_stat)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(export_stat)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, export_stat, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(export_stat)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(export_stat)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(local_mcht_no)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, local_mcht_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(local_mcht_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(local_mcht_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(cups_mcht_sort_no)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, cups_mcht_sort_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(cups_mcht_sort_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(cups_mcht_sort_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(cups_mcht_no)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, cups_mcht_no, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(cups_mcht_no)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(cups_mcht_no)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(export_date)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, export_date, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(export_date)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(export_date)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(mcht_grp)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, mcht_grp, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(mcht_grp)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(mcht_grp)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_N_MCHT_MATCH)索引(mcht_mcc)");
+	lRet = IBPSetIdx(TBL_N_MCHT_MATCH, dbNMchtMatch, mcht_mcc, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_N_MCHT_MATCH)字段(mcht_mcc)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_N_MCHT_MATCH)字段(mcht_mcc)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_SERVICE_CONFIG
+ ****************************************************************************************/
+long	lLoadTblServiceCfg()
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbSvceCfg	stDbCfg;
+	char		szNormal[10];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szNormal, 0, sizeof(szNormal));
+	szNormal[0] = '1';
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_service_config CURSOR FOR 
+		SELECT NVL(ID, 0), NVL(SERVICE_CODE, ' '), NVL(SERVICE_NAME, ' '), NVL(SERVICE_VERSION, ' '), 
+		NVL(FEE_RATE, ' '), NVL(PROB_CONCESS_RATE, ' '), NVL(PROB_DAYS, 0), NVL(PLAN_STARTTIME, ' '), 
+		NVL(PLAN_ENDTIME, ' '), NVL(TASK_STATUS, ' '), NVL(PROFIT_RATE, ' '), NVL(PROFIT_BRNO, ' '), 
+		NVL(PROFILE_FLAG, ' ') FROM TBL_SERVICE_CONFIG WHERE TASK_STATUS = :szNormal;
+
+	EXEC SQL OPEN Cur_service_config;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表tbl_service_config错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表tbl_service_config错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_SERVICE_CONFIG)->lValid = 0;
+	pGetTblDef(TBL_SERVICE_CONFIG)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbCfg, 0, sizeof(stDbCfg));
+		EXEC SQL FETCH Cur_service_config INTO :stDbCfg.id, :stDbCfg.service_code, :stDbCfg.service_name, 
+			:stDbCfg.service_version, :stDbCfg.fee_rate, :stDbCfg.prob_concess_rate, :stDbCfg.prob_days, 
+			:stDbCfg.plan_starttime, :stDbCfg.plan_endtime, :stDbCfg.task_status, :stDbCfg.profit_rate,
+			:stDbCfg.profit_brno, :stDbCfg.profile_flag;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_service_config;
+ 			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_SERVICE_CONFIG) <= lCount)
+		{
+			break;
+/*
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_SERVICE_CONFIG), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_SERVICE_CONFIG), lCount);
+			Tbl_service_config_Clo_Sel();
+			return RC_FAIL;
+*/
+		}
+
+		sTrimAll(stDbCfg.service_code);	
+		sTrimAll(stDbCfg.service_name);	
+		sTrimAll(stDbCfg.service_version);	
+		sTrimAll(stDbCfg.fee_rate);	
+		sTrimAll(stDbCfg.prob_concess_rate);	
+		sTrimAll(stDbCfg.plan_starttime);	
+		sTrimAll(stDbCfg.plan_endtime);	
+		sTrimAll(stDbCfg.task_status);	
+		sTrimAll(stDbCfg.profit_rate);	
+		sTrimAll(stDbCfg.profit_brno);	
+		sTrimAll(stDbCfg.profile_flag);	
+
+		stDbCfg.id = lSetEXLong(stDbCfg.id);
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, (void *)&stDbCfg.id, ++(pGetTblDef(TBL_SERVICE_CONFIG)->lTreeNode),
+			dbSvceCfg, id, lGetTblPos(TBL_SERVICE_CONFIG) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载服务费模型(%d)失败, 原因:%s", stDbCfg.id, sGetError());
+			EXEC SQL CLOSE Cur_service_config;
+ 			vDestroyTree(pstRoot);
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		stDbCfg.prob_days = lSetEXLong(stDbCfg.prob_days);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_SERVICE_CONFIG)), &stDbCfg, sizeof(stDbCfg));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbCfg);
+		pGetTblDef(TBL_SERVICE_CONFIG)->lValid ++;
+		if(g_LoadSize < ((IBPShm *)pGetShmRun())->m_lOffset)
+		{
+			HtLog(ERR_PARAM, "共享内存表空间超限！(%d)<(%d)", g_LoadSize, ((IBPShm *)pGetShmRun())->m_lOffset);
+			EXEC SQL CLOSE Cur_service_config;
+			vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(service_code)失败(%d)", lRet);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_service_config;
+	vDbsDisconnect();
+
+	HtLog(NML_PARAM, "(TBL_SERVICE_CONFIG)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_SERVICE_CONFIG), 
+		pGetTblDef(TBL_SERVICE_CONFIG)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_SERVICE_CONFIG表建立字段id快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_SERVICE_CONFIG)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_SERVICE_CONFIG)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(id)");
+	lRet = IBPSetUnIdx(TBL_SERVICE_CONFIG, dbSvceCfg, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(service_code)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, service_code, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(service_code)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(service_code)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(service_version)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, service_version, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(service_version)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(service_version)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(fee_rate)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, fee_rate, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(fee_rate)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(fee_rate)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(prob_concess_rate)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, prob_concess_rate, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(prob_concess_rate)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(prob_concess_rate)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(prob_days)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, prob_days, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(prob_days)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(prob_days)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(plan_starttime)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, plan_starttime, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(plan_starttime)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(plan_starttime)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(plan_endtime)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, plan_endtime, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(plan_endtime)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(plan_endtime)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(task_status)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, task_status, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(task_status)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(task_status)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(profit_rate)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, profit_rate, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(profit_rate)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(profit_rate)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(profit_brno)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, profit_brno, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(profit_brno)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(profit_brno)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_CONFIG)索引(profile_flag)");
+	lRet = IBPSetIdx(TBL_SERVICE_CONFIG, dbSvceCfg, profile_flag, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_CONFIG)字段(profile_flag)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_CONFIG)字段(profile_flag)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_DISC_ALGO
+ ****************************************************************************************/
+long	lLoadTblDisc()
+{
+	long	lRet = 0, lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbDisc	stDbDisc;
+	char	szFlag[2];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	szFlag[0] = '0';
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_disc_algo CURSOR FOR SELECT NVL(ID, 0), NVL(DISC_ID, ' '),
+		NVL(INDEX_NUM, 0),  NVL(MIN_FEE, 0.00), NVL(MAX_FEE, 0.00), NVL(FLOOR_AMOUNT, 0.00),
+		NVL(UPPER_AMOUNT, 0.00), NVL(FLAG, 0), NVL(FEE_VALUE, 0), NVL(CARD_TYPE, 0)
+		FROM TBL_DISC_ALGO WHERE DISC_ID IN 
+			(SELECT DISC_ID FROM TBL_DISC_INFO WHERE DISC_FLAG = :szFlag) 
+		ORDER BY DISC_ID, UPPER_AMOUNT;
+
+	EXEC SQL OPEN Cur_disc_algo;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_disc_algo错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表Tbl_disc_algo错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();	
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_DISC_ALGO)->lValid = 0;
+	pGetTblDef(TBL_DISC_ALGO)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbDisc, 0, sizeof(stDbDisc));
+		EXEC SQL FETCH Cur_disc_algo INTO :stDbDisc.id, :stDbDisc.disc_id, :stDbDisc.index_num,
+			:stDbDisc.min_fee, :stDbDisc.max_fee, :stDbDisc.floor_amount, :stDbDisc.upper_amount,
+			:stDbDisc.flag, :stDbDisc.fee_value, :stDbDisc.card_type;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_disc_algo;
+			vDbsDisconnect();	
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_DISC_ALGO) <= lCount)
+		{
+			break;
+/*
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_DISC_ALGO), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_DISC_ALGO), lCount);
+			Tbl_disc_algo_Clo_Sel();
+			return RC_FAIL;
+*/
+		}
+
+		sTrimAll(stDbDisc.disc_id);	
+		stDbDisc.id = lSetEXLong(stDbDisc.id);
+		stDbDisc.index_num = lSetEXLong(stDbDisc.index_num);
+		stDbDisc.flag = lSetEXLong(stDbDisc.flag);
+		stDbDisc.card_type = lSetEXLong(stDbDisc.card_type);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_DISC_ALGO)), &stDbDisc, sizeof(stDbDisc));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbDisc);
+		pGetTblDef(TBL_DISC_ALGO)->lValid ++;
+	}
+	EXEC SQL CLOSE Cur_disc_algo;
+	vDbsDisconnect();	
+
+	HtLog(NML_PARAM, "(TBL_DISC_ALGO)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_DISC_ALGO), 
+		pGetTblDef(TBL_DISC_ALGO)->lValid);
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_DISC_ALGO)), (char *)pInitSHTree(NULL), sizeof(SHTree));
+
+	HtLog(NML_PARAM, "初始化表(TBL_DISC_ALGO)索引(id)");
+	lRet = IBPSetUnIdx(TBL_DISC_ALGO, dbDisc, id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_DISC_ALGO)字段(id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_DISC_ALGO)字段(id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_DISC_ALGO)索引(disc_id)");
+	lRet = IBPSetIdx(TBL_DISC_ALGO, dbDisc, disc_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_DISC_ALGO)字段(disc_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_DISC_ALGO)字段(disc_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_DISC_ALGO)索引(index_num)");
+	lRet = IBPSetIdx(TBL_DISC_ALGO, dbDisc, index_num, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_DISC_ALGO)字段(index_num)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_DISC_ALGO)字段(index_num)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_DISC_ALGO)索引(flag)");
+	lRet = IBPSetIdx(TBL_DISC_ALGO, dbDisc, flag, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_DISC_ALGO)字段(flag)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_DISC_ALGO)字段(flag)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_DISC_ALGO)索引(card_type)");
+	lRet = IBPSetIdx(TBL_DISC_ALGO, dbDisc, card_type, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_DISC_ALGO)字段(card_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_DISC_ALGO)字段(card_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	将数据导入共享内存中	TBL_SERVICE_REGISTER
+ ****************************************************************************************/
+long	lLoadTblRegister(char *pszSettleNum)
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	char	*pszIdx = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbResigter	stDbRegst;
+	char		szSettleNum[10];
+	char		szSrv[10], szRTime[10], szRTime_OO[10];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szSrv, 0, sizeof(szSrv));
+	memset(szRTime, 0, sizeof(szRTime));
+	memset(szRTime_OO, 0, sizeof(szRTime_OO));
+	strcpy(szSrv, FEE_REALTIME);
+	strcpy(szRTime, FEE_SERVICE);
+	strcpy(szRTime_OO, FEE_SERVICE_OO);
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	strcpy(szSettleNum, pszSettleNum);
+   	EXEC SQL DECLARE Cur_service_register CURSOR FOR SELECT NVL(SERVICE_ID, 0), NVL(SERVICE_OBJECT_TYPE, ' '),
+		NVL(SERVICE_OBJECT_ID, ' '), NVL(REG_DATETIME, ' ') FROM TBL_SERVICE_REGISTER WHERE SERVICE_OBJECT_ID 
+		IN (SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum) ORDER BY SERVICE_ID;
+	
+	EXEC SQL OPEN Cur_service_register;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表tbl_service_register错误, (%d)(%s)", lRet, sDbsError());
+		vSetErrMsg("定义表tbl_service_register错误, (%d)(%s)", lRet, sDbsError());
+		vDbsDisconnect();	
+		return RC_FAIL;
+	}
+
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	pGetTblDef(TBL_SERVICE_REGISTER)->lValid = 0;
+	pGetTblDef(TBL_SERVICE_REGISTER)->lTreeNode = 0;
+	while(1)
+	{
+		memset(&stDbRegst, 0, sizeof(stDbRegst));
+		EXEC SQL FETCH Cur_service_register INTO :stDbRegst.service_id, :stDbRegst.service_object_type, 
+			:stDbRegst.service_object_id, :stDbRegst.reg_datetime;	
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			vSetErrMsg("用游标获取数据失败, (%d)(%s)", lRet, sDbsError());
+			EXEC SQL CLOSE Cur_service_register;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();	
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(TBL_SERVICE_REGISTER) <= lCount)
+		{
+			break;
+/*			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_SERVICE_REGISTER), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(TBL_SERVICE_REGISTER), lCount);
+			Tbl_service_register_Clo_Sel();
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();	
+			return RC_FAIL;
+*/
+		}
+
+		sTrimAll(stDbRegst.service_object_type);	
+		sTrimAll(stDbRegst.service_object_id);	
+		sTrimAll(stDbRegst.reg_datetime);
+
+		pszIdx = sGetRegistIdx(stDbRegst.service_object_id, strlen(stDbRegst.service_object_id), 
+			stDbRegst.service_id, stDbRegst.service_object_type[0]);
+		if(!pszIdx)
+		{
+			HtLog(ERR_PARAM, "设置组合索引错误:(%s)", sGetError());
+			vDestroyTree(pstRoot);
+			EXEC SQL CLOSE Cur_service_register;
+			vDbsDisconnect();	
+			return RC_FAIL;
+		}
+
+		pstRoot = (Tree *)pInsertTree(pstRoot, pszIdx, ++(pGetTblDef(TBL_SERVICE_REGISTER)->lTreeNode), 0,
+			MAX_INDEX_LEN, lGetTblPos(TBL_SERVICE_REGISTER) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载服务注册(%s)失败, 原因:%s", stDbRegst.service_object_id, sGetError());
+			EXEC SQL CLOSE Cur_service_register;
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();	
+ 			return RC_FAIL;
+		}
+
+		stDbRegst.service_id = lSetEXLong(stDbRegst.service_id);
+
+		memcpy((char *)pGetTblAddr(lGetTblPos(TBL_SERVICE_REGISTER)), &stDbRegst, sizeof(stDbRegst));	
+		((IBPShm *)pGetShmRun())->m_lOffset += sizeof(stDbRegst);
+		pGetTblDef(TBL_SERVICE_REGISTER)->lValid ++;
+		if(g_LoadSize < ((IBPShm *)pGetShmRun())->m_lOffset)
+		{
+			HtLog(ERR_PARAM, "共享内存表空间超限！(%d)<(%d)", g_LoadSize, ((IBPShm *)pGetShmRun())->m_lOffset);
+			EXEC SQL CLOSE Cur_service_register;
+			vSetErrMsg("设置表(TBL_SERVICE_REGISTER)字段(service_code)失败(%d)", lRet);
+			vDestroyTree(pstRoot);
+			vDbsDisconnect();	
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_service_register;
+	vDbsDisconnect();	
+
+	HtLog(NML_PARAM, "(TBL_SERVICE_REGISTER)装载表空间总记录(%d), 有效记录(%d)", lGetTblCount(TBL_SERVICE_REGISTER), 
+		pGetTblDef(TBL_SERVICE_REGISTER)->lValid);
+
+	HtLog(NML_PARAM, "对TBL_SERVICE_REGISTER表建立字段service_object_id, service_id, service_object_type快速查找索引!");
+	((IBPShm *)pGetShmRun())->m_lOffset = 0;
+	vInorderTree((char *)pGetTblAddr(lGetShmPos(TBL_SERVICE_REGISTER)), pstRoot);
+	memcpy((char *)pGetTblAddr(lGetShmPos(TBL_SERVICE_REGISTER)), (char *)pInitSHTree(pstRoot), sizeof(SHTree));
+	vDestroyTree(pstRoot);
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_REGISTER)索引(service_id)");
+	lRet = IBPSetIdx(TBL_SERVICE_REGISTER, dbResigter, service_id, FIELD_LONG);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_REGISTER)字段(service_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_REGISTER)字段(service_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_REGISTER)索引(service_object_type)");
+	lRet = IBPSetIdx(TBL_SERVICE_REGISTER, dbResigter, service_object_type, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_REGISTER)字段(service_object_type)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_REGISTER)字段(service_object_type)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_REGISTER)索引(service_object_id)");
+	lRet = IBPSetIdx(TBL_SERVICE_REGISTER, dbResigter, service_object_id, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_REGISTER)字段(service_object_id)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_REGISTER)字段(service_object_id)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_SERVICE_REGISTER)索引(reg_datetime)");
+	lRet = IBPSetIdx(TBL_SERVICE_REGISTER, dbResigter, reg_datetime, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_SERVICE_REGISTER)字段(reg_datetime)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_SERVICE_REGISTER)字段(reg_datetime)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+
+/****************************************************************************************
+	添加渠道金额索引
+ ***************************************************************************************/
+long	lLoadTblCupsAmt()
+{
+	long	lRet = 0;
+
+	HtLog(NML_PARAM, "初始化表(TBL_CUPS_AMT)索引(m_szCupsNo)");
+	lRet = IBPSetIdx(TBL_CUPS_AMT, EXTCupAmt, m_szCupsNo, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_CUPS_AMT)字段(m_szCupsNo)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_CUPS_AMT)字段(m_szCupsNo)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(TBL_CUPS_AMT)索引(m_szStlmDate)");
+	lRet = IBPSetIdx(TBL_CUPS_AMT, EXTCupAmt, m_szStlmDate, FIELD_CHAR);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "设置表(TBL_CUPS_AMT)字段(plan_endtime)失败(%d)", lRet);
+		vSetErrMsg("设置表(TBL_CUPS_AMT)字段(m_szStlmDate)失败(%d)", lRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+/****************************************************************************************
+	加载指定表到内存中
+ ***************************************************************************************/
+long	LoadTblFromDb(char *pszSettleNum, TABLE table)
+{
+	if(RC_SUCC != lTblIsNExist(table))
+		return RC_FAIL;
+
+	if(table == TBL_REGION_CODE)
+	{
+		HtLog(NML_PARAM, "开始导入地区编码表(%d)...", TBL_REGION_CODE);
+		if(RC_SUCC != lLoadTblRegionCode())	return RC_FAIL;
+	}
+	else if(TBL_BRH_INFO == table)
+	{
+		HtLog(NML_PARAM, "开始导入机构信息表(%d)...", TBL_BRH_INFO);
+		if(RC_SUCC != lLoadTblBrhInfo())	return RC_FAIL;
+	}
+	else if(TBL_BRH_PROFIT_INFO == table)
+	{
+		HtLog(NML_PARAM, "开始导入机构分润主体表(%d)...", TBL_BRH_PROFIT_INFO);
+		if(RC_SUCC != lLoadBrhPfitInfo())	return RC_FAIL;
+	}
+	else if(TBL_MCHT_MCC_INF == table)
+	{	
+		HtLog(NML_PARAM, "开始导入MCC信息表(%d)...", TBL_MCHT_MCC_INF);
+		if(RC_SUCC != lLoadTblMchtMccInfo())	return RC_FAIL;
+	}
+	else if(TBL_BRH_PROFIT_DEF == table)
+	{
+		HtLog(NML_PARAM, "开始导入机构分润定义表(%d)...", TBL_BRH_PROFIT_DEF);
+		if(RC_SUCC != lLoadBrhPorfitDef())	return RC_FAIL;
+	}
+	else if(TBL_BRH_PROFIT_ALGO == table)
+	{
+		HtLog(NML_PARAM, "开始导入机构分润配置表(%d)...", TBL_BRH_PROFIT_ALGO);
+		if(RC_SUCC != lLoadBrhPorfitAlgo())	return RC_FAIL;
+	}
+	else if(TBL_ACCT_INFO == table)
+	{
+		HtLog(NML_PARAM, "开始导入账号信息表(%d)...", TBL_ACCT_INFO);
+		if(RC_SUCC != lLoadTblAcctInfo(pszSettleNum))		return RC_FAIL;
+	}
+	else if(TBL_OPR_INFO == table)
+	{
+		HtLog(NML_PARAM, "开始导入清算账号信息表(%d)...", TBL_OPR_INFO);
+		if(RC_SUCC != lLoadTblOprInfo(pszSettleNum))		return RC_FAIL;
+	}
+	else if(TBL_SPDB_BRH == table)
+	{
+		HtLog(NML_PARAM, "开始导入浦发支行地区编码表(%d)...", TBL_SPDB_BRH);
+		if(RC_SUCC != lLoadTblSpdbBrh())		return RC_FAIL;
+	}
+	else if(TBL_MCHT_BASE == table)
+	{
+		HtLog(NML_PARAM, "开始导入商户基本信息表(%d)(%s)...", TBL_MCHT_BASE, pszSettleNum);
+		if(RC_SUCC != lLoadTblMchtBase(pszSettleNum))		return RC_FAIL;
+	}
+	else if(TBL_MCHT_ALGO == table)
+	{
+		HtLog(NML_PARAM, "开始导入商户费率配置表(%d)...", TBL_MCHT_ALGO);
+		if(RC_SUCC != lLoadTblMchtAlgo())		return RC_FAIL;
+	}
+	else if(TBL_PUB_DISC_ALGO == table)
+	{
+		HtLog(NML_PARAM, "开始导入费用模型配置表(%d)...", TBL_PUB_DISC_ALGO);
+		if(RC_SUCC != lLoadTblDiscAlgo())		return RC_FAIL;
+	}
+	else if(TBL_MCHT_USER == table)
+	{
+		HtLog(NML_PARAM, "开始导入商户用户信息表(%d)...", TBL_MCHT_USER);
+		if(RC_SUCC != lLoadTblMchtUser(pszSettleNum))		return RC_FAIL;
+	}
+	else if(TBL_MCHT_CUPS_INF == table)
+	{
+		HtLog(NML_PARAM, "开始导入渠道信息表(%d)...", TBL_MCHT_CUPS_INF);
+		if(RC_SUCC != lLoadTblMchtCupsInf())	return RC_FAIL;
+	}
+	else if(TBL_N_MCHT_MATCH == table)
+	{
+		HtLog(NML_PARAM, "开始导入渠道商户映射表(%d)...", TBL_N_MCHT_MATCH);
+		if(RC_SUCC != lLoadTblNMchtMatch())		return RC_FAIL;
+	}
+	else if(TBL_SERVICE_CONFIG == table)
+	{
+		HtLog(NML_PARAM, "开始导入服务-配置-表(%d)...", TBL_SERVICE_CONFIG);
+		if(RC_SUCC != lLoadTblServiceCfg())		return RC_FAIL;
+	}
+	else if(TBL_DISC_ALGO == table)
+	{
+		HtLog(NML_PARAM, "开始添加服务费率模型表索引(%d)...", TBL_DISC_ALGO);
+		if(RC_SUCC != lLoadTblDisc())			return RC_FAIL;
+	}
+	else if(TBL_SERVICE_REGISTER == table)
+	{
+		HtLog(NML_PARAM, "开始添加服务注册费率模型表索引(%d)...", TBL_SERVICE_REGISTER);
+		if(RC_SUCC != lLoadTblRegister(pszSettleNum))		return RC_FAIL;
+	}
+	else if(TBL_CUPS_AMT == table)
+	{
+		HtLog(NML_PARAM, "开始添加渠道金额表索引(%d)...", TBL_CUPS_AMT);
+		if(RC_SUCC != lLoadTblCupsAmt())		return RC_FAIL;
+	}
+	else
+	{
+		HtLog(NML_PARAM, "错误, 表(%d)导入服务未定义装载方法!", TBL_SERVICE_CONFIG);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	创建内存表空间
+ ***************************************************************************************/
+long	lCreateShmTbl(char *pszSettleNum)
+{
+	memset(&g_stTblDef, 0, sizeof(g_stTblDef));
+	g_LoadSize = lGetLoadSize(pszSettleNum);
+	if(RC_SUCC != lInitCreateShm(g_LoadSize))
+		return RC_FAIL;
+	return lAttachShm();
+}
+
+/****************************************************************************************
+	创建共享内存，并将表数据加载
+ ***************************************************************************************/
+long	lLoadTable(char *pszSettleNum, TABLE table)
+{
+	long	lRet = 0;
+
+	if(RC_SUCC != lTblIsNExist(table))
+		return RC_FAIL;
+
+	lRet = LoadTblFromDb(pszSettleNum, table);
+	if(lRet)
+		return RC_FAIL;
+
+	//	将头结点补上
+	memcpy((char *)pGetShmAddr(), (char *)pGetTblDef(0), sizeof(TblDef) * SHM_TABLE_NUM);	
+	HtLog(NML_PARAM, "全部装载完成!");
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	创建共享内存，并将所有表数据加载
+ ***************************************************************************************/
+long	lInitAllShmTbl(char *pszSettleNum)
+{
+	int		iRet = 0;
+
+	if(RC_SUCC != lCreateShmTbl(pszSettleNum))	return RC_FAIL;
+
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_REGION_CODE))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_BRH_INFO))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_BRH_PROFIT_INFO))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_MCHT_MCC_INF))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_BRH_PROFIT_DEF))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_BRH_PROFIT_ALGO))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_ACCT_INFO))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_OPR_INFO))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_SPDB_BRH))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_MCHT_BASE))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_MCHT_ALGO))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_PUB_DISC_ALGO))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_MCHT_USER))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_MCHT_CUPS_INF))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_N_MCHT_MATCH))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_SERVICE_CONFIG))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_DISC_ALGO))	return RC_FAIL;
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_SERVICE_REGISTER))	return RC_FAIL;
+
+	if(RC_SUCC != LoadTblFromDb(pszSettleNum, TBL_CUPS_AMT))	return RC_FAIL;	
+
+
+	//	将头结点补上
+	memcpy((char *)pGetShmAddr(), (char *)pGetTblDef(0), sizeof(TblDef) * SHM_TABLE_NUM);	
+	HtLog(NML_PARAM, "全部装载完成!");
+
+	vDetachShm();
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

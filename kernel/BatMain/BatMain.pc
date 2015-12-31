@@ -1,0 +1,1674 @@
+/***********************************************************************************
+ *
+ *  功能: 批量主控进程,负责批量程序启动的控制
+ *
+ *  Edit History:
+ *
+ ***********************************************************************************/
+#include "BatMain.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_bat_rel_ctl.h"
+#include "tbl_bat_task.h"
+#include "tbl_bat_main_ctl.h"
+#include "tbl_bat_main_ctl_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+void			vDealChildPorcess();
+static void		SignalHandle(int sig);
+static void		vHandleChildDeath(int sig);
+static int		WaistConsole(t_Console_Cmd_Def*);
+static int 		giListenSocket, giConnectSocket;
+static int		gnBatProcNum = 0, g_lDoTime = 0;
+
+static t_Bat_List_Def gtBatProcList[MAX_BAT_NUM];
+static char gsStlmDate[LEN_DATE+1];
+static char gsStlmNum[LEN_NUM+1];
+static char gsBatStartFlag[1+1];
+
+/******************************************************************************************
+ *	   检查批量任务是否可以执行
+ *  Parameters: sBatId:   批量任务号
+ *			  iRelFlg:  依赖关系标志
+ *						0, 依赖检查通过
+ *						1, 依赖检查不通过
+ *  Return Value:
+ *	   RC_SUCC		- 成功
+ *	   RC_FAIL		- 异常
+ *****************************************************************************************/
+int nChkBatRel(char *pszBatId, char *pszStlmDate, char *pszStlmNum, long lArgc, char *pszOpr, int *iRelFlg)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szBatId[5], szOpr[12], szRelId[5];
+	char	szStlmDate[9], szSettleNum[5], szState[2];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szOpr, 0, sizeof(szOpr));
+	memset(szBatId, 0, sizeof(szBatId));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szOpr, pszOpr, sizeof(szOpr) - 1);
+	memcpy(szBatId, pszBatId, sizeof(szBatId) - 1);
+	memcpy(szStlmDate, pszStlmDate, sizeof(szStlmDate) - 1);
+	memcpy(szSettleNum, pszStlmNum, sizeof(szSettleNum) - 1);
+
+	if(lArgc > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+	{
+		EXEC SQL DECLARE Cur_rel_ctl_t CURSOR FOR SELECT NVL(REL_BAT_ID, ' ') 
+			FROM TBL_BAT_REL_CTL WHERE BAT_ID = :szBatId AND REC_UPD_OPR = :szOpr;
+	}
+	else
+	{
+		EXEC SQL DECLARE Cur_rel_ctl_n CURSOR FOR SELECT NVL(REL_BAT_ID, ' ')
+			FROM TBL_BAT_REL_CTL WHERE BAT_ID = :szBatId;
+	}
+
+	if(lArgc > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+		EXEC SQL OPEN Cur_rel_ctl_t;
+	else
+		EXEC SQL OPEN Cur_rel_ctl_n;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "打开依赖表游标失败!, err:(%s)(%d)(%s)", szBatId, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	*iRelFlg = 0;
+	while(1)
+	{
+		memset(szRelId, 0, sizeof(szRelId));
+		if(lArgc > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+			EXEC SQL FETCH Cur_rel_ctl_t INTO :szRelId;
+		else
+			EXEC SQL FETCH Cur_rel_ctl_n INTO :szRelId;
+		if(SQLNOTFOUND)
+			break;
+		else if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "查询依赖表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			if(lArgc > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+				EXEC SQL CLOSE Cur_rel_ctl_t;
+			else
+				EXEC SQL CLOSE Cur_rel_ctl_n;
+			return RC_FAIL;
+		}
+
+		if(!memcmp(szSettleNum, "TC00", 4))
+		{
+			EXEC SQL SELECT NVL(BAT_STATE, ' ') INTO :szState FROM TBL_BAT_MAIN_CTL_DTL 
+				WHERE DATE_SETTLMT = :szStlmDate AND BAT_ID = :szBatId;
+		}
+		else
+		{
+			/* 取依赖关系的批量任务信息 */
+			EXEC SQL SELECT NVL(BAT_STATE, ' ') INTO :szState FROM TBL_BAT_MAIN_CTL_DTL 
+				WHERE DATE_SETTLMT = :szStlmDate AND BAT_ID = :szBatId AND 
+				SETTLE_NUM = :szSettleNum;
+		}
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "查询当日(%s)批量任务表失败, err:(%d)(%s)", 
+				szStlmDate, SQLCODE, sDbsError());
+			if(lArgc > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+				EXEC SQL CLOSE Cur_rel_ctl_t;
+			else
+				EXEC SQL CLOSE Cur_rel_ctl_n;
+			return RC_FAIL;
+		}
+
+		/* 检查依赖的批量任务是否运行成功结束 */
+		if(szState[0] != BAT_RUN_STA_SUC)
+		{
+			*iRelFlg = -1;
+			break;
+		}
+	}
+	if(lArgc > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+		EXEC SQL CLOSE Cur_rel_ctl_t;
+	else
+		EXEC SQL CLOSE Cur_rel_ctl_n;
+
+	return RC_SUCC;
+}
+
+/********************************************************************************
+ *  Function: main
+ *	 主函数:批量主控进程,负责批量程序启动的控制
+ *
+ *  Parameters:
+ *	   main程序标准参数
+ *
+ *  Return Value:
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+int main(int argc, char * argv[])
+{
+	int				 iRet;
+	int				 iArgc;
+	t_Console_Cmd_Def   stConsole;
+	char   sBatId[6];
+	char   sStlmDate[9];
+
+	sprintf(gsLogFile, "%s.log", argv[0]);
+
+	/* 批量初始化 */
+	iRet = batMainInit(argc, argv);
+	if (iRet)
+	{
+		HtLog(ERR_PARAM, "main: batMainInit error: [%d]", iRet);
+		exit(1);
+	}
+
+	/* 设置信号 */
+	sigset(SIGUSR1, SignalHandle);
+	sigset(SIGTERM, SignalHandle);
+	sigset(SIGSEGV, SignalHandle);
+	sigset(SIGCLD,  vHandleChildDeath);
+	signal(SIGCHLD,  vHandleChildDeath);
+
+	HtLog(NML_PARAM, "main: batRunTask begin.........");
+
+	/* 主控进程的核心处理 */
+	while (1)
+	{
+		/* 等待控制台发送指令获取批量任务并执行 */
+		sigrelse(SIGCLD);
+		memset(&stConsole, 0, sizeof(stConsole));
+		iRet = WaistConsole(&stConsole); 
+		if (iRet)
+		{
+			HtLog(NML_PARAM, "main: WaistConsole error: [%d]", iRet);
+			exit(1);
+		}
+	
+		HtLog(NML_PARAM, "BatId: [%5.5s] Execute....", stConsole.sBatId);
+		
+		sighold(SIGCLD);
+		/* 连接数据库 */
+		iRet = lDbsConnect(DBS_BATCH);
+		if(iRet)
+		{
+			HtLog(NML_PARAM, "DbsConnect error: [%d]", iRet);
+			memcpy(stConsole.sRspCode, CONNECT_DB_ERROR,  sizeof(stConsole.sRspCode));
+			ReturnConsoleRsp(&stConsole);
+			continue; 
+		}
+
+		iRet = ExecuteBatTask(&stConsole);
+		if (iRet)
+			HtLog(NML_PARAM, "main: ExecuteBatTask error: [%d]", iRet);
+		else
+			memcpy(stConsole.sRspCode, "00", sizeof(stConsole.sRspCode)); 
+
+		ReturnConsoleRsp(&stConsole); 
+		vDbsDisconnect();
+	}
+
+	HtLog(NML_PARAM, "main: Bath Main Control Process Sucess End");
+	return RC_SUCC;
+}
+
+/********************************************************************************
+ *  Function:  ReturnConsoleRsp
+ *	 返回控制台应答
+ *
+ *  Parameters:
+ *	   pstConsole   -- 指令信息
+ *
+ *  Return Value:
+ *
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+int ReturnConsoleRsp(t_Console_Cmd_Def *pstConsole)
+{
+	int  iRet;
+	int  nLen = 4;
+	char sLen[4 + 1];
+  
+	char sBuf[538];
+
+	memset(sLen, 0, sizeof(sLen));
+	memset(sBuf, 0, sizeof(sBuf));
+
+	snprintf(sLen, sizeof(sLen), "%04d", sizeof(t_Console_Cmd_Def));
+	
+	iRet = nCSocketSnd(giConnectSocket, sLen,  &nLen);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "nCSocketSnd  DataLen error: [%d]", iRet);
+		close(giConnectSocket);
+		return -1; 
+	} 
+
+	HtLog(NML_PARAM, "[%5.5s],[%8.8s], [%4.4s],[%2.2s].", pstConsole->sBatId, pstConsole->sStlmDate,
+		  pstConsole->sStlmNum, pstConsole->sRspCode);
+	HtLog(NML_PARAM, "[%2.2s][%-256.256s]", pstConsole->sArgc,pstConsole->sArgv); 
+	HtLog(NML_PARAM, "[%2.2s][%-256.256s]", pstConsole->sRspCode,pstConsole->sRspDsp);
+	nLen = sizeof(t_Console_Cmd_Def) + 4 ;
+	iRet = nCSocketSnd(giConnectSocket, pstConsole,  &nLen);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "nCSocketSnd  Data error: [%d]", iRet);
+		close(giConnectSocket);
+		return -1;
+	}
+   
+	close(giConnectSocket);
+	return 0;
+}
+ 
+/********************************************************************************
+ *  Function:  WaistConsole
+ *	 等待控制台指令
+ *
+ *  Parameters:
+ *	   pstConsole   -- 指令信息
+ *
+ *  Return Value:
+ *
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+int WaistConsole(t_Console_Cmd_Def *pstConsole)
+{
+	int			  iRet;
+	int			  nLen;
+	char			 sDataLen[4 + 1];
+	struct sockaddr  lsaddrAccept;
+	unsigned int	 lsckltAddrLen;   
+
+	while (1)
+	{
+		memset(&lsaddrAccept, 0x00, sizeof(struct sockaddr));
+		lsckltAddrLen = 1;
+		giConnectSocket = accept(giListenSocket, &lsaddrAccept, &lsckltAddrLen);
+		if (giConnectSocket < 0)
+		{
+			if(errno == EINTR)
+				continue; 
+			HtLog(ERR_PARAM, "accept error: [%d] [%s]", errno, strerror(errno));
+			return -1;
+		} 
+		
+		memset(sDataLen, 0, sizeof(sDataLen));
+		nLen = 4; 
+		iRet = nCSocketRcv(giConnectSocket, sDataLen, &nLen);
+		if (iRet)
+		{
+			HtLog(ERR_PARAM, "nCSocketRcv  DataLen error: [%d]", iRet);
+			close(giConnectSocket);
+			continue;
+		}
+		
+		nLen = atoi(sDataLen);
+		if (nLen != sizeof(t_Console_Cmd_Def))
+		{
+			HtLog(ERR_PARAM, "DataLen error: [%d]", nLen);
+			close(giConnectSocket);
+			continue;
+		} 
+
+		iRet = nCSocketRcv(giConnectSocket, pstConsole, &nLen);
+		if (iRet)
+		{
+			HtLog(ERR_PARAM, "nCSocketRcv  DataLen error: [%d]", iRet);
+			close(giConnectSocket);
+			continue;
+		}
+		break; 
+	}
+
+	return RC_SUCC;
+}
+
+/********************************************************************************
+ *  Function:  batMainInit
+ *	 批量初始化:判断系统状态,如果已经初始化则初始化批量表
+ *
+ *  Parameters:
+ *	   main程序标准参数
+ *
+ *  Return Value:
+ *
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+int batMainInit(int argc, char **argv)
+{
+	int  iRet;
+	char sIp[16];
+	char sPort[6];
+	char sStlmDate[LEN_DATE+1];
+
+	memset(sIp, 0, sizeof(sIp));
+	memset(sPort, 0, sizeof(sPort));
+
+	if (getenv("BAT_MAIN_LISTEN_IP") == NULL)
+		strcpy(sIp, "127.0.0.1");
+	else
+		strncpy(sIp, getenv("BAT_MAIN_LISTEN_IP"), sizeof(sIp) - 1);
+
+	if (getenv("BAT_MAIN_LISTEN_PORT") == NULL )
+		 strcpy(sPort, "30000");
+	else
+		 strncpy(sPort, getenv("BAT_MAIN_LISTEN_PORT"), sizeof(sPort) - 1);
+
+	HtLog(NML_PARAM, "Listen IP: [%s] Port: [%s]", sIp, sPort);
+
+	/* 建立监听端口 */
+	giListenSocket = hCEstablishListen(sIp, atoi(sPort)); 
+	if(giListenSocket < 0)
+	{
+		HtLog(ERR_PARAM, "hCEstablishListen error: [%d]", giListenSocket);
+		return -1;
+	}
+
+	return 0;
+}
+
+/********************************************************************************
+ *  Function:  batAssignTask
+ *	 批量分配子任务:根据相关参数调用相应函数来化分子任务
+ *
+ *  Parameters:
+ *		sStlmDate  -- 清算日期
+ *		sStlmNum   -- 同周期批次编号
+ *		sBatId	 -- 批量编号
+ *		iChldCount -- 化分子任务数量
+ *  Return Value:
+ *
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+int batAssignTask(char *sStlmDate, char  *sStlmNum, char *sBatId, int iChldCount) 
+{
+	int i;
+
+	HtLog(NML_PARAM, "begin find date[%s],num[%s],bat_id[%s]...", sStlmDate, sStlmNum, sBatId);
+
+	for (i = 0; i < sizeof(gBatAssignFun)/sizeof(T_BatAssignFun); ++i)
+	{
+		if(!memcmp(gBatAssignFun[i].sBatId, sBatId, strlen(gBatAssignFun[i].sBatId)))
+			return gBatAssignFun[i].pfAssignFun(sStlmDate, sStlmNum, sBatId, iChldCount);
+	}
+	
+	HtLog(NML_PARAM, "date[%s],num[%s],bat_id[%s] not found.", sStlmDate, sStlmNum, sBatId);
+
+	return RC_FAIL;
+} 
+
+/********************************************************************************
+ *  Function:  BatRunTask
+ *	 批量执行:分配子任务及调起子任务开始工作
+ *  Parameters:
+ *	 pstBatCtl -- 批量主控流水信息
+ *	 pstConsole	   -- 命令参数信息
+ *  Return Value:
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+int BatRunTask(TBatMainCtlDtl *pstBatCtl, t_Console_Cmd_Def *pstConsole)
+{
+	int   iRet, i, j, k;
+	pid_t iPid;
+	long  lBatTaskNum; 
+	char  *pArgvList[100];
+	char  *pArgv;
+	char  sStlmDate[9];
+	char  sStlmNum[5];
+	char  sArgc[3];
+	char  sArgv[257];
+	char  sMatchStr[31];
+	int   iProcNum=0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask		stBatTask;
+	TBatMainCtlDtl	stBatCtl;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stBatTask, 0, sizeof(stBatTask));
+	memcpy(stBatTask.bat_id, pstBatCtl->bat_id, sizeof(stBatTask.bat_id) - 1);
+	memcpy(stBatTask.date_settlmt, pstBatCtl->date_settlmt, sizeof(stBatTask.date_settlmt) - 1);
+	memcpy(stBatTask.settle_num, pstBatCtl->settle_num, sizeof(stBatTask.settle_num) - 1);
+	memcpy(stBatTask.matchstr, pstConsole->sArgv, sizeof(stBatTask.matchstr) - 1);
+	memcpy(stBatTask.rec_upd_ts, sGetCurrentTime(), sizeof(stBatTask.rec_upd_ts) - 1);
+
+	sTrimRight(stBatTask.matchstr);
+	HtLog(NML_PARAM, "bat_id[%s], date_settlmt[%s],settle_num[%s](%s).", stBatTask.bat_id, 
+		stBatTask.date_settlmt, stBatTask.settle_num, stBatTask.matchstr);
+	
+	if (pstBatCtl->task_assign_state[0] == TASK_ASSIGN_STA_OK ) 
+	{	 
+		/* 分配成功，把失败和处理中的子任务状态修改为待处理 */ 
+		stBatTask.task_state[0] = TASK_RUN_STA_PRE;
+
+		if(BAT_START_FLAG_PAT == pstBatCtl->task_start_flg[0] && atol(pstConsole->sArgc) > 0)
+		{
+			EXEC SQL UPDATE TBL_BAT_TASK SET
+				TASK_STATE = :stBatTask.task_state,
+				REC_UPD_TS = :stBatTask.rec_upd_ts
+			WHERE DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+				AND BAT_ID = :stBatTask.bat_id AND MATCHSTR = :stBatTask.matchstr;
+		}
+		else if(pstBatCtl->task_start_flg[0] == BAT_START_FLAG_AUTO )
+		{
+			EXEC SQL UPDATE TBL_BAT_TASK SET
+				TASK_STATE = :stBatTask.task_state,
+				REC_UPD_TS = :stBatTask.rec_upd_ts
+			WHERE DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+				AND BAT_ID = :stBatTask.bat_id;
+		}
+		else
+		{
+			EXEC SQL UPDATE TBL_BAT_TASK SET
+				TASK_STATE = :stBatTask.task_state,
+				REC_UPD_TS = :stBatTask.rec_upd_ts
+			WHERE DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+				AND BAT_ID = :stBatTask.bat_id AND TASK_STATE IN ('1', '3');
+		}
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新任务(%s)(%s)(%s)表失败, err:(%d)(%s)", stBatTask.date_settlmt, 
+				stBatTask.settle_num, stBatTask.bat_id, SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+		EXEC SQL COMMIT WORK;
+		
+		/* 置批量状态为处理中 */ 
+		pstBatCtl->bat_state[0] = BAT_RUN_STA_RUN;
+	} 
+	else 
+	{
+		/* 未分配，更新子任务分配状态为分配中 */
+		pstBatCtl->task_assign_state[0] = TASK_ASSIGN_STA_RUN;
+		memcpy(pstBatCtl->rec_upd_ts, sGetCurrentTime(), sizeof(pstBatCtl->rec_upd_ts) - 1);
+		memcpy(&stBatCtl, pstBatCtl, sizeof(stBatCtl));
+		EXEC SQL UPDATE TBL_BAT_MAIN_CTL_DTL SET
+			TASK_ASSIGN_STATE = :stBatCtl.task_assign_state,
+			REC_UPD_TS		  = :stBatCtl.rec_upd_ts
+		WHERE DATE_SETTLMT = :stBatCtl.date_settlmt AND SETTLE_NUM = :stBatCtl.settle_num
+			AND BAT_ID = :stBatCtl.bat_id;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "TBL_BAT_MAIN_CTL_DTL UPDATE2 [%s] Time[%s] STATE[%s]error [%d]", pstBatCtl->bat_id, 
+				pstBatCtl->rec_upd_ts, pstBatCtl->task_assign_state, iRet);
+			return RC_FAIL;
+		}
+		EXEC SQL COMMIT WORK;
+			   
+		HtLog(NML_PARAM, "date[%s],num[%s],bat[%s] begin to AssignTask", pstBatCtl->date_settlmt, 
+			pstBatCtl->settle_num, pstBatCtl->bat_id);
+		iRet = batAssignTask(pstBatCtl->date_settlmt, pstBatCtl->settle_num, pstBatCtl->bat_id, pstBatCtl->chd_count);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "batAssignTask error: [%d]", iRet);
+			pstBatCtl->task_assign_state[0] = TASK_ASSIGN_STA_PRE;
+			stBatCtl.task_assign_state[0] = TASK_ASSIGN_STA_PRE;
+
+			EXEC SQL UPDATE TBL_BAT_MAIN_CTL_DTL SET
+				TASK_ASSIGN_STATE = :stBatCtl.task_assign_state,
+				REC_UPD_TS		= :stBatCtl.rec_upd_ts
+			WHERE DATE_SETTLMT = :stBatCtl.date_settlmt AND SETTLE_NUM = :stBatCtl.settle_num
+		   		AND BAT_ID = :stBatCtl.bat_id;
+			if(SQL_UD_ERR)
+			{
+				HtLog(ERR_PARAM, "TBL_BAT_MAIN_CTL_DTL UPDATE2 [%s][%s][%s] error [%d]", pstBatCtl->date_settlmt, 
+					pstBatCtl->settle_num, pstBatCtl->bat_id, iRet);
+				return RC_FAIL;
+			}
+			EXEC SQL COMMIT WORK;
+			return RC_FAIL;
+		}
+		HtLog(NML_PARAM, "date[%s],num[%s],bat[%s] AssignTask end", pstBatCtl->date_settlmt, pstBatCtl->settle_num, pstBatCtl->bat_id);
+		/* 将子任务分配状态置成功 */
+		pstBatCtl->task_assign_state[0] = TASK_ASSIGN_STA_OK; 
+		/* 置批量状态为处理中 */   
+		pstBatCtl->bat_state[0] = BAT_RUN_STA_RUN;
+	}
+	
+	/* 取得当前子任务个数 */
+	iProcNum = gnBatProcNum;
+	gnBatProcNum ++;
+HtLog(NML_PARAM, "初始化到运行该次任务次数(%d)(%d)", ++ g_lDoTime, pstBatCtl->run_proc_qt);
+
+	gtBatProcList[iProcNum].nRunProcQt = pstBatCtl->run_proc_qt;
+
+	memcpy(gtBatProcList[iProcNum].sBatId, pstBatCtl->bat_id, sizeof(pstBatCtl->bat_id) - 1); 
+	memcpy(gtBatProcList[iProcNum].szPorcName, pstBatCtl->bat_proc_name, sizeof(gtBatProcList[iProcNum].szPorcName) - 1); 
+	memcpy(gtBatProcList[iProcNum].szStlmNum, stBatTask.settle_num, sizeof(gtBatProcList[iProcNum].szStlmNum) - 1); 
+	memcpy(gtBatProcList[iProcNum].szStlmDate, stBatTask.date_settlmt, sizeof(gtBatProcList[iProcNum].szStlmDate) - 1); 
+
+	gtBatProcList[iProcNum].nProcTotalNum = 0;
+	gtBatProcList[iProcNum].nCurrentTotalNum = 0;
+	gtBatProcList[iProcNum].nCurrentProcNum = 0;
+	
+	memset(&stBatTask, 0, sizeof(TBatTask));
+	memcpy(stBatTask.date_settlmt, pstBatCtl->date_settlmt, sizeof(stBatTask.date_settlmt) - 1);
+	memcpy(stBatTask.settle_num, pstBatCtl->settle_num, sizeof(stBatTask.settle_num) - 1);
+	memcpy(stBatTask.bat_id, pstBatCtl->bat_id, sizeof(stBatTask.bat_id) - 1);
+	memcpy(stBatTask.matchstr, pstConsole->sArgv, sizeof(stBatTask.matchstr) - 1);
+	stBatTask.task_state[0] = TASK_RUN_STA_PRE;
+	sTrimAll(stBatTask.matchstr);
+
+	HtLog(NML_PARAM, "调度模式(%d)(%s), (%s)(%s)(%s)(%s)(%s)", atol(pstConsole->sArgc), 
+		gsBatStartFlag, stBatTask.date_settlmt, stBatTask.settle_num,
+		stBatTask.bat_id, stBatTask.matchstr, stBatTask.task_state);
+
+	if(atol(pstConsole->sArgc) > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+	{
+		EXEC SQL DECLARE Cur_task_c CURSOR FOR SELECT * FROM TBL_BAT_TASK WHERE 
+			DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+			AND BAT_ID = :stBatTask.bat_id AND MATCHSTR = :stBatTask.matchstr
+			AND TASK_STATE = :stBatTask.task_state;
+	}
+	else
+	{
+		EXEC SQL DECLARE Cur_task_t CURSOR FOR SELECT * FROM TBL_BAT_TASK WHERE 
+			DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+			AND BAT_ID = :stBatTask.bat_id AND TASK_STATE = :stBatTask.task_state;
+	}
+
+	if(atol(pstConsole->sArgc) > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+		EXEC SQL OPEN Cur_task_c;
+	else 
+		EXEC SQL OPEN Cur_task_t;
+	if(SQLCODE) 
+	{
+		HtLog(ERR_PARAM, "TBL_BAT_TASK_DEC_SEL [%s][%s][%s] error [%d]", pstBatCtl->date_settlmt, 
+			pstBatCtl->settle_num, pstBatCtl->bat_id, iRet);
+		return RC_FAIL;
+	}
+	
+	/** 将子任务装载到共享结构体中*/
+	while (1)
+	{
+		memset(&stBatTask, 0, sizeof(TBatTask));
+		memset(&gtBatProcList[iProcNum].tPidList[gtBatProcList[iProcNum].nProcTotalNum].sMatchStr, 0, 
+			sizeof(gtBatProcList[iProcNum].tPidList[gtBatProcList[iProcNum].nProcTotalNum].sMatchStr)); 
+		gtBatProcList[iProcNum].tPidList[gtBatProcList[iProcNum].nProcTotalNum].nProcFlag = 0;
+		if(atol(pstConsole->sArgc) > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+			EXEC SQL FETCH Cur_task_c INTO :stBatTask;
+		else 
+			EXEC SQL FETCH Cur_task_t INTO :stBatTask;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "查询任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			if(atol(pstConsole->sArgc) > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+				EXEC SQL CLOSE Cur_task_c;
+			else 
+				EXEC SQL CLOSE Cur_task_t;
+			return RC_FAIL;
+		}	
+		if(SQLNOTFOUND)
+		{
+			if(atol(pstConsole->sArgc) > 0 && BAT_START_FLAG_PAT == gsBatStartFlag[0])
+				EXEC SQL CLOSE Cur_task_c;
+			else 
+				EXEC SQL CLOSE Cur_task_t;
+			break;
+		}
+		
+		sTrimRight(stBatTask.matchstr);
+
+		memcpy(&gtBatProcList[iProcNum].tPidList[gtBatProcList[iProcNum].nProcTotalNum].sMatchStr,
+			   stBatTask.matchstr, sizeof(stBatTask.matchstr) - 1); 
+		gtBatProcList[iProcNum].tPidList[gtBatProcList[iProcNum].nProcTotalNum].nArgc = atol(pstConsole->sArgc);
+		gtBatProcList[iProcNum].tPidList[gtBatProcList[iProcNum].nProcTotalNum].szBatStartFalg[0] = gsBatStartFlag[0];
+		gtBatProcList[iProcNum].nProcTotalNum ++ ;
+	}
+	lBatTaskNum = gtBatProcList[iProcNum].nProcTotalNum;
+
+	HtLog(NML_PARAM, "调度任务(%d)(%d), bat_id[%s], settle_num[%s](%s).", gtBatProcList[iProcNum].nProcTotalNum, iProcNum,
+		gtBatProcList[iProcNum].sBatId, gtBatProcList[iProcNum].szStlmNum, 
+		gtBatProcList[iProcNum].tPidList[gtBatProcList[iProcNum].nProcTotalNum].sMatchStr);
+	/* 无进程启动 */
+	if(gtBatProcList[iProcNum].nProcTotalNum == 0)
+		pstBatCtl->bat_state[0] = BAT_RUN_STA_SUC;
+
+	/* 更新批量任务状态 */
+	memcpy(pstBatCtl->rec_upd_ts, sGetCurrentTime(), sizeof(pstBatCtl->rec_upd_ts) - 1);
+	memcpy(&stBatCtl, pstBatCtl, sizeof(stBatCtl));
+	EXEC SQL UPDATE TBL_BAT_MAIN_CTL_DTL SET 
+		BAT_STATE = :stBatCtl.bat_state,
+		TASK_ASSIGN_STATE = :stBatCtl.task_assign_state,
+		REC_UPD_TS = :stBatCtl.rec_upd_ts
+	WHERE DATE_SETTLMT = :stBatCtl.date_settlmt AND SETTLE_NUM = :stBatCtl.settle_num 
+		AND BAT_ID = :stBatCtl.bat_id;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "TBL_BAT_MAIN_CTL UPDATE3[%s][%s][%s] error [%d]", pstBatCtl->date_settlmt, 
+			pstBatCtl->settle_num, pstBatCtl->bat_id, SQLCODE);
+		return RC_FAIL;
+	}
+	EXEC SQL COMMIT WORK;
+
+	/* Fork子进程进行批量任务处理 */ 
+	for( k = 0; k < lBatTaskNum; k ++ )
+	{
+		/* 达到规定子任务数时等待*/
+		if(gtBatProcList[iProcNum].nCurrentProcNum >= gtBatProcList[iProcNum].nRunProcQt )
+		{
+			k --;
+			sleep(1);
+			vDealChildPorcess();
+			continue;
+		}
+		
+		/* 更新批量子任务状态 */
+		stBatTask.task_state[0] = TASK_RUN_STA_RUN;
+		memcpy(stBatTask.rec_upd_ts, sGetCurrentTime(), sizeof(stBatTask.rec_upd_ts) - 1);
+		memcpy(stBatTask.date_settlmt, gtBatProcList[iProcNum].szStlmDate, 8);		
+		memcpy(stBatTask.bat_id, gtBatProcList[iProcNum].sBatId, sizeof(stBatTask.bat_id) - 1);		
+		memcpy(stBatTask.settle_num, gtBatProcList[iProcNum].szStlmNum, 4);		
+		strcpy(stBatTask.matchstr, gtBatProcList[iProcNum].tPidList[k].sMatchStr);
+
+		EXEC SQL UPDATE TBL_BAT_TASK SET
+			TASK_STATE = :stBatTask.task_state,
+			REC_UPD_TS = :stBatTask.rec_upd_ts
+		WHERE DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+			AND BAT_ID = :stBatTask.bat_id AND MATCHSTR = :stBatTask.matchstr;
+		if(SQL_UD_ERR) 
+		{
+			HtLog(ERR_PARAM, "date[%s],num[%s],BatId: [%s] TBL_BAT_TASK_UPD_UPD error: [%d]", 
+				gtBatProcList[iProcNum].szStlmDate, gtBatProcList[iProcNum].szStlmNum, 
+				gtBatProcList[iProcNum].sBatId, SQLCODE);
+			EXEC SQL ROLLBACK WORK;
+			exit(-1);
+		} 
+		EXEC SQL COMMIT WORK;
+ 
+		if((iPid = fork()) < 0) 
+		{
+			HtLog(ERR_PARAM, "ForkChild: fork error id: [%d] [%s]", errno, strerror(errno));
+			exit(-1);
+		} 
+		else if (iPid == 0) 
+		{
+			//close(giListenSocket);
+			//close(giConnectSocket);		   
+ 
+			/* 子进程进行批量处理 */
+			/* 处理取得的一个批量 */
+			
+			/* 设置批量程序的输入参数 */
+			memset(pArgvList, 0, sizeof(pArgvList));
+			memset(sStlmDate, 0, sizeof(sStlmDate));
+			memcpy(sStlmDate, pstConsole->sStlmDate, sizeof(sStlmDate) - 1);
+			memset(sStlmNum, 0, sizeof(sStlmNum));
+			memcpy(sStlmNum, pstConsole->sStlmNum, sizeof(sStlmNum) - 1);
+			memset(sArgc, 0, sizeof(sArgc));
+			memcpy(sArgc, pstConsole->sArgc, sizeof(sArgc) - 1);
+			memset(sArgv, 0, sizeof(sArgv));
+			memcpy(sArgv, pstConsole->sArgv, sizeof(sArgv) - 1);
+			sTrimRight(pstBatCtl->bat_proc_name);
+			pArgvList[0] = pstBatCtl->bat_proc_name;
+			pArgvList[1] = sStlmDate;
+			pArgvList[2] = sStlmNum;
+			pArgvList[3] = pstBatCtl->bat_id;
+			for(i = 0; i < atoi(sArgc); ++i)
+			{
+				if (i == 0)
+					pArgv = strtok(sArgv, " ");
+				else
+					pArgv = strtok(NULL, " ");
+				if (pArgv == NULL)
+					break;
+				pArgvList[i + 4] = pArgv;
+			}
+
+			if(atol(pstConsole->sArgc) <= 0)
+			{
+				j = 0;
+				memset(sMatchStr, 0, sizeof(sMatchStr));
+				memcpy(sMatchStr, gtBatProcList[iProcNum].tPidList[k].sMatchStr, sizeof(sMatchStr) - 1);
+				while (1)
+				{ 
+					if (j == 0)
+						pArgv = strtok(sMatchStr, " ");
+					else
+						pArgv = strtok(NULL, " ");
+					if(pArgv == NULL)
+						break;
+					pArgvList[i + 4] = pArgv;
+					++j;
+					++i;
+				}
+			}
+
+			for (j = 0; j < i + 4; ++j)
+				HtLog(NML_PARAM, "argv [%d]: [%s]", j, pArgvList[j]);
+			HtLog(NML_PARAM, "T1");
+
+			/* 启动批量程序 */
+			if(execvp(pstBatCtl->bat_proc_name, pArgvList) == -1)
+				HtLog(ERR_PARAM, "start %s fail at execvp, %d.", pstBatCtl->bat_proc_name, errno);
+			HtLog(NML_PARAM, "T2");
+			exit(1);
+		}
+		
+		gtBatProcList[iProcNum].tPidList[k].iPid = iPid;
+		gtBatProcList[iProcNum].nCurrentProcNum ++;
+	}
+
+	return 0;
+}	
+
+/********************************************************************************
+ *  Function:  BatAllSubAssignTask
+ *	 手工反选子任务时分配子任务操作(公共)
+ *  Parameters:
+ *		 pStlmDate   --	清算日期
+ *		 pStlmNum	--	同周期批次编号
+ *		 pchBatId	--	批量编号
+ *		 psMatchStr  --	附加参数信息
+ *  Return Value:
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+int BatAllSubAssignTask(char *pStlmDate, char *pStlmNum, char *pchBatId, char *psMatchStr)
+{
+	int  iRet;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szFlag[2], szInit[2];
+	TBatTask stBatTask;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stBatTask, 0, sizeof(TBatTask));
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szInit, 0, sizeof(szInit));
+
+	memcpy(stBatTask.date_settlmt, pStlmDate, sizeof(stBatTask.date_settlmt) - 1);
+	memcpy(stBatTask.settle_num, pStlmNum, sizeof(stBatTask.settle_num) - 1);
+	memcpy(stBatTask.bat_id, pchBatId, sizeof(stBatTask.bat_id) - 1); 
+	memcpy(stBatTask.matchstr, psMatchStr, strlen(psMatchStr));
+	sTrimRight(stBatTask.matchstr);
+	/** 判断是否是重跑任务***/
+
+	EXEC SQL SELECT NVL(TASK_STATE, ' ') INTO :stBatTask.task_state FROM TBL_BAT_TASK WHERE
+		DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+		AND BAT_ID = :stBatTask.bat_id AND MATCHSTR = :stBatTask.matchstr;
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "查询任务查表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	if(SQLNOTFOUND )
+	{
+		/** 新任务加入到子任务表中**/
+		stBatTask.task_state[0] = TASK_RUN_STA_RUN;
+		memcpy(stBatTask.task_id, "  ", 2); 
+		memcpy(stBatTask.commit_point, "0", 1);
+		memcpy(stBatTask.fail_point, "0", 1);
+		memcpy(stBatTask.rec_opr_id, "I", 1);
+		memcpy(stBatTask.rec_upd_opr, "bat", 3);
+		memcpy(stBatTask.rec_crt_ts, sGetCurrentTime(), sizeof(stBatTask.rec_crt_ts) - 1);
+		memcpy(stBatTask.rec_upd_ts, "  ", 2);
+
+		EXEC SQL INSERT INTO TBL_BAT_TASK VALUES(:stBatTask);
+		if(SQLCODE) 
+		{
+			HtLog(ERR_PARAM, "新分配子任务插表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;
+		}
+	}
+	else
+		;
+
+	sTrimAll(stBatTask.task_state);
+	if(TASK_RUN_STA_FAIL == stBatTask.task_state[0])
+	{
+		/***运行失败重新跑过***/
+		stBatTask.task_state[0] == TASK_RUN_STA_RUN;
+		EXEC SQL UPDATE TBL_BAT_TASK SET 
+			TASK_STATE = :stBatTask.task_state
+		WHERE DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+			AND BAT_ID = :stBatTask.bat_id AND MATCHSTR = :stBatTask.matchstr;
+		if(SQL_UD_ERR) 
+		{
+			HtLog(ERR_PARAM, "新分配子任务修改表失败[%d]", iRet);
+			EXEC SQL ROLLBACK WORK;
+			return iRet;
+		}
+	}
+	else
+	{
+		/** 正在跑批敬或跑批已成功**/
+		return RC_FAIL;
+	}
+
+	szFlag[0] = TASK_ASSIGN_STA_OK; 
+	szInit[0] = BAT_RUN_STA_RUN; 
+
+	/* 将子任务分配状态置成功 */
+	/* 置批量状态为处理中 */   
+	EXEC SQL UPDATE TBL_BAT_MAIN_CTL_DTL SET 
+		TASK_ASSIGN_STATE = szFlag,
+		BAT_STATE		 = szInit,
+		REC_UPD_TS 		  = :stBatTask.rec_upd_ts
+	WHERE DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+		AND BAT_ID = :stBatTask.bat_id;
+	if(SQL_UD_ERR) 
+	{
+		HtLog(ERR_PARAM, "更新主控任务列表失败, (%s)(%s)(%s) err:(%d)(%s)", stBatTask.date_settlmt, 
+			stBatTask.settle_num, stBatTask.bat_id, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}		
+
+/********************************************************************************
+ *  Function:  BatRunTaskSub
+ *	 批量执行:调起子任务开始工作(手工发起子任务)
+ *  Parameters:
+ *	 pstBatCtl -- 批量主控流水信息
+ *	 pstConsole	   -- 命令参数信息
+ *  Return Value:
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+int BatRunTaskSub(TBatMainCtlDtl *pstBatCtl, t_Console_Cmd_Def *pstConsole)
+{
+	int   iRet, i, j;
+	pid_t iPid;
+	long  lBatTaskNum; 
+	TBatTask stBatTask;
+	char  *pArgvList[100];
+	char  *pArgv;
+	char  sBatId[6];
+	char  sStlmDate[9];
+	char  sStlmNum[5];
+	char  sArgc[3];
+//  char  sArgv[257];
+	char  sArgv[256];
+	char  sMatchStr[31];
+	int   iProcNum=0;
+
+	memset(pArgvList, 0, sizeof(pArgvList));
+
+	memset(sBatId, 0, sizeof(sBatId));
+	memcpy(sBatId, pstConsole->sBatId, sizeof(sBatId) - 1);
+	memset(sStlmDate, 0, sizeof(sStlmDate));
+	memcpy(sStlmDate, pstConsole->sStlmDate, sizeof(sStlmDate) - 1);
+	memset(sStlmNum, 0, sizeof(sStlmNum));
+	memcpy(sStlmNum, pstConsole->sStlmNum, sizeof(sStlmNum) - 1);
+	memset(sArgc, 0, sizeof(sArgc));
+	memcpy(sArgc, pstConsole->sArgc, sizeof(sArgc) - 1);
+	memset(sArgv, 0, sizeof(sArgv));
+	memcpy(sArgv, pstConsole->sArgv, sizeof(sArgv) - 1);
+	sTrimRight(sArgv);
+
+	/** 若控制台附加参数为空则示为失败**/
+	if(atoi(sArgc) == 0 )
+	{
+		HtLog(ERR_PARAM, "手工发起子任务附加参数有误 ");
+		return -1;
+	}
+
+
+	/** 检查及分配子任务**/
+	iRet = BatAllSubAssignTask(sStlmDate, sStlmNum, sBatId, sArgv); 
+	if( iRet )
+	{
+		HtLog(ERR_PARAM, "手工发起子任务分配及检查子任务失败[%d]", iRet);
+		return -1;
+	}
+
+	iProcNum = gnBatProcNum;
+	gnBatProcNum++;
+HtLog(NML_PARAM, "初始化到运行该次任务次数(%d)", ++ g_lDoTime);
+
+	/* Fork子进程进行批量任务处理 */ 
+	memcpy(gtBatProcList[iProcNum].sBatId, pstBatCtl->bat_id, sizeof(pstBatCtl->bat_id) - 1); 
+	memset(&gtBatProcList[iProcNum].tPidList[0].sMatchStr, 0, sizeof(gtBatProcList[iProcNum].tPidList[0].sMatchStr));
+	gtBatProcList[iProcNum].nProcTotalNum = 1;
+	gtBatProcList[iProcNum].nCurrentTotalNum = 0;
+	gtBatProcList[iProcNum].nCurrentProcNum = 0;
+	
+	if ((iPid = fork()) < 0) 
+	{
+		HtLog(ERR_PARAM, "ForkChild: fork error id: [%d] [%s]", errno, strerror(errno));
+		exit(-1);
+	} 
+	else if (iPid == 0) 
+	{
+		
+		//close(giListenSocket);
+		//close(giConnectSocket);		   
+
+		/* 子进程进行批量处理 */
+		/* 处理取得的一个批量 */
+		 
+		/* 设置批量程序的输入参数 */
+		sTrimRight(pstBatCtl->bat_proc_name);
+		pArgvList[0] = pstBatCtl->bat_proc_name;
+		pArgvList[1] = sStlmDate;
+		pArgvList[2] = sStlmNum;
+		pArgvList[3] = pstBatCtl->bat_id;
+		for (i = 0; i < atoi(sArgc); ++i) 
+		{
+			if (i == 0)
+				pArgv = strtok(sArgv, " ");
+			else
+				pArgv = strtok(NULL, " ");
+			if (pArgv == NULL)
+				break;
+			pArgvList[i + 4] = pArgv;
+		}
+
+
+		for (j = 0; j < i + 4; ++j)
+			HtLog(ERR_PARAM, "argv [%d]: [%s]", j, pArgvList[j]);
+		HtLog(ERR_PARAM, "T1");
+
+		/* 启动批量程序 */
+		if (execvp(pstBatCtl->bat_proc_name, pArgvList) == -1) 
+			HtLog(NML_PARAM, "start %s fail at execvp, %d.", pstBatCtl->bat_proc_name, errno);
+		HtLog(NML_PARAM, "T2");
+		exit(1);
+	}
+
+	// add by lzh
+	memcpy(gtBatProcList[iProcNum].szPorcName, pstBatCtl->bat_proc_name, sizeof(gtBatProcList[iProcNum].szPorcName) - 1); 
+	memcpy(gtBatProcList[iProcNum].szStlmNum, sStlmNum, sizeof(gtBatProcList[iProcNum].szStlmNum) - 1); 
+	memcpy(gtBatProcList[iProcNum].szStlmDate, sStlmDate, sizeof(gtBatProcList[iProcNum].szStlmDate) - 1); 
+	// add end
+
+	gtBatProcList[iProcNum].tPidList[0].iPid = iPid;
+	memcpy(&gtBatProcList[iProcNum].tPidList[0].sMatchStr, sArgv, strlen(sArgv)); 
+	gtBatProcList[iProcNum].nCurrentTotalNum ++;
+	gtBatProcList[iProcNum].nCurrentProcNum ++;
+
+	return RC_SUCC;
+}	
+
+
+/********************************************************************************
+ *  Function:  UpdateBatState
+ *	 修改批量主控流水表状态
+ *
+ *  Parameters:
+ *	   sBatId	-   批量编号
+ *
+ *  Return Value:
+ *	   0 - 成功
+ *	   其它 - 失败
+ ********************************************************************************/
+//	mdf by lzh
+//	int UpdateBatState(char *sBatId)
+int UpdateBatState(char *sBatId, char *sStlmNum, char *sStlmDate, char *pszMatch, long lArgc, char chFlag)
+{ 
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask		stBatTask;
+	TBatMainCtlDtl	stBatCtl;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stBatTask, 0, sizeof(stBatTask));
+	memset(&stBatCtl, 0, sizeof(stBatCtl));
+	memcpy(stBatTask.bat_id, sBatId, sizeof(stBatTask.bat_id) - 1);
+	memcpy(stBatTask.date_settlmt, sStlmDate, sizeof(stBatTask.date_settlmt) - 1);
+	memcpy(stBatTask.settle_num, sStlmNum, sizeof(stBatTask.settle_num) - 1);
+	memcpy(stBatCtl.date_settlmt, sStlmDate, sizeof(stBatCtl.date_settlmt) - 1);
+	memcpy(stBatCtl.settle_num, sStlmNum, sizeof(stBatCtl.settle_num) - 1);
+	memcpy(stBatCtl.bat_id, sBatId, sizeof(stBatCtl.bat_id) - 1);
+	stBatTask.task_state[0] = TASK_RUN_STA_SUC;
+	strcpy(stBatTask.matchstr, pszMatch);
+	sTrimAll(stBatTask.matchstr);
+	if(lArgc > 0 && BAT_START_FLAG_PAT == chFlag)
+	{
+		stBatTask.task_state[0] = BAT_RUN_STA_FAIL;	
+
+		EXEC SQL SELECT * INTO :stBatTask FROM TBL_BAT_TASK WHERE 
+			DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+			AND BAT_ID = :stBatTask.bat_id AND TASK_STATE = :stBatTask.task_state 
+			AND MATCHSTR = :stBatTask.matchstr;
+	}
+	else
+	{
+		EXEC SQL SELECT * INTO :stBatTask FROM TBL_BAT_TASK WHERE 
+			DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+			AND BAT_ID = :stBatTask.bat_id AND TASK_STATE <> :stBatTask.task_state 
+			AND ROWNUM = 1;
+	}
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "UpdateBatState: [%s] error: [%d]", sBatId, SQLCODE);
+		return RC_FAIL;
+	}
+	else if(SQLNOTFOUND)
+	{
+		if(lArgc > 0 && BAT_START_FLAG_PAT == chFlag)
+			stBatCtl.bat_state[0] = BAT_RUN_PAT_SUC;
+		else	stBatCtl.bat_state[0] = BAT_RUN_STA_SUC;
+	}
+	else
+		stBatCtl.bat_state[0] = BAT_RUN_STA_FAIL;
+   
+	memcpy(stBatCtl.rec_upd_ts, sGetCurrentTime(), sizeof(stBatCtl.rec_upd_ts) - 1);
+	EXEC SQL UPDATE TBL_BAT_MAIN_CTL_DTL SET
+		BAT_STATE  = :stBatCtl.bat_state,
+		REC_UPD_TS = :stBatCtl.rec_upd_ts
+	WHERE DATE_SETTLMT = :stBatCtl.date_settlmt AND SETTLE_NUM = :stBatCtl.settle_num AND 	
+		BAT_ID = :stBatCtl.bat_id;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新任务流水(%s)(%s)(%s)失败, err:(%d)(%s)", stBatCtl.date_settlmt, 
+			stBatCtl.settle_num, stBatCtl.bat_id, SQLCODE, sDbsError);
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}
+	
+/************************************************************************************
+ *  Function: vRealseTaskList 
+ *	   T+0加入，批量初始化频繁，造成gnBatProcNum无上限的增长，导致内存溢出
+ *	   用于将进程信息释放掉，这样gnBatProcNum 可以回收
+ *
+ *  Parameters:
+ *
+ *  Return Value:
+ *		   无
+ ***********************************************************************************/
+void	vRealseTaskList()
+{
+	int		iRet = 0, i = 0, j = 0;
+
+	HtLog(NML_PARAM, "搜索可释放的进程信息，(%d)(%d)", gnBatProcNum, g_lDoTime);
+	// 从后面开始遍历
+	for(i = gnBatProcNum - 1; i >= 0; i --) 
+	{
+		if( gtBatProcList[i].nCurrentTotalNum == gtBatProcList[i].nProcTotalNum )
+		{
+			HtLog(NML_PARAM, "释放第(%d)个进程信息，date_settlmt(%s)settle_num(%s)bat_id(%s)", gnBatProcNum, 
+				gtBatProcList[i].szStlmDate, gtBatProcList[i].szStlmNum, gtBatProcList[i].sBatId);
+			--gnBatProcNum;
+			memset(&gtBatProcList[i], 0, sizeof(t_Bat_List_Def));
+		}	
+		else
+			return ;
+	}
+}
+
+/************************************************************************************
+ *  Function: nIsnExistProcess 
+ *	   T+0加入，批量初始化频繁，避免将批量任务的其他进程信息初始化了，添加在批量
+ *	   初始化之前检查记录的进程是否存在
+ *
+ *  Parameters:
+ *
+ *  Return Value:
+ *		   无
+ ***********************************************************************************/
+int		nIsnExistProcess()
+{
+	int		iRet = 0, i = 0, j = 0;
+	FILE	*fp = NULL;
+	char	szCmd[512], szLine[512];
+
+
+	for(i = 0; i < gnBatProcNum; i++)
+	{
+
+		for(j = 0; j < gtBatProcList[i].nProcTotalNum; j++)
+		{
+			memset(szCmd, 0, sizeof(szCmd));
+			snprintf(szCmd, sizeof(szCmd), "ps -u $LOGNAME|grep %d|grep %s|wc -l", 
+				gtBatProcList[i].tPidList[j].iPid, gtBatProcList[i].szPorcName);
+			if(NULL == (fp = popen(szCmd, "r")))
+			{
+				HtLog(ERR_PARAM, "打开管道失败!");
+   				return RC_FAIL;
+			}
+			memset(szLine, 0, sizeof(szLine));
+			fgets(szLine, sizeof(szLine), fp);
+			sTrimCRLF(szLine);
+			pclose(fp);
+			fp = NULL;
+			
+			iRet = atoi(szLine);
+			if(iRet)	//	还存在
+			{
+				HtLog(ERR_PARAM, "发现(%s)进程(%s)(%d)正在处理!", gtBatProcList[gnBatProcNum].sBatId, 
+					gtBatProcList[i].szPorcName, gtBatProcList[i].tPidList[j].iPid);
+				return RC_FAIL;	
+			}
+		}
+	}
+
+	return RC_SUCC;
+}
+
+void	vDealChildPorcess()
+{
+	int   iRet, status, i, j;
+	pid_t pr;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask stBatTask;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stBatTask, 0, sizeof(stBatTask));
+	while ((pr = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) 
+	{
+//		for (i = 0; i < gnBatProcNum; i++) 
+//		没有设置队列，在同时做多任务时候, 对先进先出有问题, 找不到进程信息, 目前取最大值
+		for (i = 0; i < MAX_BAT_NUM; i++) 
+		{
+			for (j = 0; j < gtBatProcList[i].nProcTotalNum; j++)
+				if (gtBatProcList[i].tPidList[j].iPid == pr)
+					break;
+			if (j == gtBatProcList[i].nProcTotalNum)
+				continue;
+			gtBatProcList[i].tPidList[j].iPid = 0;
+			gtBatProcList[i].nCurrentProcNum --;
+			gtBatProcList[i].nCurrentTotalNum ++;
+			break; 
+		}
+		if (i == gnBatProcNum) {
+			HtLog(gsLogFile, HT_LOG_MODE_ERROR, __FILE__, __LINE__,
+				  "pid: [%ld Can't Find In gtBatProcList", pr);
+			continue;
+		}
+
+		memset(&stBatTask, 0, sizeof(stBatTask));
+		/* 检查子进程退出状态 */
+		if (WIFEXITED(status)) 
+		{
+			iRet = WEXITSTATUS(status);
+			HtLog(NML_PARAM, "BatId: [%s] Child Process Exit Normal: [%d]", gtBatProcList[i].sBatId, iRet);
+			if (iRet == 0) 
+			{
+				/* 子进程成功返回 */
+				stBatTask.task_state[0] = TASK_RUN_STA_SUC;
+			} else
+				stBatTask.task_state[0] = TASK_RUN_STA_FAIL;				   
+		} else
+			stBatTask.task_state[0] = TASK_RUN_STA_FAIL;
+		 
+//		mdf by lzh
+//		memcpy(stBatTask.date_settlmt, gsStlmDate, sizeof(stBatTask.date_settlmt) - 1);
+//		memcpy(stBatTask.settle_num, gsStlmNum, sizeof(stBatTask.settle_num) - 1);
+		memcpy(stBatTask.date_settlmt, gtBatProcList[i].szStlmDate, sizeof(stBatTask.date_settlmt) - 1);
+		memcpy(stBatTask.settle_num, gtBatProcList[i].szStlmNum, sizeof(stBatTask.settle_num) - 1);
+//		mdf end
+
+		memcpy(stBatTask.bat_id, gtBatProcList[i].sBatId, sizeof(stBatTask.bat_id) - 1);
+		memcpy(stBatTask.matchstr, gtBatProcList[i].tPidList[j].sMatchStr, sizeof(stBatTask.matchstr) - 1);
+		HtLog(NML_PARAM, "date_settlmt[%s], settle_num[%s],bat_id[%s], matchstr[%s].", stBatTask.date_settlmt, 
+			stBatTask.settle_num, stBatTask.bat_id, stBatTask.matchstr);
+		memcpy(stBatTask.rec_upd_ts, sGetCurrentTime(), sizeof(stBatTask.rec_upd_ts) - 1);
+
+		EXEC SQL UPDATE TBL_BAT_TASK SET 
+			TASK_STATE = :stBatTask.task_state,
+			REC_UPD_TS = :stBatTask.rec_upd_ts
+		WHERE DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num 
+			AND BAT_ID = :stBatTask.bat_id AND MATCHSTR = :stBatTask.matchstr;
+		if(SQL_UD_ERR) 
+		{
+			HtLog(ERR_PARAM, "BatId: [%s] TBL_BAT_TASK UPDATE2 error: [%d]", gtBatProcList[i].sBatId, SQLCODE);
+			EXEC SQL ROLLBACK WORK;
+		} 
+		EXEC SQL COMMIT WORK;
+
+		/** 子任务执行完成并不是手工发起子任务模式的**/
+		if(gtBatProcList[i].nCurrentTotalNum == gtBatProcList[i].nProcTotalNum && gsBatStartFlag[0] != BAT_START_FLAG_SUB) 
+		{
+			HtLog(ERR_PARAM, "BatId: [%s] Execute Complete", gtBatProcList[i].sBatId);
+//			mdf by lzh
+//			iRet = UpdateBatState(gtBatProcList[i].sBatId);
+			iRet = UpdateBatState(gtBatProcList[i].sBatId, gtBatProcList[i].szStlmNum, gtBatProcList[i].szStlmDate, stBatTask.matchstr, 
+				gtBatProcList[i].tPidList[j].nArgc, gtBatProcList[i].tPidList[j].szBatStartFalg[0]);
+//			mdf end
+			if(iRet) 
+			{
+				HtLog(ERR_PARAM, "BatId: [%s] UpdateBatState error: [%d]", gtBatProcList[i].sBatId, iRet);
+			}
+
+//			add by lzh	用于将进程信息释放掉，这样gnBatProcNum 可以回收
+			vRealseTaskList();	
+		}
+	}
+
+}
+
+/************************************************************************************
+ *  Function: vHandleChildDeath 
+ *	   父进程回收子进程,更新进程状态
+ *
+ *  Parameters:
+ *
+ *  Return Value:
+ *		   无
+ ***********************************************************************************/
+void vHandleChildDeath(int nSig)
+{
+	int   iRet, status, i, j;
+	pid_t pr;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatTask stBatTask;
+	EXEC SQL END DECLARE SECTION;
+
+	HtLog(NML_PARAM, "对子进程退出扫描回收!");
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(gsLogFile, HT_LOG_MODE_ERROR, __FILE__, __LINE__,
+			  "DbsConnect error: [%d]", iRet);
+	}
+ 
+	/* 回收子进程 */
+	while ((pr = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) 
+	{
+		for (i = 0; i < gnBatProcNum; i++) 
+		{
+			for (j = 0; j < gtBatProcList[i].nProcTotalNum; j++)
+				if (gtBatProcList[i].tPidList[j].iPid == pr)
+					break;
+			if (j == gtBatProcList[i].nProcTotalNum)
+				continue;
+			gtBatProcList[i].tPidList[j].iPid = 0;
+			gtBatProcList[i].nCurrentProcNum --;
+			gtBatProcList[i].nCurrentTotalNum ++;
+			break; 
+		}
+		if (i == gnBatProcNum) {
+			HtLog(NML_PARAM, "pid: [%ld Can't Find In gtBatProcList", pr);
+			continue;
+		}
+
+		memset(&stBatTask, 0, sizeof(stBatTask));
+		/* 检查子进程退出状态 */
+		if (WIFEXITED(status)) 
+		{
+			iRet = WEXITSTATUS(status);
+			HtLog(NML_PARAM, "BatId: [%s] Child Process Exit Normal: [%d]", gtBatProcList[i].sBatId, iRet);
+			if(iRet == 0) 	//	子进程成功返回
+				stBatTask.task_state[0] = TASK_RUN_STA_SUC;
+			 else
+				stBatTask.task_state[0] = TASK_RUN_STA_FAIL;				   
+		} else
+			stBatTask.task_state[0] = TASK_RUN_STA_FAIL;
+		 
+//		mdf by lzh
+//		memcpy(stBatTask.date_settlmt, gsStlmDate, sizeof(stBatTask.date_settlmt) - 1);
+//		memcpy(stBatTask.settle_num, gsStlmNum, sizeof(stBatTask.settle_num) - 1);
+		memcpy(stBatTask.date_settlmt, gtBatProcList[i].szStlmDate, sizeof(stBatTask.date_settlmt) - 1);
+		memcpy(stBatTask.settle_num, gtBatProcList[i].szStlmNum, sizeof(stBatTask.settle_num) - 1);
+//		mdf end
+
+		memcpy(stBatTask.bat_id, gtBatProcList[i].sBatId, sizeof(stBatTask.bat_id) - 1);
+		memcpy(stBatTask.matchstr, gtBatProcList[i].tPidList[j].sMatchStr, sizeof(stBatTask.matchstr) - 1);
+		HtLog(ERR_PARAM, "date_settlmt[%s], settle_num[%s],bat_id[%s], matchstr[%s].",
+			   stBatTask.date_settlmt, stBatTask.settle_num, stBatTask.bat_id, stBatTask.matchstr);
+		memcpy(stBatTask.rec_upd_ts, sGetCurrentTime(), sizeof(stBatTask.rec_upd_ts) - 1);
+
+		EXEC SQL UPDATE TBL_BAT_TASK SET 
+			TASK_STATE = :stBatTask.task_state, 
+			REC_UPD_TS = :stBatTask.rec_upd_ts
+		WHERE DATE_SETTLMT = :stBatTask.date_settlmt AND SETTLE_NUM = :stBatTask.settle_num AND 
+			BAT_ID = :stBatTask.bat_id AND MATCHSTR = :stBatTask.matchstr;
+		if(SQL_UD_ERR) 
+		{
+			HtLog(ERR_PARAM, "BatId: [%s] TBL_BAT_TASK UPDATE2 error: [%d]", gtBatProcList[i].sBatId, SQLCODE);
+			EXEC SQL ROLLBACK WORK;
+		} 
+		EXEC SQL COMMIT WORK;
+
+		/** 子任务执行完成并不是手工发起子任务模式的**/
+		if(gtBatProcList[i].nCurrentTotalNum == gtBatProcList[i].nProcTotalNum && gsBatStartFlag[0] != BAT_START_FLAG_SUB) 
+		{
+			HtLog(gsLogFile, HT_LOG_MODE_ERROR, __FILE__, __LINE__, "BatId: [%s] Execute Complete", gtBatProcList[i].sBatId);
+//			mdf by lzh
+//			iRet = UpdateBatState(gtBatProcList[i].sBatId);
+			iRet = UpdateBatState(gtBatProcList[i].sBatId, gtBatProcList[i].szStlmNum, gtBatProcList[i].szStlmDate, stBatTask.matchstr, 
+				gtBatProcList[i].tPidList[j].nArgc, gtBatProcList[i].tPidList[j].szBatStartFalg[0]);
+//			mdf end
+			if (iRet) 
+			{
+				HtLog(ERR_PARAM, "BatId: [%s] UpdateBatState error: [%d]", gtBatProcList[i].sBatId, iRet);
+			}
+
+//			add by lzh	用于将进程信息释放掉，这样gnBatProcNum 可以回收
+			vRealseTaskList();	
+		}
+	}
+	vDbsDisconnect();
+	sigset(SIGCLD,  vHandleChildDeath);
+}
+
+/********************************************************************************
+ *  Function:  InitBatTask 
+ *  批量执行:  批量初始化
+ *
+ *  Return Value:
+ *	   0 - 成功
+ *	   其它 - 失败
+ *******************************************************************************/
+int InitBatTask(char *psStlmDate, char *psStlmNum, t_Console_Cmd_Def* pstConsole)
+{
+	int		i = 0, iRet = 0, iFlag = 0;
+	char	sTime[15] = {0}, sBatchFlag[256] = {0};
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szFlag[2], sTmp[3] = {0};
+	TBatMainCtlDtl  stBatCtl;			/* 批量主控流水表 */
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stBatCtl, 0, sizeof(TBatMainCtlDtl));
+	if(!memcmp(psStlmNum, "TN", 2) || !memcmp(psStlmNum, "TC", 2))
+	{
+		memcpy(sBatchFlag, pstConsole->sArgv, sizeof(pstConsole->sArgv));
+		sTrimAll(sBatchFlag);
+	}
+	else
+		sBatchFlag[0] = '1';
+
+	memcpy(sTmp, psStlmNum, 2);
+	memcpy(sTime, sGetCurrentTime(), sizeof(sTime) - 1);
+
+	/** 批量执行日期不能比当前系统日期还有晚**/
+	if(memcmp(psStlmDate, sTime, 8) > 0)
+	{
+		HtLog(gsLogFile, HT_LOG_MODE_ERROR, __FILE__, __LINE__,
+			"now is running [%s][%s], but sysdate is[%s] ", psStlmDate, psStlmNum, sTime);
+		memcpy(pstConsole->sRspCode, BAT_INIT_DATEA_ERROR, sizeof(pstConsole->sRspCode));
+		memcpy(pstConsole->sRspDsp, BAT_INIT_DATEA_ERROR_DSP, strlen(BAT_INIT_DATEA_ERROR_DSP));
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE Cur_bat_main_dtl CURSOR FOR SELECT * FROM TBL_BAT_MAIN_CTL_DTL 
+		WHERE SUBSTR(SETTLE_NUM, 1, 2) = :sTmp ORDER BY DATE_SETTLMT DESC, SETTLE_NUM DESC, BAT_ID ASC;
+
+	EXEC SQL OPEN Cur_bat_main_dtl;
+	if(SQLCODE) 
+	{
+		HtLog(NML_PARAM, "打开查询批量控制表查询游标出错, err:(%d)(%s) (%s)", 
+			SQLCODE, sDbsError(), sTmp);
+		memcpy(pstConsole->sRspCode, DB_BAT_SYS_ERROR, sizeof(pstConsole->sRspCode));
+		memcpy(pstConsole->sRspDsp, DB_BAT_SYS_ERROR_DSP, strlen(DB_BAT_SYS_ERROR_DSP));
+		return RC_FAIL;
+	}
+	
+	while (1) 
+	{
+		memset(&stBatCtl, 0, sizeof(TBatMainCtlDtl));
+		EXEC SQL FETCH Cur_bat_main_dtl INTO :stBatCtl;
+		if(SQLERR) 
+		{
+			HtLog(ERR_PARAM, "TBL_BAT_MAIN_CTL_DTL_FET_SEL [%s][%s] error [%d]", psStlmDate, psStlmNum, iRet);
+			memcpy(pstConsole->sRspCode, DB_BAT_SYS_ERROR, sizeof(pstConsole->sRspCode));
+			memcpy(pstConsole->sRspDsp, DB_BAT_SYS_ERROR_DSP, strlen(DB_BAT_SYS_ERROR_DSP));
+			EXEC SQL CLOSE Cur_bat_main_dtl;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		vTrimBatMainCtlDtl(&stBatCtl);
+		
+		i++;
+		/****检查是否已经初始化***/
+		if(!memcmp(stBatCtl.date_settlmt, psStlmDate, 8) && !memcmp(stBatCtl.settle_num, psStlmNum, 4))
+		{
+			HtLog(NML_PARAM, "now is running [%s][%s] ", psStlmDate, psStlmNum);
+			memcpy(pstConsole->sRspCode, BAT_INIT_SUCC_ERROR, sizeof(pstConsole->sRspCode));
+			memcpy(pstConsole->sRspDsp, BAT_INIT_SUCC_ERROR_DSP, strlen(BAT_INIT_SUCC_ERROR_DSP));
+			EXEC SQL CLOSE Cur_bat_main_dtl;
+			return RC_FAIL;
+		}
+
+		/***不能插队初始化***/
+		if ( memcmp(stBatCtl.date_settlmt, psStlmDate, 8) > 0 || 
+			 ( !memcmp(stBatCtl.date_settlmt, psStlmDate, 8) && memcmp(stBatCtl.settle_num, psStlmNum, 4) > 0 ) )
+		{
+			HtLog(ERR_PARAM, "now is init [%s][%s] but runned is[%s][%s] ", psStlmDate, psStlmNum, 
+				stBatCtl.date_settlmt, stBatCtl.settle_num);
+			memcpy(pstConsole->sRspCode, BAT_INIT_DATEB_ERROR, sizeof(pstConsole->sRspCode));
+			memcpy(pstConsole->sRspDsp, BAT_INIT_DATEB_ERROR_DSP, strlen(BAT_INIT_DATEB_ERROR_DSP));
+			EXEC SQL CLOSE Cur_bat_main_dtl;
+			return RC_FAIL;
+		}
+
+		/***前一批次必需成功至少三个任务***/
+		if ( i < 4 && stBatCtl.bat_state[0] != '2' )
+		{
+			HtLog(ERR_PARAM, "前一批次至少要成功前三个任务");
+			memcpy(pstConsole->sRspCode, BAT_INIT_BEFORE_ERROR, sizeof(pstConsole->sRspCode));
+			memcpy(pstConsole->sRspDsp, BAT_INIT_BEFORE_ERROR_DSP, strlen(BAT_INIT_BEFORE_ERROR_DSP));
+			EXEC SQL CLOSE Cur_bat_main_dtl;
+			return RC_FAIL;
+		}
+
+		/***可以进行下一批**/
+		if ( i > 3 )
+			break;
+	}
+	EXEC SQL CLOSE Cur_bat_main_dtl;
+
+ 	memset(szFlag, 0, sizeof(szFlag));
+ 	memset(&stBatCtl, 0, sizeof(TBatMainCtlDtl));
+	memcpy(stBatCtl.date_settlmt, psStlmDate, sizeof(stBatCtl.date_settlmt) - 1);
+	memcpy(stBatCtl.settle_num, psStlmNum, sizeof(stBatCtl.settle_num) - 1);
+	stBatCtl.rec_opr_id[0] = sBatchFlag[0];
+	szFlag[0] = psStlmNum[1];
+		
+	/***进行批次初始化***/
+	memcpy(stBatCtl.rec_upd_ts, sGetCurrentTime(), sizeof(stBatCtl.rec_upd_ts) - 1);
+	EXEC SQL INSERT INTO TBL_BAT_MAIN_CTL_DTL 
+		SELECT :stBatCtl.date_settlmt || :stBatCtl.settle_num || A.BAT_ID, 
+		:stBatCtl.date_settlmt, :stBatCtl.settle_num, A.* FROM TBL_BAT_MAIN_CTL A 
+	WHERE SUBSTR(A.BAT_ID,2,1) = :szFlag AND A.REC_OPR_ID >= :stBatCtl.rec_opr_id;
+	if(SQLCODE) 
+	{
+		HtLog(ERR_PARAM, "TBL_BAT_MAIN_CTL_DTL err:(%d)(%s), (%s)", SQLCODE, sDbsError(), sBatchFlag);
+		memcpy(pstConsole->sRspCode, DB_BAT_SYS_ERROR, sizeof(pstConsole->sRspCode));
+		memcpy(pstConsole->sRspDsp, DB_BAT_SYS_ERROR_DSP, strlen(DB_BAT_SYS_ERROR_DSP));
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+
+	EXEC SQL DELETE FROM TBL_BAT_TASK WHERE DATE_SETTLMT = :stBatCtl.date_settlmt AND 
+		SETTLE_NUM = :stBatCtl.settle_num;
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}
+ 
+/********************************************************************************
+ *  Function:  ExecuteBatTask 
+ *
+ *	 批量执行:处理批量列表
+ *
+ *
+ *  Return Value:
+ *
+ *	   0 - 成功
+ *	   其它 - 失败
+ *******************************************************************************/
+
+int ExecuteBatTask(t_Console_Cmd_Def* pstConsole)
+{
+	int		iRet, iRelFlg = 0;
+	char	szApp[256 + 1];
+	EXEC SQL BEGIN DECLARE SECTION;
+	TBatMainCtlDtl	stBatCtl;
+	EXEC SQL END DECLARE SECTION;
+
+	/**清算日期**/
+	memset(gsStlmDate, 0, sizeof(gsStlmDate));
+	memcpy(gsStlmDate, pstConsole->sStlmDate, sizeof(gsStlmDate) - 1);
+
+	/**用清算次数做为清算类型和批次数**/
+	memset(gsStlmNum, 0, sizeof(gsStlmNum));
+	memcpy(gsStlmNum, pstConsole->sStlmNum, sizeof(gsStlmNum) - 1);
+
+	sTrimRight(pstConsole->sArgc);
+	sTrimRight(pstConsole->sArgv);
+
+	HtLog(NML_PARAM, "[%5.5s],[%8.8s], [%4.4s],[%2.2s].", pstConsole->sBatId, 
+		pstConsole->sStlmDate, pstConsole->sStlmNum, pstConsole->sRspCode);
+	HtLog(NML_PARAM, "[%2.2s][%-256.256s]", pstConsole->sArgc,pstConsole->sArgv);
+
+	if (!memcmp(pstConsole->sBatId, BAT_INIT_ID, sizeof(pstConsole->sBatId))) 
+	{
+		HtLog(NML_PARAM, "Batch Init Start....");
+//	add by lzh
+//	T+0加入 可能还有正在跑的进程信息，不能初始化掉
+		iRet = nIsnExistProcess();
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "还有批次任务正在处理，请稍后进行批量初始化");
+			memcpy(pstConsole->sRspCode, BAT_INIT_DOING_ERROR, sizeof(pstConsole->sRspCode) - 1); 
+			memcpy(pstConsole->sRspDsp, BAT_INIT_DOING_ERROR_DSP, strlen(BAT_INIT_DOING_ERROR_DSP));
+			return -1;
+		}
+// add end
+		iRet = InitBatTask(gsStlmDate, gsStlmNum, pstConsole);
+		if ( iRet )
+		{
+			HtLog(ERR_PARAM,  "InitBatTask: exec error: [%d]", iRet);
+			HtLog(ERR_PARAM, "[%5.5s],[%8.8s], [%4.4s],[%2.2s].", pstConsole->sBatId, 
+				pstConsole->sStlmDate, pstConsole->sStlmNum, pstConsole->sRspCode);
+			HtLog(ERR_PARAM, "[%2.2s][%-256.256s]", pstConsole->sArgc,pstConsole->sArgv);
+			HtLog(ERR_PARAM, "[%2.2s][%-256.256s]", pstConsole->sRspCode,pstConsole->sRspDsp);
+			return -1;
+		}
+		gnBatProcNum = 0;
+g_lDoTime = 0;
+		memset(gtBatProcList, 0, sizeof(gtBatProcList));
+		return 0;
+	}
+
+	/* 查找该批量任务信息 */
+	memset(&stBatCtl, 0, sizeof(stBatCtl));
+	memcpy(stBatCtl.bat_id, pstConsole->sBatId, sizeof(stBatCtl.bat_id) - 1);  
+	memcpy(stBatCtl.date_settlmt, gsStlmDate, sizeof(stBatCtl.date_settlmt) - 1);  
+	memcpy(stBatCtl.settle_num, gsStlmNum, sizeof(stBatCtl.settle_num) - 1);  
+
+	EXEC SQL SELECT * INTO :stBatCtl FROM TBL_BAT_MAIN_CTL_DTL WHERE DATE_SETTLMT = :stBatCtl.date_settlmt 
+		AND SETTLE_NUM = :stBatCtl.settle_num AND BAT_ID = :stBatCtl.bat_id;
+	if(SQLCODE) 
+	{
+		HtLog(ERR_PARAM,  "ExecuteBatTask: DB_SELECT [%s] error: [%d]", stBatCtl.bat_id, iRet);
+		memcpy(pstConsole->sRspCode, DB_SELECT_BAT_MAIN_ERROR, sizeof(pstConsole->sRspCode)); 
+		memcpy(pstConsole->sRspDsp, DB_SELECT_BAT_MAIN_ERROR_DSP, strlen(DB_SELECT_BAT_MAIN_ERROR_DSP));
+		return RC_FAIL;
+	}
+	vTrimBatMainCtlDtl(&stBatCtl);
+
+	/**手动执行子任务标示**/
+	memset(gsBatStartFlag, 0, sizeof(gsBatStartFlag));
+	memcpy(gsBatStartFlag, stBatCtl.task_start_flg, sizeof(gsBatStartFlag) - 1);
+
+	/* 检查批量状态 如果是成功，并且不不支持手工多任务时,则返回取下一条记录 */
+	if (stBatCtl.bat_state[0] == BAT_RUN_STA_SUC &&  stBatCtl.task_start_flg[0] == BAT_START_FLAG_NO ) 
+		return RC_SUCC;
+
+	/* 检查批量子任务分配状态 */
+	if( stBatCtl.task_assign_state[0] == TASK_ASSIGN_STA_RUN && stBatCtl.task_start_flg[0] != BAT_START_FLAG_SUB)
+	{
+		HtLog(NML_PARAM, "ExecuteBatTask: task_assign_sta error: [%c]", stBatCtl.task_assign_state[0]);
+		memcpy(pstConsole->sRspCode, BAT_TASK_ASSIGN_STA_ERROR, sizeof(pstConsole->sRspCode)); 
+		memcpy(pstConsole->sRspDsp, BAT_TASK_ASSIGN_STA_ERROR_DSP, strlen(BAT_TASK_ASSIGN_STA_ERROR_DSP));
+		return -1;
+	}
+		
+	/* 如果是预处理,要校验依赖批量是否完成 */
+	if (stBatCtl.bat_state[0] == BAT_RUN_STA_PRE || stBatCtl.bat_state[0] == BAT_RUN_PAT_SUC)
+	{
+		/* 检查批量依赖关系 */
+		iRet = nChkBatRel(stBatCtl.bat_id, stBatCtl.date_settlmt, stBatCtl.settle_num, atol(pstConsole->sArgc), 
+			pstConsole->sArgv, &iRelFlg);
+		if(iRet)
+		{
+			HtLog(NML_PARAM, "ExecuteBatTask: nChkBatRel error: [%d]", iRet);
+			memcpy(pstConsole->sRspCode, BAT_CHECK_REL_ERROR, sizeof(pstConsole->sRspCode)); 
+			memcpy(pstConsole->sRspDsp, BAT_CHECK_REL_ERROR_DSP, strlen(BAT_CHECK_CLS_ERROR_DSP));
+			return -1;
+		} 
+
+		/* 依赖关系是否能检查通过, 若不通过继续取下一任务 */
+		if (iRelFlg)
+		{
+			memcpy(pstConsole->sRspCode, BAT_CHECK_REL_ERROR, sizeof(pstConsole->sRspCode)); 
+			memcpy(pstConsole->sRspDsp, BAT_CHECK_REL_ERROR_DSP, strlen(BAT_CHECK_REL_ERROR_DSP));
+			return -1;
+		}
+	} 
+	else if (stBatCtl.bat_state[0] == BAT_RUN_STA_RUN && stBatCtl.task_start_flg[0] != BAT_START_FLAG_SUB ) 
+	{   /* 批量运行中 */
+		/* 不需要再重复启动 */
+		memcpy(pstConsole->sRspCode, BAT_REPEAT_RUN_ERROR, sizeof(pstConsole->sRspCode)); 
+		memcpy(pstConsole->sRspDsp, BAT_REPEAT_RUN_ERROR_DSP, strlen(BAT_REPEAT_RUN_ERROR_DSP));
+		return -1;
+	}
+
+	/* 校验可执行文件是否存在 */
+	sTrimRight(stBatCtl.bat_proc_name);
+	memset(szApp, 0, sizeof(szApp));
+	sprintf(szApp, "%s/bin/%s", getenv("BATHOME"), stBatCtl.bat_proc_name);
+
+	iRet = access(szApp, F_OK);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "ExecuteBatTask: the %s exec file no found ", stBatCtl.bat_proc_name);
+		memcpy(pstConsole->sRspCode, BAT_PROC_NOT_EXIST, sizeof(pstConsole->sRspCode)); 
+		memcpy(pstConsole->sRspDsp, BAT_PROC_NOT_EXIST_DSP, strlen(BAT_PROC_NOT_EXIST_DSP));
+		return -1;
+	}
+
+	if(stBatCtl.task_start_flg[0] == BAT_START_FLAG_SUB)
+		iRet = BatRunTaskSub(&stBatCtl, pstConsole);
+	else
+		iRet = BatRunTask(&stBatCtl, pstConsole);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "BatRunTask %s error %d", stBatCtl.bat_id, iRet);
+		memcpy(pstConsole->sRspCode, BAT_RUN_TASK_ERROR, sizeof(pstConsole->sRspCode)); 
+		memcpy(pstConsole->sRspDsp, BAT_RUN_TASK_ERROR_DSP, strlen(BAT_RUN_TASK_ERROR_DSP));
+		return -1;
+	}
+	 
+	return 0;
+}
+
+
+/****************************************************************************************************
+ *  Function:  Signalhandle
+ *
+ *	  捕获指定信号后的处理函数
+ *
+ *  Parameters:
+ *
+ *	  sig - 捕获到的信号
+ *
+ *  Return Value:
+ *
+ ****************************************************************************************************/
+static void SignalHandle(int sig)
+{
+	int iRet;
+
+	HtLog(NML_PARAM, "---------- catch the signal [%d] (%d)---------", sig, gnBatProcNum);
+	switch (sig)
+	{
+		case SIGTERM:
+		case SIGSEGV:
+		case SIGUSR1:
+			EXEC SQL ROLLBACK WORK;
+			vDbsDisconnect();
+			HtLog(ERR_PARAM, "---------- exit [%d] ---------", sig);
+			exit(0);
+		case SIGUSR2:
+			break;
+		default:
+			;
+	}
+}

@@ -1,0 +1,290 @@
+/*****************************************************************
+ *  功能: 自主清分T+1流水未给下，对账不平，T+2对平下， 只能在T+3才自动清分,
+ *			本模块实现在T+2对平下，提供在T+2清算功能
+ *	Author：DeffPuzzL
+ *  Edit History:
+ ****************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_stlm_err.h"
+#include "tbl_stlm_succ.h"
+#include "tbl_algo_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INCLUDE SQLCA;
+
+extern	int	nDoneAlgoDtl(TStlmSucc *pstSucc, char *pszSettleDate, char *pszSettleNum);
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int main(int argc, char **argv )										*/
+/*   功能  ： 本模块实现在T + 2对平下，提供在T + 2清算功能 							*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int main(int argc , char ** argv)
+{
+	int		iRet = 0;
+	long	lTrace = 0;
+	char	szSettleDate[9], szSettleNum[5]; 
+	
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	sprintf(gsLogFile, "AlgoErrTxn.log");
+   
+	vPrintVersion(argv[1]);
+	if(argc != 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+//	snprintf(gsLogFile, sizeof(gsLogFile), "AlgoErrTxn_%d.log", lTrace);
+
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleDate, argv[1], sizeof(szSettleDate) - 1);
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);  
+
+	HtLog(NML_PARAM, "日期(%s)(%s), 针对对平流水自动清分处理开始.", szSettleDate, szSettleNum);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "数据库连接失败, err:(%d)(%s)\n", iRet, sDbsError());
+		return RC_FAIL;
+	}
+	
+	//	仅仅针对 T + N/C的需求
+	iRet = nAlgoErrTxn(szSettleDate, szSettleNum, lTrace);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "对商户清分失败, err:(%d)\n", iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	} 
+   
+	/*断开数据库*/
+	vDbsDisconnect();
+	HtLog(NML_PARAM, "商户清分流程结束.\n");
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nDealAlgoErr(TStlmSucc *pstSucc, char *pszSettleDate, 			*/
+/*					char *pszSettleNum)												*/
+/*   功能  ： 清分处理流程															*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nDealAlgoErr(TStlmSucc *pstSucc, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szDone[2], szStlmDate[9];
+	TStlmSucc	stSucc;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szDone, 0, sizeof(szDone));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memcpy(szStlmDate, pszSettleDate, sizeof(szStlmDate) - 1);
+	memcpy(&stSucc, pstSucc, sizeof(stSucc));
+
+	//  因为存在数据备份，因此考虑异常对已经清分不做清分处理
+	if(STLM_SUCC_FLG_OK == pstSucc->result_flag[0])
+	{
+		HtLog(ERR_PARAM, "该笔流水(%s)标记已经清分, 请核查后在做处理", pstSucc->id);
+		szDone[0] = STLM_CUP_SETTLE_SUCC;
+
+		EXEC SQL UPDATE TBL_STLM_ERR SET 
+			RESULT_FLAG = :szDone,
+			REC_UPD_TS  = :stSucc.rec_upd_ts
+		WHERE ID = :stSucc.id;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新差错流水(%s)失败, err:(%d)(%s)", stSucc.id, 
+				SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+
+		return RC_SUCC;
+	}
+	else if(STLM_SUCC_FLG_UPACT == pstSucc->result_flag[0])		//	挂账处理
+	{
+		HtLog(ERR_PARAM, "该笔流水(%s)标记已挂账处理, 请核查后在做处理", pstSucc->id);
+		szDone[0] = STLM_CUP_NOT_DEAL;
+
+		EXEC SQL UPDATE TBL_STLM_ERR SET 
+			RESULT_FLAG = :szDone,
+			REC_UPD_TS  = :stSucc.rec_upd_ts
+		WHERE ID = :stSucc.id;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新差错流水(%s)失败, err:(%d)(%s)", stSucc.id, 
+				SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+
+		return RC_SUCC;
+	}
+	else
+		stSucc.result_flag[0] = STLM_SUCC_FLG_INIT;
+
+	if(RC_SUCC != nDoneAlgoDtl(pstSucc, pszSettleDate, pszSettleNum))
+	{
+		HtLog(ERR_PARAM, "清分流水(%s)商户清分明细失败!", pstSucc->id);
+		return RC_FAIL;	
+	}
+
+	stSucc.result_flag[0] = STLM_SUCC_FLG_OK;   //  已清分状态
+
+	EXEC SQL UPDATE TBL_STLM_SUCC SET
+		RESULT_FLAG = :stSucc.result_flag, 
+		TX_AMT		= :stSucc.tx_amt,
+		REC_UPD_TS  = :stSucc.rec_upd_ts
+	WHERE ID = :stSucc.id;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "更新对账成功表状态失败, err:(%d)(%s)ID(%s)", SQLCODE,
+			sDbsError(), stSucc.id);
+		return RC_FAIL;
+	}
+
+	szDone[0] = STLM_CUP_SETTLE_SUCC;
+
+	EXEC SQL UPDATE TBL_STLM_ERR SET 
+		RESULT_FLAG = :szDone,
+		NEXT_DATE	= :szStlmDate,
+		REC_UPD_TS  = :stSucc.rec_upd_ts
+	WHERE ID = :stSucc.id;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "更新差错流水(%s)失败, err:(%d)(%s)", stSucc.id, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nAlgoErrTxn(char *pszSettleDate, char *pszSettleNum, long lLast)	*/
+/*   功能  ： 清分处理流程															*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nAlgoErrTxn(char *pszSettleDate, char *pszSettleNum, long lLast)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szType[2], szDone[2], szToDo[2], szID[23];
+	char		szStlmDate[9], szSettleNum[5];
+	double		dTxAmt = 0.00;
+	long		lDisc = 0, lCount = 0, lRet = 0;
+	TStlmSucc	stSucc;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szType, 0, sizeof(szType));
+	memset(szToDo, 0, sizeof(szToDo));
+	memset(szDone, 0, sizeof(szDone));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+
+	memcpy(szStlmDate, pszSettleDate, sizeof(szStlmDate) - 1);
+	memcpy(szSettleNum, pszSettleNum, sizeof(szSettleNum) - 1);
+	szToDo[0] = STLM_CUP_TO_DONE;
+	szType[0] = STLM_FLG_OK_UNNORMAL;
+
+	HtLog(NML_PARAM, "开始获取对平且自动参与清分差错流水(%s)(%s)", pszSettleDate, pszSettleNum);
+
+	EXEC SQL DECLARE Cur_stlm_err CURSOR FOR 
+		SELECT NVL(ID, ' '), NVL(TX_AMT, 0.00) FROM TBL_STLM_ERR 
+		WHERE RESULT_FLAG = :szToDo AND STLM_TYPE = :szType AND DISC_CYCLE > :lDisc;
+
+	EXEC SQL OPEN Cur_stlm_err;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "打开差错流水待清分流水失败, err:(%d)(%s)",
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szID, 0, sizeof(szID));
+		EXEC SQL FETCH Cur_stlm_err INTO :szID, :dTxAmt;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "打开差错流水待清分流水失败, err:(%d)(%s)",
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_stlm_err;
+			EXEC SQL ROLLBACK WORK;	
+			return RC_FAIL;
+		}
+
+		sTrimAll(szID);
+
+		memset(&stSucc, 0, sizeof(stSucc));
+		EXEC SQL SELECT * INTO :stSucc FROM TBL_STLM_SUCC WHERE ID = :szID;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "根据差错流水(%s)查找成功流水失败, err:(%d)(%s)",
+				szID, SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_stlm_err;
+			EXEC SQL ROLLBACK WORK;	
+			return RC_FAIL;	
+		}
+		else if(SQLNOTFOUND)
+		{
+			HtLog(ERR_PARAM, "流水(%s)在成功表不存在，无法参与清分!", szID);
+			memcpy(stSucc.rec_upd_ts, sGetCurrentTime(), sizeof(stSucc.rec_upd_ts) - 1);
+			continue;
+		}
+		else
+		{
+			HtLog(ERR_PARAM, "获取流水(%s)将参与本期(%s)清分", szID, szStlmDate);
+			vTrimStlmSucc(&stSucc);
+			stSucc.tx_amt = dTxAmt;
+			memcpy(stSucc.rec_upd_ts, sGetCurrentTime(), sizeof(stSucc.rec_upd_ts) - 1);
+
+			if(RC_SUCC != nDealAlgoErr(&stSucc, pszSettleDate, pszSettleNum))
+			{
+				HtLog(ERR_PARAM, "处理待清分流水(%s)失败, err:(%d)(%s)", szID, 
+					SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_stlm_err;
+				EXEC SQL ROLLBACK WORK;	
+				return RC_FAIL;
+			}
+		}
+		
+		if(++ lCount % 500 == 0)
+			EXEC SQL COMMIT WORK;
+	}
+	EXEC SQL CLOSE Cur_stlm_err;
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "本批次(%s)清分总条数(%d)", pszSettleNum, lCount);
+	return RC_SUCC;
+}
+
+/************************************************************************************
+	code end
+ ************************************************************************************/

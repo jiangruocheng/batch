@@ -1,0 +1,172 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取客户表TBL_MCHT_USER启动内存大小
+ ****************************************************************************************/
+long	lDefine_MchtUser(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szSettleNum[5], szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	strcpy(szTable, sGetTableName(t));
+	memcpy(szSettleNum, pszSettleNum, 4); 
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbMchtUser), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(user_id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbMchtUser, user_id, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(user_id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(mcht_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtUser, mcht_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(mcht_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(user_phone)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtUser, user_phone, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(user_phone)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(user_email)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtUser, user_email, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(user_email)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(user_card_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtUser, user_card_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(user_card_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_MCHT_USER	
+ ****************************************************************************************/
+long	lLoad_MchtUser(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMchtUser	stUser;
+	char		szSettleNum[5], szPrimary[2];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szPrimary, 0, sizeof(szPrimary));
+
+	memcpy(szSettleNum, pszSettleNum, 4);
+	szPrimary[0] = '1';
+
+	EXEC SQL DECLARE Cur_mcht_user CURSOR FOR
+		SELECT NVL(USER_ID, 0), NVL(MCHT_NO, ' '), NVL(USER_NAME, ' '),
+			NVL(USER_ENGNAME, ' '), NVL(USER_PHONE, ' '), NVL(USER_EMAIL, ' '),
+			NVL(USER_CARD_NO, ' ') FROM TBL_MCHT_USER
+		WHERE USER_PRIMARY = :szPrimary AND MCHT_NO IN
+			(SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum);
+
+	EXEC SQL OPEN Cur_mcht_user;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stUser, 0, sizeof(stUser));
+		EXEC SQL FETCH Cur_mcht_user INTO :stUser.user_id, :stUser.mcht_no,
+			:stUser.user_name, :stUser.user_engname, :stUser.user_phone,
+			:stUser.user_email, :stUser.user_card_no;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_user;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(t), lCount);
+			vSetErrMsg("定义超限，请重新装载!(%d)<(%d)", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_mcht_user;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		sTrimAll(stUser.mcht_no);	
+		sTrimAll(stUser.user_name);	
+		sTrimAll(stUser.user_engname);	
+		sTrimAll(stUser.user_phone);	
+		sTrimAll(stUser.user_email);	
+		sTrimAll(stUser.user_card_no);	
+		stUser.user_id = lSetEXLong(stUser.user_id);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, (void *)&stUser.user_id, ++(pGetTblDef(t)->lTreeNode),
+			dbMchtUser, user_id, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载操作员ID(%d)失败, 原因:%s", stUser.user_id, sGetError());
+			EXEC SQL CLOSE Cur_mcht_user;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != IBPInsertData(t, &stUser, sizeof(stUser)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%d)失败, 原因:%s", sGetTableName(t),
+				stUser.user_id, sGetError());
+			EXEC SQL CLOSE Cur_mcht_user;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_mcht_user;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

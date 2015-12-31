@@ -1,0 +1,2754 @@
+#include	"Ibp.h"
+#include	"load.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"tool.h"
+#include	"tbl_settle_account.h"
+EXEC SQL END DECLARE SECTION;
+
+#define		TRUE				1
+#define		FALSE				0
+
+#define		MASK_STEP			0x01
+#define		MASK_BASE			0x1f
+#define		STEP_STOP			0xff
+#define		STEP_ONE(x)			(0x01 & (x))
+#define		STEP_TWO(x)			(0x02 & (x))
+#define		STEP_THREE(x)		(0x04 & (x))
+#define		STEP_FOUR(x)		(0x08 & (x))
+#define		STEP_FIVE(x)		(0x10 & (x))
+
+#define		IBP_RACE			0x00
+#define		IBP_ERR				0x01
+#define		IBP_WARM			0x02
+#define		IBP_DEBUG			0x03
+#define		IBP_RPT				0x04
+
+#define		LOG_MOST			0x09
+#define		LOG_ONE				0x01
+#define		LOG_TWO				0x02
+#define		LOG_THREE			0x03
+
+#ifndef		LOGNAME
+#define		LOGNAME				"IBPSettle.log"
+#endif
+#define		RPTNAME				"IBPSettle.rpt"
+
+#define		PRO_EXIT			2
+#define		PRO_EXEC			1
+#define		PRO_REPT			3
+
+#define		ERR_TIME			5000 * 10
+#define		GAP_TIME			8000 * 10
+
+#define		STEP_RUN_ISOK(x, y)	(x) = (x) ^ (y)
+#define		VERSION				"Compile "__DATE__" "__TIME__" CST 2015 for Oracle&OS Runtime\nRelease Version V2.2.0.1\nAuthor : DeffPuzzL for BPS"
+
+#define		IBPUserInfo(x,...)	vHeadPrint(__FILE__, __LINE__, x), vLogPrint(__VA_ARGS__)
+#define		IBPrint				vSetLogMode(IBP_RACE, LOG_MOST), vLogPrint
+#define		IBPrint1			vSetLogMode(IBP_RACE, LOG_ONE), vLogPrint
+#define		IBPrint2			vSetLogMode(IBP_RACE, LOG_TWO), vLogPrint
+#define		IBPError			vSetLogMode(IBP_ERR, LOG_MOST), vLogPrint
+#define		IBPWarm				vSetLogMode(IBP_WARM, LOG_MOST), vLogPrint
+#define		IBPDebug			vSetLogMode(IBP_DEBUG, LOG_MOST), vLogPrint
+#define		IBPrept				vSetLogMode(IBP_RPT, LOG_MOST), vLogPrint
+
+/*************************************************************************************************
+	全局变量定义
+ *************************************************************************************************/
+EXEC SQL BEGIN DECLARE SECTION;
+TrdCnt			g_stTrdCnt = {0};
+TSettleAccount	g_stSetAct = {0};
+EXEC SQL END DECLARE SECTION;
+LogMsg			g_stMsg = {0};
+long			g_lMsgId = 0;
+
+/*************************************************************************************************
+	申明	
+ *************************************************************************************************/
+void	vSetLogMode(int , int );
+void	vOtherActChk();
+void	vSettleTxnChk();
+void	vLogPrint(char *pszFmt, ...);
+
+/*************************************************************************************************
+	步骤申明	
+ *************************************************************************************************/
+int		nCountToDay();
+int		nChkAlgoAll();
+int		nChkAlgoSettle();
+int		nChkSettleTxn();
+int		nChkSettleSum();
+int		nPrintReport();
+
+RunStep  g_RunStep[10] = {
+		{0x01,  nCountToDay},
+		{0x02,  nChkAlgoAll},
+		{0x04,  nChkAlgoSettle},
+		{0x08,  nChkSettleTxn},
+		{0x10,  nChkSettleSum},
+		{0x80,  nPrintReport}
+};
+
+/*************************************************************************************************
+	插入账务表
+ *************************************************************************************************/
+long	lTblSettleActIns()
+{
+	EXEC SQL 
+		INSERT INTO TBL_SETTLE_ACCOUNT (ID, SETTLE_DATE, SETTLE_NUM, TX_NUM, TX_AMT, DELAY_NUM, 
+			DELAY_AMT, REDO_NUM, REDO_AMT, REDO_FEE, REDO_SETTLE, TOTAL_NUM, TOTAL_AMT, 
+			TOTAL_FEE, TOTAL_SETTLE, DELAY_SETTLE, REPAIR_AMT, REPAIR_SETTLE, SETTLE_AMT, 
+			DATE_NUM, DATE_DESC, AUTH_STATE) 
+		VALUES (:g_stSetAct.id, :g_stSetAct.settle_date, :g_stSetAct.settle_num, :g_stSetAct.tx_num, 
+			:g_stSetAct.tx_amt, :g_stSetAct.delay_num, :g_stSetAct.delay_amt, :g_stSetAct.redo_num, 
+			:g_stSetAct.redo_amt, :g_stSetAct.redo_fee, :g_stSetAct.redo_settle, :g_stSetAct.total_num, 
+			:g_stSetAct.total_amt, :g_stSetAct.total_fee, :g_stSetAct.total_settle, :g_stSetAct.delay_settle, 
+			:g_stSetAct.repair_amt, :g_stSetAct.repair_settle, :g_stSetAct.settle_amt, :g_stSetAct.date_num, 
+			:g_stSetAct.date_desc, :g_stSetAct.auth_state);
+	if(SQLCODE)
+	{
+		IBPError("新增核对账务表数据出错, (%d)(%s)", SQLCODE, sDbsError());
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	获取消息队列ID
+ *************************************************************************************************/
+long	lGetMsgId()
+{
+	return g_lMsgId;	
+}
+
+/*************************************************************************************************
+	选择步骤跑任务
+ *************************************************************************************************/
+void	vRunSelectStep(int nStep)
+{
+	int		 i = 0, iRet = 0;
+
+	for(i = 0; i < g_stTrdCnt.lMaxStep;  ++i)
+	{
+		if(g_RunStep[i].lRunStep == nStep)
+		{
+			iRet = g_RunStep[i].pfRunStep();
+			if(RC_SUCC == iRet)
+				STEP_RUN_ISOK(g_stTrdCnt.lIsNStepNeed, nStep);
+			return ;
+		}
+	}
+
+	IBPError("没有找到步骤(%d)方法!", nStep);
+	return ;
+}
+
+/*************************************************************************************************
+	获取版本号	
+ *************************************************************************************************/
+char*	sGetVersion()
+{
+	static	char	szVersion[512];
+
+	memset(szVersion, 0, sizeof(szVersion));
+	snprintf(szVersion, sizeof(szVersion), "%s", VERSION);
+
+	return szVersion;
+}
+
+/*************************************************************************************************
+	获取结构指针
+ *************************************************************************************************/
+void*	pGetTrdCnt()
+{
+	return &g_stTrdCnt;
+}
+
+/*************************************************************************************************
+	设置日期级别
+ *************************************************************************************************/
+void	vSetLogMode(int n, int nlog)
+{
+	g_stTrdCnt.stLog.lLogMode = n;	
+	g_stTrdCnt.stLog.lLogLevel = nlog;
+}
+
+/*************************************************************************************************
+	获取日期级别	
+ *************************************************************************************************/
+int		nLogGetLevel()
+{
+	return g_stTrdCnt.stLog.lLogLevel;
+}
+
+/*************************************************************************************************
+	暂存日志相关信息
+ *************************************************************************************************/
+void	vStoreLogAttrib()
+{
+	memcpy(&g_stTrdCnt.stBakLog, &g_stTrdCnt.stLog, sizeof(LogInfo));
+}
+
+/*************************************************************************************************
+	回复日志相关信息
+ *************************************************************************************************/
+void	vRestoreLogAttrib()
+{
+	memcpy(&g_stTrdCnt.stLog, &g_stTrdCnt.stBakLog, sizeof(LogInfo));
+}
+
+/*************************************************************************************************
+	关闭日志	
+ *************************************************************************************************/
+void	vLogDisable()
+{
+	g_stTrdCnt.stBakLog.lLogGloble = g_stTrdCnt.stLog.lLogGloble;
+	g_stTrdCnt.stLog.lLogGloble += LOG_MOST + 1;
+}
+
+/*************************************************************************************************
+	启动日志
+ *************************************************************************************************/
+void	vLogEnable()
+{
+	if(g_stTrdCnt.stBakLog.lLogGloble > LOG_MOST)
+		g_stTrdCnt.stLog.lLogGloble = LOG_ONE;
+	else
+		g_stTrdCnt.stLog.lLogGloble = g_stTrdCnt.stBakLog.lLogGloble;
+}
+
+/*************************************************************************************************
+	设置系统日期等级
+ *************************************************************************************************/
+void	vSetLogGloble(int n)
+{
+	g_stTrdCnt.stLog.lLogGloble = n;
+}
+
+/*************************************************************************************************
+	获取系统日志等级	
+ *************************************************************************************************/
+int		nGetLogGloble()
+{
+	return g_stTrdCnt.stLog.lLogGloble;
+}
+
+/*************************************************************************************************
+	日志：屏幕输出
+ *************************************************************************************************/
+void	vIBPrint(char *s, ...)
+{
+	va_list ap;
+
+	va_start(ap, s);
+	if(!bRunIsOk())
+		vfprintf(stderr, s, ap);
+	else
+		vfprintf(stdout, s, ap);
+	va_end(ap);
+}
+
+/*************************************************************************************************
+	变量初始化
+ *************************************************************************************************/
+void	vInitTradeCnt(char *pszDate, char *pszSettleNum, long nMaxStep)
+{
+	memset(&g_stTrdCnt, 0, sizeof(g_stTrdCnt));
+	strcpy(g_stTrdCnt.szDate, pszDate);	
+	strcpy(g_stTrdCnt.szBatNum, pszSettleNum);
+	g_stTrdCnt.lMaxStep = nMaxStep;
+
+	memset(&g_stSetAct, 0, sizeof(g_stSetAct));
+	memcpy(g_stSetAct.settle_date, g_stTrdCnt.szDate, sizeof(g_stSetAct.settle_date) - 1);
+	memcpy(g_stSetAct.settle_num, g_stTrdCnt.szBatNum, sizeof(g_stSetAct.settle_num) - 1);
+	snprintf(g_stSetAct.id, sizeof(g_stSetAct.id), "%s%s000", g_stSetAct.settle_date, g_stSetAct.settle_num);
+}
+
+/*************************************************************************************************
+	获取报表名称	
+ *************************************************************************************************/
+char*	sGetRptName()
+{
+	if(!strlen(g_stTrdCnt.stLog.szRptName))
+		strcpy(g_stTrdCnt.stLog.szRptName, RPTNAME);
+	return g_stTrdCnt.stLog.szRptName;
+}
+
+/*************************************************************************************************
+	获取日志名称
+ *************************************************************************************************/
+char*	sLogGetName()
+{
+	if(!strlen(g_stTrdCnt.stLog.szLog))
+		strcpy(g_stTrdCnt.stLog.szLog, LOGNAME);
+	return g_stTrdCnt.stLog.szLog;
+}
+
+/*************************************************************************************************
+	判断返回值
+ *************************************************************************************************/
+BOOL	bRunIsOk()
+{
+	if(RC_SUCC == g_stTrdCnt.lRetCode)
+		return TRUE;
+	else
+		return FALSE;
+}
+
+/*************************************************************************************************
+	设置响应码	
+ *************************************************************************************************/
+void	vSetRetCode(int n)
+{
+	g_stTrdCnt.lRetCode = n;
+}
+
+/*************************************************************************************************
+	设置跑的步骤	
+ *************************************************************************************************/
+void	vSetStepNeed(long	n)
+{
+	g_stTrdCnt.lIsNStepNeed = n;
+}
+
+/*************************************************************************************************
+	获取指定的步骤	
+ *************************************************************************************************/
+long	nGetSetStep()
+{
+	return g_stTrdCnt.lSetStep;
+}
+/*************************************************************************************************
+	步骤映射
+ *************************************************************************************************/
+int		nTransferStep(int *pnAction)
+{
+	long	lVal = 1, i = 0;
+
+	if(!pnAction)	return RC_FAIL;
+
+	if(*pnAction > 5 || *pnAction < 0)
+	{
+		(*pnAction) = 0x00;
+		return RC_FAIL;
+	}
+
+	for(i = 0; i < ((*pnAction) - 1); i ++)
+		lVal = lVal << 1;
+
+	*pnAction = lVal;
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	获取指定步骤所需的步骤
+ *************************************************************************************************/
+long	nGetStepNeed(int n)
+{
+	if(1 == n)
+		g_stTrdCnt.lIsNStepNeed = g_stTrdCnt.lIsNStepNeed | 0x00;
+	else if(2 == n)
+		g_stTrdCnt.lIsNStepNeed = g_stTrdCnt.lIsNStepNeed | 0x01;
+	else if(3 == n)
+		g_stTrdCnt.lIsNStepNeed = g_stTrdCnt.lIsNStepNeed | 0x00;
+	else if(4 == n)
+		g_stTrdCnt.lIsNStepNeed = g_stTrdCnt.lIsNStepNeed | 0x00;
+	else if(5 == n)
+		g_stTrdCnt.lIsNStepNeed = g_stTrdCnt.lIsNStepNeed | 0x03;
+	else
+		return 0x00;
+	return g_stTrdCnt.lIsNStepNeed;
+}
+
+/*************************************************************************************************
+	获取所需的步骤
+ *************************************************************************************************/
+long	nGetNeedStep()
+{
+	return g_stTrdCnt.lIsNStepNeed;
+}
+
+/*************************************************************************************************
+	设置名称
+ *************************************************************************************************/
+void	vLogSetName(char *s, ...)
+{
+	va_list ap;
+
+	memset(g_stTrdCnt.stLog.szLog, 0, sizeof(g_stTrdCnt.stLog.szLog));
+	va_start(ap, s);
+	vsnprintf(g_stTrdCnt.stLog.szLog, sizeof(g_stTrdCnt.stLog.szLog), s, ap);
+	va_end(ap);
+}
+
+/*************************************************************************************************
+	输出日期头
+ *************************************************************************************************/
+void	vHeadPrint(char *pszFile, long lLine, int nMode)
+{
+	FILE	*fp = NULL;
+	char	szLog[1024];
+	time_t	cur;
+	struct	tm	*tm = NULL;
+
+	if(nLogGetLevel() < nGetLogGloble())
+		return ;
+
+	memset(&g_stMsg, 0, sizeof(g_stMsg));
+	g_stMsg.m_lType = PRO_EXEC;
+
+	time(&cur);
+	tm = localtime(&cur);
+	sprintf(g_stMsg.m_szMsg, "F=%s L=%d P=%d D=%04d-%02d-%02d T=%02d:%02d:%02d  ", pszFile, lLine, 
+		getpid(), tm->tm_year+1900, tm->tm_mon+1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+
+	//	发送消息
+//	if(msgsnd(lGetMsgId(), (void *)&g_stMsg, sizeof(g_stMsg.m_szMsg), IPC_NOWAIT) < RC_SUCC)
+	if(msgsnd(lGetMsgId(), (void *)&g_stMsg, sizeof(g_stMsg.m_szMsg), 0) < RC_SUCC)
+	{
+		vIBPrint("发送日志消息失败, err:(%d)(%s)\n", errno, strerror(errno));
+		return ;
+	}
+
+	g_stTrdCnt.stLog.lLogMode = nMode;
+}
+
+/*************************************************************************************************
+	退出日志
+ *************************************************************************************************/
+void	vShutDownLog()
+{
+	memset(&g_stMsg, 0, sizeof(g_stMsg));
+	g_stMsg.m_lType = PRO_EXIT;
+
+	//	发送消息
+//	if(msgsnd(lGetMsgId(), (void *)&g_stMsg, sizeof(g_stMsg.m_szMsg), IPC_NOWAIT) < RC_SUCC)
+	if(msgsnd(lGetMsgId(), (void *)&g_stMsg, sizeof(g_stMsg.m_szMsg), 0) < RC_SUCC)
+	{
+		vIBPrint("发送日志消息失败, err:(%d)(%s)\n", errno, strerror(errno));
+		return ;
+	}
+}
+
+/*************************************************************************************************
+	输出日志
+ *************************************************************************************************/
+void	vPrintMsg(char *pszFmt, ...)
+{
+	FILE	*fp = NULL;
+	char	szLog[1024];
+
+	memset(szLog, 0, sizeof(szLog));
+	if(IBP_RPT == g_stTrdCnt.stLog.lLogMode)
+		snprintf(szLog, sizeof(szLog), "%s/%s", getenv("LOG_FILE_PATH"), sGetRptName());
+	else
+		snprintf(szLog, sizeof(szLog), "%s/%s", getenv("LOG_FILE_PATH"), sLogGetName());
+	if(NULL == (fp = fopen(szLog, "a+")))
+	{
+		fprintf(stderr, "打开文件%s失败:[%s]", szLog, strerror(errno));
+		exit(-1);
+	}
+
+	fprintf(fp, "%s", g_stMsg.m_szMsg);
+	fclose(fp);
+}
+
+/*************************************************************************************************
+	组织日志
+ *************************************************************************************************/
+void	vLogPrint(char *pszFmt, ...)
+{
+	va_list ap;
+	FILE	*fp = NULL;
+
+	memset(&g_stMsg, 0, sizeof(g_stMsg));
+	if(IBP_RPT == g_stTrdCnt.stLog.lLogMode)
+		g_stMsg.m_lType = PRO_REPT;
+	else	
+		g_stMsg.m_lType = PRO_EXEC;
+
+	if(IBP_ERR == g_stTrdCnt.stLog.lLogMode)
+		g_stTrdCnt.lRetCode = RC_FAIL;
+
+	if(nLogGetLevel() < nGetLogGloble())
+		return ;
+
+	if(IBP_WARM == g_stTrdCnt.stLog.lLogMode)
+		sprintf(g_stMsg.m_szMsg, "warn：");
+
+	va_start(ap, pszFmt);
+	vsnprintf(g_stMsg.m_szMsg + strlen(g_stMsg.m_szMsg), sizeof(g_stMsg.m_szMsg) - strlen(g_stMsg.m_szMsg), 
+		pszFmt, ap);
+	va_end(ap);
+
+	strcat(g_stMsg.m_szMsg, "\n");
+	g_stMsg.m_szMsg[sizeof(g_stMsg.m_szMsg) - 1 ] = 0x00;
+
+	//	发送消息
+	if(msgsnd(lGetMsgId(), (void *)&g_stMsg, sizeof(g_stMsg.m_szMsg), 0) < RC_SUCC)
+	{
+fprintf(stderr, "%d, [%s]", g_stMsg.m_lType, g_stMsg.m_szMsg);
+		vIBPrint("发送日志消息失败, err:(%d)(%s)(%d)\n", errno, strerror(errno), __LINE__);
+		return ;
+	}
+
+	if(nLogGetLevel() < LOG_MOST || IBP_DEBUG == g_stTrdCnt.stLog.lLogMode || IBP_RPT == g_stTrdCnt.stLog.lLogMode)
+		return ;	
+
+	if(IBP_ERR == g_stTrdCnt.stLog.lLogMode)
+		vIBPrint(g_stMsg.m_szMsg);
+	else if(IBP_RACE == g_stTrdCnt.stLog.lLogMode || IBP_WARM == g_stTrdCnt.stLog.lLogMode)
+		vIBPrint(g_stMsg.m_szMsg);
+	else
+		;
+}
+
+/*************************************************************************************************
+	启动日志服务
+ *************************************************************************************************/
+long	lWakeupLog()
+{
+	pid_t	lPid;
+
+	g_lMsgId = msgget(IPC_PRIVATE, IPC_CREAT|0666);
+	if(lGetMsgId() == RC_FAIL)
+	{
+		vIBPrint("创建/链接核心消息队列失败, err:(%d)(%s)\n", errno,
+			strerror(errno));
+		return RC_FAIL;
+	}
+
+  	lPid = fork();
+	if(lPid < 0)
+ 	{
+		vIBPrint("fork子进程失败, err:(%d)(%s)\n", errno, strerror(errno));
+		exit(-1);
+	}
+	else if(lPid > 0)	//	父进程返回
+		return RC_SUCC;
+	else	//  if (lPid == 0)
+  		;
+
+	while(1)
+	{
+		memset(&g_stMsg, 0, sizeof(g_stMsg));
+
+		//	接收所有的消息
+		if(RC_SUCC > msgrcv(lGetMsgId(), &g_stMsg, sizeof(g_stMsg.m_szMsg), 0, 0))
+		{
+			vPrintMsg("获取队列请求消息出错, err:(%d)(%s)", errno, strerror(errno));
+			continue;
+		}
+
+		if(PRO_EXIT == g_stMsg.m_lType)
+		{
+			msgctl(lGetMsgId(), IPC_RMID, NULL);
+			exit(0);
+		}
+		else if(PRO_REPT == g_stMsg.m_lType)
+			g_stTrdCnt.stLog.lLogMode = IBP_RPT;
+		else
+			g_stTrdCnt.stLog.lLogMode = IBP_RACE;
+
+		vPrintMsg("%s", g_stMsg.m_szMsg);
+	}
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	查询商户费率	
+ *************************************************************************************************/
+int		nGetMchtRate(double dTxAmt, char *pszMchtNo, double *pdRate, char *pszMchtNm)
+{
+	long		lRet = 0, lCount = 0;
+	dbDiscAlgo  stAlgo, *pstAlgo = NULL;
+	dbMchtBase	stMcht;
+
+	memset(&stMcht, 0, sizeof(stMcht));
+	lRet = lGetMchtBase(&stMcht, pszMchtNo);
+	if(lRet)
+	{
+		sprintf(pszMchtNm, "%s", sGetError());
+//		IBPrint("查询商户(%s)信息失败, err:(%d)(%s)", pszMchtNo, lRet, sGetError());
+		return RC_FAIL;
+	}
+
+	strcpy(pszMchtNm, stMcht.mcht_nm);
+
+	lRet = lGetDiscAlgo(stMcht.mcht_disc_id, 1, FIELD_MATCH, &pstAlgo, (long *)&lCount);
+	if(RC_SUCC != lRet)
+	{
+		IBPrint("查询TBL_PUB_DISC_ALGO信息错误(%s), 原因:%s", stMcht.mcht_disc_id, sGetError());
+		return RC_FAIL;
+	}
+
+	memset(&stAlgo, 0, sizeof(stAlgo));
+	lRet = lGetAlgoModel(pstAlgo, lCount, dTxAmt, &stAlgo);
+	if(lRet)
+	{
+		IBPFree(pstAlgo);
+		IBPrint("从费率表中查询(%s)金额(%.2f)段费率出错, err:(%d)(%s)", stMcht.mcht_disc_id,
+			dTxAmt, lRet, sGetError());
+		return RC_FAIL;
+	}
+	IBPFree(pstAlgo);
+
+	(*pdRate) = stAlgo.fee_value;
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	打印报表延迟清算和参与清算记录	
+ *************************************************************************************************/
+void	vChkErrTrade(BOOL bf)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szId[26], szErrType[2], szStlmType[2];
+	char	szDesc[1025], szSQLCmd[1024];
+	EXEC SQL END DECLARE SECTION;
+	char	szPrint[1024];
+
+	memset(szSQLCmd, 0, sizeof(szSQLCmd));
+	if(FALSE == bf)
+		snprintf(szSQLCmd, sizeof(szSQLCmd), "SELECT ID, ERR_TYPE, STLM_TYPE, ERR_DESC FROM TBL_STLM_ERR "
+			"WHERE STLM_DATE = '%s' AND DISC_CYCLE = 1", g_stTrdCnt.szDate);
+	else
+		snprintf(szSQLCmd, sizeof(szSQLCmd), "SELECT ID, ERR_TYPE, STLM_TYPE, ERR_DESC FROM TBL_STLM_ERR "
+			"WHERE NEXT_DATE = '%s' AND DISC_CYCLE = 1", g_stTrdCnt.szDate);
+
+	EXEC SQL PREPARE Pre_stlm_err FROM :szSQLCmd;
+	EXEC SQL DECLARE Cur_stlm_err CURSOR FOR Pre_stlm_err;
+	if(SQLERR)
+	{
+		IBPError("打开表TBL_STLM_ERR游标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return ;
+	}
+
+	EXEC SQL OPEN Cur_stlm_err;	
+	if(SQLERR)
+	{
+		IBPError("打开表TBL_STLM_ERR游标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return ;
+	}
+
+	while(1)
+	{
+		memset(szId, 0, sizeof(szId));
+		memset(szDesc, 0, sizeof(szDesc));
+		memset(szErrType, 0, sizeof(szErrType));
+		memset(szStlmType, 0, sizeof(szStlmType));
+		EXEC SQL FETCH Cur_stlm_err INTO :szId, :szErrType, :szStlmType, :szDesc;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_STLM_ERR标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_stlm_err;
+			return ;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		sTrimAll(szId);
+		sTrimAll(szDesc);
+
+		memset(szPrint, 0, sizeof(szPrint));
+		if(FALSE == bf)
+		{
+			if('2' == szStlmType[0])
+				snprintf(szPrint, sizeof(szPrint), "\t=  %s\t", szId);
+			else
+				snprintf(szPrint, sizeof(szPrint), "\t-  %s\t", szId);
+		}
+		else
+			snprintf(szPrint, sizeof(szPrint), "\t+  %s\t", szId);
+
+		if('1' == szErrType[0])
+			strcat(szPrint, "对账不平\t\t");
+		else if('2' == szErrType[0])
+			strcat(szPrint, "风控延迟清算\t");
+		else if('3' == szErrType[0])
+			strcat(szPrint, "手工延迟清算\t");
+		else if('4' == szErrType[0])
+			strcat(szPrint, "商户不正常\t\t");
+		else
+			strcat(szPrint, "异常:error!\t\t");
+
+		if('0' == szStlmType[0])
+			strcat(szPrint, "流水已对平\t\t");
+		else if('1' == szStlmType[0])
+			strcat(szPrint, "本地有渠道无\t");
+		else if('2' == szStlmType[0])
+			strcat(szPrint, "渠道有本地无\t");
+		else if('3' == szStlmType[0])
+			strcat(szPrint, "金额不一致\t\t");
+		else if('4' == szStlmType[0])
+			strcat(szPrint, "账号不一致\t\t");
+		else 
+			strcat(szPrint, "异常:error!\t\t");
+		
+		strcat(szPrint, szDesc);
+		IBPrept(szPrint);
+	}
+	EXEC SQL CLOSE Cur_stlm_err;
+}
+
+/*************************************************************************************************
+	修改任务的步骤
+ *************************************************************************************************/
+long	lSetStep(int n)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szState[3];
+	EXEC SQL END DECLARE SECTION;
+
+	if(n < 0)	n = 0;
+	g_stTrdCnt.lRunStep = n;
+
+	memset(szState, 0, sizeof(szState));
+	if(1 == g_stTrdCnt.lRunStep)
+		EXEC SQL SELECT NVL(BAT_STATE, ' ') INTO :szState FROM TBL_BAT_MAIN_CTL_DTL WHERE DATE_SETTLMT = :g_stTrdCnt.szDate 
+			AND SETTLE_NUM = :g_stTrdCnt.szBatNum AND BAT_ID = 'AN002';
+	else if(2 == g_stTrdCnt.lRunStep)
+		EXEC SQL SELECT NVL(BAT_STATE, ' ') INTO :szState FROM TBL_BAT_MAIN_CTL_DTL WHERE DATE_SETTLMT = :g_stTrdCnt.szDate 
+			AND SETTLE_NUM = :g_stTrdCnt.szBatNum AND BAT_ID = 'DN001';
+	else if(3 == g_stTrdCnt.lRunStep)
+		EXEC SQL SELECT NVL(BAT_STATE, ' ') INTO :szState FROM TBL_BAT_MAIN_CTL_DTL WHERE DATE_SETTLMT = :g_stTrdCnt.szDate 
+			AND SETTLE_NUM = :g_stTrdCnt.szBatNum AND BAT_ID = 'EN002';
+	else if(4 == g_stTrdCnt.lRunStep)
+		EXEC SQL SELECT NVL(BAT_STATE, ' ') INTO :szState FROM TBL_BAT_MAIN_CTL_DTL WHERE DATE_SETTLMT = :g_stTrdCnt.szDate 
+			AND SETTLE_NUM = :g_stTrdCnt.szBatNum AND BAT_ID = 'FN002';
+	else if(5 == g_stTrdCnt.lRunStep)
+		EXEC SQL SELECT NVL(BAT_STATE, ' ') INTO :szState FROM TBL_BAT_MAIN_CTL_DTL WHERE DATE_SETTLMT = :g_stTrdCnt.szDate 
+			AND SETTLE_NUM = :g_stTrdCnt.szBatNum AND BAT_ID = 'FN003';
+	else
+		return RC_SUCC;
+	if(SQLERR)
+	{
+		IBPError("查询表TBL_BAT_MAIN_CTL_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	sTrimAll(szState);
+	
+	if(0 == szState[0])
+	{
+		IBPWarm("今日(%s)未运行，步骤(%d), 请确认!!", g_stTrdCnt.szDate, g_stTrdCnt.lRunStep);
+		return RC_FAIL;	
+	}
+	else if('0' == szState[0])
+	{
+		IBPError("步骤(%d)所依赖的步骤还未运行，请先运行！", n);
+		return RC_FAIL;	
+	}
+	else if('1' == szState[0])
+	{
+		IBPError("步骤(%d)所依赖的步骤正在运行，请稍后运行该步骤！", n);
+		return RC_FAIL;	
+	}
+	else
+		;
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	统计流水表应清算数据
+ *************************************************************************************************/
+int		nCountToDay()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	int		iCount = 0, iPerCount = 0, lLastCount = 0, lCupsCount = 0.00;
+	double	dPerAmt = 0.00, dLastAmt = 0.00, dCupsAmt = 0.00;
+	char	szYDay[10], szLastDate[10], szTransDate[10];
+	EXEC SQL END DECLARE SECTION;
+	long	iRet = 0;	
+	
+	iRet = lSetStep(1);
+	if(iRet)	return RC_FAIL;
+
+	IBPUserInfo(IBP_RACE, ">>Step 1:统计流水表应清算数据<<");
+	memset(szYDay, 0, sizeof(szYDay));
+	memcpy(szYDay, sGetChgDate(g_stTrdCnt.szDate, -1), 8);
+
+	EXEC SQL SELECT COUNT(*) INTO :iCount FROM TBL_STLM_DATE WHERE STLM_DATE = :g_stTrdCnt.szDate;
+	g_stSetAct.date_num = iCount;
+	if(0 == iCount)
+	{
+		IBPrint("当日(%s)非清算日，只统计当日流水数据!", szYDay);
+		EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT),0.00) INTO :g_stTrdCnt.lSETCount, :g_stTrdCnt.dSETTxAmt 
+			FROM TBL_TXN_SUCC 
+		WHERE (TX_SUB_CODE = '31' OR TX_SUB_CODE = '51') AND STAT = '0' AND 
+			CUPS_NO NOT IN ('sqpy', 'vway') AND TX_DATE = :szYDay;
+		if(SQLERR)
+		{
+			IBPError("查询TBL_TXN_SUCC统计错误，(%d)(%d)(%s)", __LINE__, SQLCODE, sDbsError());			
+			return RC_FAIL;
+		}
+		IBPrint("-------------------------------------------------------------------------");
+		IBPrint("交易量统计如下：");
+		IBPrint("流水笔数：%-6d", g_stTrdCnt.lSETCount);
+		IBPrint("流水金额：%.2f", g_stTrdCnt.dSETTxAmt);
+		IBPrint("-------------------------------------------------------------------------");
+		IBPrint("统计本周期(%s)交易流水成功，completed successfully!!!\n", g_stTrdCnt.szDate);
+		vSetRetCode(STEP_STOP);
+		usleep(ERR_TIME);
+		return RC_SUCC;
+	}
+
+	memset(szTransDate, 0, sizeof(szTransDate));
+	EXEC SQL SELECT MIN(TRANS_DATE) INTO :szTransDate FROM TBL_STLM_DATE WHERE STLM_DATE = :g_stTrdCnt.szDate;
+	if(SQLERR)
+	{
+		IBPError("查询表TBL_STLM_DATE错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	sTrimAll(szTransDate);
+	IBPrint1("本周期清算日期(%s)最小交易日为(%s)", g_stTrdCnt.szDate, szTransDate);
+	
+	memset(szLastDate, 0, sizeof(szLastDate));
+	memcpy(szLastDate, sGetChgDate(szTransDate, -1), 8);
+	IBPrint1("上清算周期最后交易日期为(%s)", szLastDate);
+
+	snprintf(g_stSetAct.date_desc, sizeof(g_stSetAct.date_desc) - 1, "%s 23:00:00 - %s 23:00:00", szLastDate, szYDay);
+
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :g_stTrdCnt.lLastGAPCnt, :g_stTrdCnt.dLastGAPAmt 
+		FROM TBL_TXN_SUCC 
+	WHERE (TX_SUB_CODE = '31' OR TX_SUB_CODE = '51') AND STAT = '0' AND CUPS_NO NOT IN ('sqpy', 'vway') 
+		AND TX_TIME > '230000' AND TX_DATE = :szLastDate;
+	if(SQLERR)
+	{
+		IBPError("查询表TBL_STLM_DATE错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	IBPrint2("上周期交易日(%s)，23000之后的交易笔数(%d)金额(%.2f), 本周期参与清算", szLastDate, g_stTrdCnt.lLastGAPCnt, g_stTrdCnt.dLastGAPAmt);
+	//	上周期23000之后，渠道有但是对账不平，减去
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :lLastCount, :dLastAmt 
+		FROM TBL_STLM_ERR 
+	WHERE ID IN (SELECT ID FROM TBL_TXN_SUCC 
+		WHERE (TX_SUB_CODE = '31' OR TX_SUB_CODE = '51') AND STAT = '0' AND 
+			CUPS_NO NOT IN ('sqpy', 'vway') AND TX_TIME > '230000' AND 
+			DISC_CYCLE != 0 AND TX_DATE = :szLastDate);
+	if(SQLERR)
+	{
+		IBPError("查询表TBL_STLM_DATE错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	IBPrint2("上周期交易日(%s)，23000之后的交易经对账对账失败笔数(%d)金额(%.2f), 本周期参与清算", szLastDate, lLastCount, dLastAmt);
+	IBPrint2("上周期交易日(%s)，在本周期实际清算笔数(%d)-(%d)=(%d), 金额(%.2f)-(%.2f)=(%.2f)本周期参与清算", szLastDate, g_stTrdCnt.lLastGAPCnt, 
+		lLastCount, g_stTrdCnt.lLastGAPCnt - lLastCount, g_stTrdCnt.dLastGAPAmt, dLastAmt, g_stTrdCnt.dLastGAPAmt - dLastAmt);
+
+	g_stTrdCnt.lLastGAPCnt -= lLastCount;
+	g_stTrdCnt.dLastGAPAmt -= dLastAmt;
+
+	//	上周期交易日，23000之后的T + 0交易笔数统计
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :lLastCount, :dLastAmt 
+		FROM TBL_TXN_SUCC 
+	WHERE (TX_SUB_CODE = '31' OR TX_SUB_CODE = '51' OR TX_SUB_CODE = '90') AND 
+		STAT = '0' AND CUPS_NO NOT IN ('sqpy', 'vway') AND TX_TIME > '230000' AND 
+		DISC_CYCLE = 0 AND TX_DATE = :szLastDate;
+	if(SQLERR)
+	{
+		IBPError("查询表TBL_STLM_DATE错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	IBPrint2("上周期交易日(%s)，23000之后的T + 0交易笔数(%d)金额(%.2f)", szLastDate, lLastCount, dLastAmt);
+	g_stTrdCnt.lRealCount = lLastCount;
+ 	g_stTrdCnt.dRealAmt   = dLastAmt;
+
+	IBPrint("当日(%s)为清算日，只统计该清算周期包括(%d)个交易日期, 交易量分别为:", g_stTrdCnt.szDate, iCount);
+	IBPrint("-------------------------------------------------");
+	IBPrint("|\t交易日期\t|\t交易笔数\t|\t交易金额\t|");
+	IBPrint("-------------------------------------------------");
+
+	EXEC SQL DECLARE Cur_stlm_date CURSOR FOR SELECT TRANS_DATE FROM TBL_STLM_DATE WHERE STLM_DATE = :g_stTrdCnt.szDate;
+	EXEC SQL OPEN Cur_stlm_date;
+	if(SQLERR)
+	{
+		IBPError("打开表TBL_STLM_DATE游标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	while(1)
+	{
+		memset(szTransDate, 0, sizeof(szTransDate));
+		EXEC SQL FETCH Cur_stlm_date INTO :szTransDate;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_STLM_DATE游标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_stlm_date;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		sTrimAll(szTransDate);
+		EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :iPerCount, :dPerAmt 
+			FROM TBL_TXN_SUCC 
+		WHERE (TX_SUB_CODE = '31' OR TX_SUB_CODE = '51' OR TX_SUB_CODE = '90') AND STAT = '0' 
+			AND CUPS_NO NOT IN ('sqpy', 'vway') AND TX_DATE = :szTransDate;
+		if(SQLERR)
+		{
+			IBPError("查询TBL_TXN_SUCC统计错误，(%d)(%d)(%s)", __LINE__, SQLCODE, sDbsError());			
+			EXEC SQL CLOSE Cur_stlm_date;
+			return RC_FAIL;
+		}
+		IBPrint("|\t%s\t|\t%6d\t\t|%14.2f\t|", szTransDate, iPerCount, dPerAmt);
+		g_stTrdCnt.lSETCount += iPerCount;	
+		g_stTrdCnt.dSETTxAmt += dPerAmt;	
+
+		if(!memcmp(szYDay, szTransDate, 8))
+			EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :iPerCount, :dPerAmt FROM TBL_TXN_SUCC WHERE
+				(TX_SUB_CODE = '31' OR TX_SUB_CODE = '51' OR TX_SUB_CODE = '90') AND STAT = '0' AND 
+				CUPS_NO NOT IN ('sqpy', 'vway') AND DISC_CYCLE = 0 AND TX_DATE = :szTransDate AND TX_TIME <= '230000';
+		else
+			EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :iPerCount, :dPerAmt FROM TBL_TXN_SUCC WHERE 
+				(TX_SUB_CODE = '31' OR TX_SUB_CODE = '51' OR TX_SUB_CODE = '90') AND STAT = '0' AND 
+				CUPS_NO NOT IN ('sqpy', 'vway') AND DISC_CYCLE = 0 AND TX_DATE = :szTransDate;
+		if(SQLERR)
+		{
+			IBPError("查询TBL_TXN_SUCC统计错误，(%d)(%d)(%s)", __LINE__, SQLCODE, sDbsError());			
+			EXEC SQL CLOSE Cur_stlm_date;
+			return RC_FAIL;
+		}
+		g_stTrdCnt.lRealCount += iPerCount;
+		g_stTrdCnt.dRealAmt   += dPerAmt;
+
+		if(!memcmp(szYDay, szTransDate, 8))
+			EXEC SQL SELECT COUNT(*), NVL(SUM(LOCAL_AMT),0.00) INTO :iPerCount, :dPerAmt FROM TBL_STLM_ERR WHERE
+				TX_DATE = :szTransDate AND TX_TIME <= '230000' AND (STLM_TYPE != '2' OR STLM_TYPE IS NULL) 
+				AND DISC_CYCLE > 0;
+		else
+			EXEC SQL SELECT COUNT(*), NVL(SUM(LOCAL_AMT),0.00) INTO :iPerCount, :dPerAmt FROM TBL_STLM_ERR WHERE
+				TX_DATE = :szTransDate AND (STLM_TYPE != '2' OR STLM_TYPE IS NULL) AND DISC_CYCLE > 0;
+		if(SQLERR)
+		{
+			IBPError("统计表TBL_STLM_ERR错误, (%d)(%d)(%s)", __LINE__, SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+
+		g_stTrdCnt.lErrCount += iPerCount;
+		g_stTrdCnt.dErrTxAmt += dPerAmt;
+	}
+	EXEC SQL CLOSE Cur_stlm_date;
+	IBPrint("-------------------------------------------------");
+
+	IBPrint("开始核对渠道流水装载核对情况");
+	IBPrint("---------------------------------------------------------------------------------");
+	IBPrint("|\t装载日期\t|\t装载笔数\t|\t装载金额\t|\t未对笔数\t|\t未对金额\t|");
+	IBPrint("---------------------------------------------------------------------------------");
+
+	EXEC SQL DECLARE Cur_cup_date CURSOR FOR SELECT to_char(to_date(TRANS_DATE,'yyyymmdd') + 1, 'yyyymmdd') 
+		FROM TBL_STLM_DATE WHERE STLM_DATE = :g_stTrdCnt.szDate;
+	EXEC SQL OPEN Cur_cup_date;
+	if(SQLERR)
+	{
+		IBPError("打开表TBL_STLM_DATE游标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	while(1)
+	{
+		memset(szTransDate, 0, sizeof(szTransDate));
+		EXEC SQL FETCH Cur_cup_date INTO :szTransDate;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_STLM_DATE游标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_stlm_date;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		sTrimAll(szTransDate);
+		EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :lCupsCount, :dCupsAmt FROM TBL_CUP_SUCC WHERE 
+			STLM_DATE = :szTransDate AND RESULT_FLAG IN ('0','1','2');
+		if(SQLERR)
+		{
+			IBPError("查询TBL_CUP_SUCC计错误，(%d)(%s)", SQLCODE, sDbsError());			
+			EXEC SQL CLOSE Cur_stlm_date;
+			return RC_FAIL;
+		}
+
+		g_stTrdCnt.lCupsCount += lCupsCount;	
+		g_stTrdCnt.dCupsAmt += dCupsAmt;	
+
+		EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :iPerCount, :dPerAmt FROM TBL_CUP_SUCC WHERE 
+			STLM_DATE = :szTransDate AND RESULT_FLAG = '2';
+		if(SQLERR)
+		{
+			IBPError("查询TBL_CUP_SUCC计错误，(%d)(%s)", SQLCODE, sDbsError());			
+			EXEC SQL CLOSE Cur_stlm_date;
+			return RC_FAIL;
+		}
+
+		g_stTrdCnt.lCupsNCnt += iPerCount;	
+		g_stTrdCnt.dCupsNAmt += dPerAmt;	
+		IBPrint("|\t%s\t|\t%6d\t\t|%14.2f\t|\t%6d\t\t|%14.2f\t|", szTransDate, lCupsCount, dCupsAmt, iPerCount, dPerAmt);
+	}
+	EXEC SQL CLOSE Cur_cup_date;
+	IBPrint("---------------------------------------------------------------------------------");
+
+	g_stTrdCnt.lCount = g_stTrdCnt.lSETCount;
+	g_stTrdCnt.dTxAmt = g_stTrdCnt.dSETTxAmt;	
+
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT),0.00) INTO :g_stTrdCnt.lGAPCount, :g_stTrdCnt.dGAPTxAmt 
+		FROM TBL_TXN_SUCC 
+	WHERE (TX_SUB_CODE = '31' OR TX_SUB_CODE = '51') AND STAT = '0' AND CUPS_NO NOT IN ('sqpy', 'vway') 
+		AND TX_TIME > '230000' AND TX_DATE = :szYDay;
+	if(SQLERR)
+	{
+		IBPError("查询TBL_TXN_SUCC统计错误，(%d)(%s)", SQLCODE, sDbsError());			
+		return RC_FAIL;
+	}
+
+	//	本周期230000之后，可能在差错表中, 除去未对账的
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :lLastCount, :dLastAmt 
+		FROM TBL_STLM_ERR 
+	WHERE STLM_DATE = :g_stTrdCnt.szDate AND ID IN 
+		(SELECT ID FROM TBL_TXN_SUCC 
+			WHERE (TX_SUB_CODE = '31' OR TX_SUB_CODE = '51') AND STAT = '0' 
+				AND CUPS_NO NOT IN ('sqpy', 'vway') AND TX_TIME > '230000' 
+				AND TX_DATE = :szYDay);
+	if(SQLERR)
+	{
+		IBPError("查询TBL_TXN_SUCC统计错误，(%d)(%s)", SQLCODE, sDbsError());			
+		return RC_FAIL;
+	}
+	g_stTrdCnt.lGAPCount -= lLastCount;
+	g_stTrdCnt.dGAPTxAmt -= dLastAmt;
+
+	IBPrint("本周期(%d个交易日)汇总清算如下：", iCount);
+	IBPrint("上期流水笔数：\t%12d (笔)", g_stTrdCnt.lLastGAPCnt);
+	IBPrint("上期流水金额：\t%12.2f (元)", g_stTrdCnt.dLastGAPAmt);
+	IBPrint("交易流水笔数：\t%12d (笔)", g_stTrdCnt.lSETCount); 
+	IBPrint("交易流水金额：\t%12.2f (元)", g_stTrdCnt.dSETTxAmt);
+	IBPrint("T+0|流水笔数：\t%12d (笔)", g_stTrdCnt.lRealCount);
+	IBPrint("T+0|流水金额：\t%12.2f (元)", g_stTrdCnt.dRealAmt);
+	IBPrint("日切交易笔数：\t%12d (笔)", g_stTrdCnt.lGAPCount);
+	IBPrint("日切交易金额：\t%12.2f (元)", g_stTrdCnt.dGAPTxAmt);
+
+	if(lLastCount > 0 || dLastAmt > 0.00)
+	{	
+		IBPrint("本周期(%s)，23000之后的存在交易对账不平或延迟清算笔数(%d)金额(%.2f)", g_stTrdCnt.szDate, lLastCount, dLastAmt);
+		IBPrint("日切延迟清算交易笔数：\t%12d (笔)", g_stTrdCnt.lGAPCount);
+		IBPrint("日切延迟清算交易金额：\t%12.2f (元)", g_stTrdCnt.dGAPTxAmt);
+	}	
+	IBPrint("-------------------------------------------------------------------------");
+	IBPrint("统计本周期(%s)交易流水成功，completed successfully!!!\n", g_stTrdCnt.szDate);
+	usleep(GAP_TIME);
+	
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	检查渠道流水笔数(主要针对渠道有本地无的检查,虽然进差错也要统计)
+ *************************************************************************************************/
+long	lChkCupsTxn()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long		lErrCount = 0, lChkCount = 0;
+	double		dErrAmt = 0.00, lChkAmt = 0.00;
+	EXEC SQL END DECLARE SECTION;
+
+	IBPrint("本周期渠道流水总笔数: %6d (笔)  本周期渠道交易总金额: %12.2f (元)", g_stTrdCnt.lCupsCount, 
+		g_stTrdCnt.dCupsAmt);
+	IBPrint("本周期渠道未对帐笔数: %6d (笔)  本周期渠道未对账金额: %12.2f (元)", g_stTrdCnt.lCupsNCnt, 
+		g_stTrdCnt.dCupsNAmt);
+	IBPrint("_________________________________________________________________________");
+return RC_SUCC;
+
+	g_stTrdCnt.lCupsCount -= g_stTrdCnt.lCupsNCnt;
+	g_stTrdCnt.dCupsAmt -= g_stTrdCnt.dCupsNAmt;
+	IBPrint("本周期(%s)渠道流水理论对账笔数(%d)，金额(%.2f)", g_stTrdCnt.szDate, g_stTrdCnt.lCupsCount, g_stTrdCnt.dCupsAmt);
+
+	//	实际笔数计算(渠道对账不平的流水)
+	EXEC SQL SELECT COUNT(*), NVL(SUM(LOCAL_AMT),0.00) INTO :lErrCount, :dErrAmt FROM TBL_STLM_ERR 
+		WHERE STLM_DATE = :g_stTrdCnt.szDate AND STLM_TYPE != '1';
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_STLM_ERR错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	//	对平流水
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :lChkCount, :lChkAmt FROM TBL_STLM_SUCC WHERE 
+		STLM_DATE = :g_stTrdCnt.szDate AND RESULT_FLAG IN ('0','1');
+	if(SQLERR)
+	{
+		IBPError("查询TBL_CUP_SUCC计错误，(%d)(%s)", SQLCODE, sDbsError());			
+		return RC_FAIL;
+	}
+
+	lChkCount += lErrCount;
+	lChkAmt += dErrAmt;
+	IBPrint("本周期(%s)渠道流水实际对账笔数(%d)，金额(%.2f)", g_stTrdCnt.szDate, lChkCount, lChkAmt);
+
+	if(g_stTrdCnt.lCupsCount != lChkCount || (fabs(lChkAmt - g_stTrdCnt.dCupsAmt) < 0.005))
+	{
+		IBPError("错误, 统计渠道笔数与实际笔数或金额不匹配(%d)(%d),(%.2f)(%.2f)", g_stTrdCnt.lCupsCount, 
+			lChkCount, lChkAmt, g_stTrdCnt.dCupsAmt);
+		return RC_FAIL;
+	}
+	else
+		IBPrint("-------------------------------------------------------------------------");
+	return RC_SUCC;
+}
+
+
+/*************************************************************************************************
+	核对清分总笔数和金额
+ *************************************************************************************************/
+int		nChkAlgoAll()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	AlgoInfo	stAlgo;
+	char		szDesc[1025], szDate[9];
+	long		lTxnCount = 0, lSuccCount = 0;
+	double		dTxnAmt = 0.00, dSuccAmt = 0.00;
+	EXEC SQL END DECLARE SECTION;
+	long		iRet = 0, lResCnt = 0;	
+	double		dResAmt = 0.00;
+
+	iRet = lSetStep(2);
+	if(iRet)	return RC_FAIL;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, sGetChgDate(g_stTrdCnt.szDate, -1), 8);
+
+	IBPUserInfo(IBP_RACE, ">>Step 2:开始核对清分总笔数和金额<<");
+	IBPrint("-------------------------------------------------------------------------");
+
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT),0.00) INTO :g_stTrdCnt.lLastCount, :g_stTrdCnt.dLastTxAmt  
+		FROM TBL_STLM_ERR WHERE NEXT_DATE = :g_stTrdCnt.szDate;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_STLM_ERR错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT),0.00) INTO :g_stSetAct.redo_num, :g_stSetAct.redo_amt  
+		FROM TBL_STLM_ERR WHERE NEXT_DATE = :g_stTrdCnt.szDate AND DISC_CYCLE > 0;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_STLM_ERR错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL 
+		SELECT 
+			NVL(SUM(FEE_AMT), 0.00), 
+			NVL((SUM(TX_AMT) - SUM(FEE_AMT) + SUM(FREE_FEE) - SUM(MCHT_SERVE_FEE) - SUM(SERV_FEE_KQDA)), 0.00) 
+			INTO :g_stSetAct.redo_fee, :g_stSetAct.redo_settle FROM TBL_ALGO_DTL 
+		WHERE ID IN (SELECT ID FROM TBL_STLM_ERR WHERE NEXT_DATE = :g_stTrdCnt.szDate AND DISC_CYCLE > 0);
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_STLM_ERR错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	if(g_stTrdCnt.lGAPCount > 0 || g_stTrdCnt.dGAPTxAmt > 0.001)
+	{
+		//	状态'2'未清分初始化的记录
+		EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :lTxnCount, :dTxnAmt FROM 
+			TBL_TXN_SUCC WHERE RESULT_FLAG = '2' AND TX_DATE = :szDate;
+		if(SQLERR)
+		{
+			IBPError( "统计表TBL_TXN_SUCC错误, (%d)(%s)", SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+
+		g_stTrdCnt.lTNDlyCount = lTxnCount;
+		g_stTrdCnt.dTNDlyAmt = dTxnAmt;
+
+		EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT),0.00) INTO :lSuccCount, :dSuccAmt FROM TBL_STLM_SUCC 
+			WHERE RESULT_FLAG = '1' AND TX_DATE = :szDate;
+		if(SQLERR)
+		{
+			IBPError("统计表TBL_STLM_SUCC错误, (%d)(%s)", SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+
+		g_stTrdCnt.lTNDlyCount += lSuccCount;
+		g_stTrdCnt.dTNDlyAmt   += dSuccAmt;
+	}
+
+	g_stSetAct.tx_num = g_stTrdCnt.lSETCount + g_stTrdCnt.lLastGAPCnt - g_stTrdCnt.lGAPCount - g_stTrdCnt.lRealCount;
+	g_stSetAct.tx_amt = g_stTrdCnt.dSETTxAmt + g_stTrdCnt.dLastGAPAmt - g_stTrdCnt.dGAPTxAmt - g_stTrdCnt.dRealAmt;
+	g_stSetAct.delay_num = g_stTrdCnt.lErrCount;
+	g_stSetAct.delay_amt = g_stTrdCnt.dErrTxAmt;
+
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :stAlgo.lCountLast, :stAlgo.dTxAmtLast FROM TBL_ALGO_DTL WHERE
+		ALGO_DATE = :g_stTrdCnt.szDate AND DISC_CYCLE > 1;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_ALGO_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+/*	以后不会出现 大于 清算日期的情况
+	EXEC SQL
+		SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00) INTO :stAlgo.lCountCurr, :stAlgo.dTxAmtCurr FROM TBL_ALGO_DTL WHERE
+		ALGO_DATE > :g_stTrdCnt.szDate AND DISC_CYCLE > 1;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_ALGO_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+*/
+
+	g_stTrdCnt.lTNSetCount = stAlgo.lCountLast;
+	g_stTrdCnt.dTNSetAmt = stAlgo.dTxAmtLast;
+
+	IBPrint("本交易日总笔数:	 %6d (笔)  本交易日总金额:	 %12.2f (元)", g_stTrdCnt.lSETCount, g_stTrdCnt.dSETTxAmt);
+	IBPrint("上周期交易总笔数:  +%6d (笔)  上周期交易总金额:  +%12.2f (元)", g_stTrdCnt.lLastGAPCnt, g_stTrdCnt.dLastGAPAmt);
+	IBPrint("上周期:T+N>1笔数:  +%6d (笔)  上周期:T+N>1金额:  +%12.2f (元)", g_stTrdCnt.lTNSetCount, g_stTrdCnt.dTNSetAmt);
+	IBPrint("下周期交易总笔数:  $%6d (笔)  下周期交易总金额:  $%12.2f (元)", g_stTrdCnt.lGAPCount, g_stTrdCnt.dGAPTxAmt);
+	IBPrint("下周期实计总笔数:  -%6d (笔)  下周期实计总金额:  -%12.2f (元)", g_stTrdCnt.lTNDlyCount, g_stTrdCnt.dTNDlyAmt);
+	IBPrint("T+0|周期交易交易:  -%6d (笔)  T+0|周期清算金额:  -%12.2f (元)", g_stTrdCnt.lRealCount, g_stTrdCnt.dRealAmt);
+	IBPrint("差错交易本地笔数:  -%6d (笔)  差错交易本地金额:  -%12.2f (元)", g_stTrdCnt.lErrCount, g_stTrdCnt.dErrTxAmt);
+	IBPrint("差错参与清算笔数:  +%6d (笔)  差错参与清算金额:  +%12.2f (元)", g_stTrdCnt.lLastCount, g_stTrdCnt.dLastTxAmt);
+	IBPrint("-------------------------------------------------------------------------");
+	lResCnt = g_stTrdCnt.lSETCount + g_stTrdCnt.lLastGAPCnt + g_stTrdCnt.lTNSetCount - g_stTrdCnt.lTNDlyCount 
+		- g_stTrdCnt.lRealCount - g_stTrdCnt.lErrCount + g_stTrdCnt.lLastCount;
+	dResAmt = g_stTrdCnt.dSETTxAmt + g_stTrdCnt.dLastGAPAmt + g_stTrdCnt.dTNSetAmt - g_stTrdCnt.dTNDlyAmt 
+		- g_stTrdCnt.dRealAmt - g_stTrdCnt.dErrTxAmt + g_stTrdCnt.dLastTxAmt;
+	IBPrint("按照公式得出笔数:   %6d (笔)  按照公式得出金额:   %12.2f (元)", lResCnt, dResAmt);
+
+	//	统计本周期笔数
+	g_stTrdCnt.lSETCount -= (g_stTrdCnt.lErrCount + g_stTrdCnt.lTNDlyCount - g_stTrdCnt.lLastCount - g_stTrdCnt.lLastGAPCnt);
+	g_stTrdCnt.dSETTxAmt -= (g_stTrdCnt.dErrTxAmt + g_stTrdCnt.dTNDlyAmt - g_stTrdCnt.dLastTxAmt - g_stTrdCnt.dLastGAPAmt);
+
+	//	加上T+2以上(在本周期清算)的笔数和金额
+	g_stTrdCnt.lSETCount += stAlgo.lCountLast;
+	g_stTrdCnt.dSETTxAmt += stAlgo.dTxAmtLast;
+
+	EXEC SQL 
+		SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00), 
+		NVL((SUM(FEE_AMT) + SUM(MCHT_SERVE_FEE)), 0.00), NVL((SUM(TX_AMT) - SUM(FEE_AMT) - SUM(MCHT_SERVE_FEE)), 0.00) 
+		INTO :stAlgo.lCount, :stAlgo.dTxAmt, :g_stSetAct.total_fee, :g_stSetAct.total_settle FROM TBL_ALGO_DTL WHERE 
+		ALGO_DATE = :g_stTrdCnt.szDate AND TX_DATE != :g_stTrdCnt.szDate AND DISC_CYCLE != 0;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_ALGO_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	g_stSetAct.total_num = stAlgo.lCount;
+	g_stSetAct.total_amt = stAlgo.dTxAmt;
+
+	IBPrint("本周期实清总笔数:   %6d (笔)  本周期实清总金额:   %12.2f (元)", stAlgo.lCount, stAlgo.dTxAmt);
+	IBPrint("-------------------------------------------------------------------------");
+	IBPrint("计算与实际差异笔数: %6d ((笔) 计算与实际差异金额: %12.2f (元)\n", lResCnt - stAlgo.lCount, dResAmt - stAlgo.dTxAmt);
+
+	IBPrint("汇总T日应清总笔数:  %6d (笔)  汇总T日应清总金额:  %12.2f (元)", g_stTrdCnt.lSETCount, g_stTrdCnt.dSETTxAmt);
+	IBPrint("-------------------------------------------------------------------------");
+
+	if(g_stTrdCnt.lGAPCount > 0 || g_stTrdCnt.dGAPTxAmt > 0.001)
+	{
+		IBPrint("下周期清算记录进行查询统计：");
+		IBPrint("交易成功表(tbl_txn_succ)笔数:\t%-7d\t金额:  %-12.2f", lTxnCount, dTxnAmt);
+		IBPrint("对账成功表(tbl_stlm_succ)笔数:\t%-7d\t金额:  %-12.2f", lSuccCount, dSuccAmt);
+		IBPrint("下周期交易待清算(汇总23时日切):\t%-7d\t金额:  %-12.2f", g_stTrdCnt.lGAPCount, g_stTrdCnt.dGAPTxAmt);
+		IBPrint("_________________________________________________________________________");
+	}
+
+	//	检查T+0的几笔交易是否清算
+
+	//	检查渠道流水笔数,和和清分笔数
+	if(lChkCupsTxn() || stAlgo.lCount != (g_stTrdCnt.lSETCount - g_stTrdCnt.lRealCount) || 
+		fabs(stAlgo.dTxAmt - g_stTrdCnt.dSETTxAmt + g_stTrdCnt.dRealAmt) >= 0.005)
+		IBPWarm("~本周期(%s)账务出现严重问题，交易统计笔数(%d)(%d + %d)金额(%.2f)(%.2f + %.2f)不一致，请核实!! error", g_stTrdCnt.szDate,
+			g_stTrdCnt.lSETCount, stAlgo.lCount, g_stTrdCnt.lRealCount, g_stTrdCnt.dSETTxAmt, stAlgo.dTxAmt, g_stTrdCnt.dRealAmt);
+	else
+		IBPrint("核对本周期(%s)清分总笔数(%d)(%d + %d)和交易总金额(%.2f)(%.2f + %.2f)完全一致, 处理成功，completed successfully!!!\n", 
+			g_stTrdCnt.szDate, g_stTrdCnt.lSETCount, stAlgo.lCount, g_stTrdCnt.lRealCount, g_stTrdCnt.dSETTxAmt, stAlgo.dTxAmt, g_stTrdCnt.dRealAmt);
+	usleep(GAP_TIME);
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	核对清分与商户明细
+ *************************************************************************************************/
+int	nAlgoSettleCmp(char *pszSettleNum, long lChild)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	AlgoInfo	stAlgo;
+	SettleInfo	stSettInfo;
+	char		szDesc[1025], szMchtNm[100], szSQL[1024], szSettleNum[5];
+	long		iDtlCount = 0, iAlgoCount = 0, lTrace = 0;
+	double		dRepair = 0.00, dActSum = 0.00;
+	EXEC SQL END DECLARE SECTION;
+	long		iFlag = 1, iRet = 0, lError = 0, iFind = 0, lDef = 0;
+
+	memset(szSQL, 0, sizeof(szSQL));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	lTrace = lChild;
+	memcpy(szSettleNum, pszSettleNum, 4);
+
+	EXEC SQL SELECT COUNT(*) INTO :iDtlCount FROM TBL_MCHT_SETTLE_DTL WHERE 
+		SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum AND 
+		MOD(IBOX42,20) = :lTrace;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+//	IBPrint("当日规则(%s)有(%d)个商户清算明细需要核对。", szLast, iDtlCount);
+
+	snprintf(szSQL, sizeof(szSQL), "SELECT COUNT(*), SUM(TX_AMT), "
+		"SUM(FEE_AMT) + SUM(MCHT_SERVE_FEE) + SUM(SERV_FEE_KQDA) - SUM(FREE_FEE), SUM(BASE_AMT), SUM(CUP_FEE), "
+		"SUM(TX_AMT) - SUM(FEE_AMT) - SUM(MCHT_SERVE_FEE) - SUM(SERV_FEE_KQDA) + SUM(FREE_FEE),"
+		"SUM(OTHER_FEE), SETTLE_MCHT FROM TBL_ALGO_DTL WHERE ALGO_DATE = '%s' AND DISC_CYCLE > 0 AND ", 
+		g_stTrdCnt.szDate);
+
+	if(!strcmp(pszSettleNum, "TN00"))
+		snprintf(szSQL + strlen(szSQL), sizeof(szSQL) - strlen(szSQL), "CUPS_NO IN "
+			"(SELECT CUPS_NO FROM TBL_CHN_SETTLE WHERE SETTLE_DATE = '%s' AND CLEAR_FLAG = '0') "
+			" AND MOD(IBOX42,20) = %d GROUP BY SETTLE_MCHT ORDER BY SETTLE_MCHT ", 
+			g_stTrdCnt.szDate, lTrace);
+	else if(!strcmp(pszSettleNum, "TC00"))
+		snprintf(szSQL + strlen(szSQL), sizeof(szSQL) - strlen(szSQL), "CUPS_NO IN "
+			"(SELECT CUPS_NO FROM TBL_CHN_SETTLE WHERE SETTLE_DATE = '%s' AND CLEAR_FLAG = '1') "
+			" AND MOD(IBOX42,20) = %d GROUP BY SETTLE_MCHT ORDER BY SETTLE_MCHT ", 
+			g_stTrdCnt.szDate, lTrace);
+	else
+		return RC_SUCC;
+
+	EXEC SQL PREPARE pre_sql FROM :szSQL;
+	EXEC SQL DECLARE cur_algo_dtl CURSOR FOR pre_sql;
+	if(SQLERR)
+	{
+		IBPError("定义表游标TBL_ALGO_DTL标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL OPEN Cur_algo_dtl;
+	if(SQLERR)
+	{
+		IBPError("打开表TBL_ALGO_DTL标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stAlgo, 0, sizeof(stAlgo));		
+		memset(szMchtNm, 0, sizeof(szMchtNm));
+		EXEC SQL FETCH Cur_algo_dtl INTO :stAlgo.lCount, :stAlgo.dTxAmt, :stAlgo.dFeeAmt, 
+			:stAlgo.dBaseAmt, :stAlgo.dCupAmt, :stAlgo.dSettleAmt, :stAlgo.dOtherAmt, 
+			:stAlgo.szMchtNo;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_ALGO_DTL标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_algo_dtl;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		sTrimAll(stAlgo.szMchtNo);
+		iAlgoCount ++;		
+		memset(&stSettInfo, 0, sizeof(stSettInfo));
+		strcpy(stSettInfo.szMchtNo, stAlgo.szMchtNo);
+		EXEC SQL 
+			SELECT SUM(TX_NUM), SUM(TX_AMT), SUM(FEE_AMT), SUM(REPAIR_AMT), 
+				SUM(UNREPAIR_AMT), SUM(UPERR_AMT), SUM(SETTLE_AMT) INTO :stSettInfo.lCount, 
+				:stSettInfo.dTxAmt, :stSettInfo.dFeeAmt, :stSettInfo.dRePairAmt, 
+				:stSettInfo.dUpRePairAmt, :stSettInfo.dUpErrAmt, 
+				:stSettInfo.dSettleAmt FROM TBL_MCHT_SETTLE_DTL 
+			WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND IBOX42 = :stAlgo.szMchtNo 
+				AND SETTLE_NUM = :szSettleNum;
+		if(SQLERR)
+		{
+			IBPError("打开表TBL_ALGO_DTL错误(%s), (%d)(%s)", stAlgo.szMchtNo, SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_algo_dtl;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+		{
+			IBPrint("____________________________________________________________________________________________");
+			IBPError("商户(%s)异常，请检查! (%d)\n\n\n\n", stAlgo.szMchtNo, SQLCODE);
+		}
+
+		nGetMchtRate(stSettInfo.dTxAmt, stAlgo.szMchtNo, &stSettInfo.dRate, szMchtNm);
+		sTrimAll(szMchtNm);
+
+		stAlgo.dRate = stAlgo.dFeeAmt / stAlgo.dTxAmt * 100;
+//		if(stAlgo.lCount == stSettInfo.lCount && fabs(stAlgo.dTxAmt - stSettInfo.dTxAmt) < 0.005 && fabs(stAlgo.dRate - stSettInfo.dRate) < 0.005 &&
+		if(stAlgo.lCount == stSettInfo.lCount && fabs(stAlgo.dTxAmt - stSettInfo.dTxAmt) < 0.005 &&
+			fabs(stAlgo.dFeeAmt - stSettInfo.dFeeAmt) < 0.005 && fabs(stAlgo.dSettleAmt - stSettInfo.dSettleAmt) < 0.005)	// 让其显示原因
+//			fabs(stAlgo.dSettleAmt - (stSettInfo.dSettleAmt + stSettInfo.dRePairAmt - stSettInfo.dUpRePairAmt - stSettInfo.dUpErrAmt)) < 0.005)
+		{
+			iFlag = 0;
+			IBPDebug("____________________________________________________________________________________________");
+			IBPDebug("核对第%d个商户\t|tbl_algo_dtl\t|tbl_mcht_settle_dtl\t|比对结果|", iAlgoCount);
+			IBPDebug("--------------------------------------------------------------------------------------------");
+			g_stTrdCnt.dSettleAmt += (stAlgo.dSettleAmt - stSettInfo.dRePairAmt + stSettInfo.dUpRePairAmt + stSettInfo.dUpErrAmt);
+			IBPDebug("商户号:%s\t商户名:%-45s核对结果:[%s]", stAlgo.szMchtNo, szMchtNm, "对平");
+			IBPDebug("--交易笔数:%6d 交易金额:%12.2f 手续费:%7.2f 清算金额:%12.2f 费率:(%.2f)(%.2f)", stAlgo.lCount, 
+				stSettInfo.dTxAmt, stSettInfo.dFeeAmt, stSettInfo.dSettleAmt, stAlgo.dRate, stSettInfo.dRate);
+			continue;
+		}
+		IBPrint("_________________________________________________________________________");
+		IBPrint("核对第%d个商户\t|tbl_algo_dtl\t|tbl_mcht_settle_dtl\t|比对结果|", iAlgoCount);
+		IBPrint("-------------------------------------------------------------------------");
+
+		if(stAlgo.lCount == stSettInfo.lCount && fabs(stAlgo.dTxAmt - stSettInfo.dTxAmt) < 0.005 &&  
+			fabs(stAlgo.dSettleAmt - (stSettInfo.dSettleAmt + stSettInfo.dRePairAmt - stSettInfo.dUpRePairAmt - stSettInfo.dUpErrAmt)) < 0.005)
+		{
+			iFlag = 0;
+			IBPrint("商户号:%s\t商户名:%s\t核对结果:[%s]", stAlgo.szMchtNo, szMchtNm, "对平");
+		}
+		else
+		{
+			iFlag = 1;
+			IBPError("商户号:%s\t商户名:%s\t核对结果:[%s]", stAlgo.szMchtNo, szMchtNm, "error");
+		}
+		IBPrint("-------------------------------------------------------------------------");
+
+		if(stAlgo.lCount == stSettInfo.lCount)
+			IBPrint("交易笔数:\t|%12d\t|%16d\t|%8s|", stAlgo.lCount, stSettInfo.lCount, "对平");
+		else
+			IBPError("交易笔数:\t|%12d\t|%16d\t|%8s|", stAlgo.lCount, stSettInfo.lCount, "error");
+
+		if(fabs(stAlgo.dTxAmt - stSettInfo.dTxAmt) < 0.005)
+			IBPrint("交易金额:\t|%12.2f\t|%16.2f\t|%8s|", stAlgo.dTxAmt, stSettInfo.dTxAmt, "对平");
+		else
+			IBPError("交易金额:\t|%12.2f\t|%16.2f\t|%8s|", stAlgo.dTxAmt, stSettInfo.dTxAmt, "error");
+
+		if(fabs(stAlgo.dFeeAmt - stSettInfo.dFeeAmt) < 0.005)
+			IBPrint("交易手续费:\t|%12.2f\t|%16.2f\t|%8s|", stAlgo.dFeeAmt, stSettInfo.dFeeAmt, "对平");
+		else
+			IBPrint("交易手续费:\t|%12.2f\t|%16.2f\t|%8s|", stAlgo.dFeeAmt, stSettInfo.dFeeAmt, "error");
+
+		if(fabs(stAlgo.dSettleAmt - (stSettInfo.dSettleAmt + stSettInfo.dRePairAmt - stSettInfo.dUpRePairAmt - stSettInfo.dUpErrAmt)) < 0.005)
+			IBPrint("清算金额:\t|%12.2f\t|%16.2f\t|%8s|", stAlgo.dSettleAmt, stSettInfo.dSettleAmt, "对平");
+		else
+			IBPError("清算金额:\t|%12.2f\t|%16.2f\t|%8s|", stAlgo.dSettleAmt, stSettInfo.dSettleAmt, "error");
+
+		if(fabs(stAlgo.dRate - stSettInfo.dRate) < 0.005)
+			IBPrint("手续费费率:\t|(配置)%6.2f\t|(计算)%10.2f\t|%8s|", stSettInfo.dRate, stAlgo.dRate, "对平");
+		else
+			IBPrint("手续费费率:\t|(配置)%6.2f\t|(计算)%10.2f\t|%8s|", stSettInfo.dRate, stAlgo.dRate, "warn");
+
+		g_stTrdCnt.dSettleAmt += stAlgo.dSettleAmt;
+		if(stSettInfo.dRePairAmt > 0.00)
+		{
+			iFind = 0;
+			dActSum = 0.00;
+			g_stTrdCnt.dSettleAmt -= stSettInfo.dRePairAmt;
+			EXEC SQL DECLARE Cur_repair_txn CURSOR FOR SELECT NVL(OPR_AMT, 0.00), NVL(OPR_DESC, ' ') 
+				FROM TBL_STLM_REPAIR_DTL 
+			WHERE APP_ID = :stAlgo.szMchtNo AND SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum
+				AND OPR_TYPE = '3';
+
+			EXEC SQL OPEN Cur_repair_txn;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_STLM_REPAIR标错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_repair_txn;
+				EXEC SQL CLOSE Cur_algo_dtl;
+				return RC_FAIL;
+			}
+
+			while(1)
+			{
+				memset(szDesc, 0, sizeof(szDesc));
+				EXEC SQL FETCH Cur_repair_txn INTO :dRepair, :szDesc;	
+				if(SQLERR)
+				{
+					IBPError("获取表TBL_STLM_REPAIR标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+					EXEC SQL CLOSE Cur_repair_txn;
+					EXEC SQL CLOSE Cur_algo_dtl;
+					return RC_FAIL;
+				}
+				else if(SQLNOTFOUND)
+					break;
+				iFind ++;
+				dActSum += dRepair;
+				sTrimAll(szDesc);
+				sTrimAll(szDesc);
+				IBPrint("该商户本周期存在补帐金额:\t|%-16.2f\t|原因:%s|", dRepair, szDesc);
+			}
+			EXEC SQL CLOSE Cur_repair_txn;
+			if(!iFind)
+				IBPrint("该商户本周期存在补帐金额:\t|%-16.2f\t|原因:\terror|", stSettInfo.dRePairAmt);
+			else
+			{
+				if(fabs(dActSum - stSettInfo.dRePairAmt) < 0.005)
+					IBPrint("  -补帐统计:%12.2f\t流水金额差:%12.2f\t\t对平", dActSum, stSettInfo.dRePairAmt);
+				else
+					IBPrint("  -补帐统计:%12.2f\t流水金额差:%12.2f\t\terror", dActSum, stSettInfo.dRePairAmt);
+			}
+		}
+		if(stSettInfo.dUpRePairAmt > 0.00)
+		{
+			iFind = 0;
+			dActSum = 0.00;
+			g_stTrdCnt.dSettleAmt += stSettInfo.dUpRePairAmt;
+
+			EXEC SQL DECLARE Cur_repair_settle CURSOR FOR SELECT NVL(OPR_AMT, 0.00), NVL(OPR_DESC, ' ') 
+				FROM TBL_STLM_REPAIR_DTL 
+			WHERE APP_ID = :stAlgo.szMchtNo AND SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum
+				AND OPR_TYPE = '0';
+
+			EXEC SQL OPEN Cur_repair_settle;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_STLM_REPAIR标错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_repair_settle;
+				EXEC SQL CLOSE Cur_algo_dtl;
+				return RC_FAIL;
+			}
+
+			while(1)
+			{
+				memset(szDesc, 0, sizeof(szDesc));
+				EXEC SQL FETCH Cur_repair_settle INTO :dRepair, :szDesc;	
+				if(SQLERR)
+				{
+					IBPError("获取表TBL_STLM_REPAIR标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+					EXEC SQL CLOSE Cur_repair_settle;
+					EXEC SQL CLOSE Cur_algo_dtl;
+					return RC_FAIL;
+				}
+				else if(SQLNOTFOUND)
+					break;
+				iFind ++;
+				dActSum += dRepair;
+				sTrimAll(szDesc);
+				sTrimAll(szDesc);
+				IBPrint("该商户本周期参与清算金额:\t|%-16.2f\t|原因:%s|", dRepair, szDesc);
+			}
+			EXEC SQL CLOSE Cur_repair_settle;
+			if(!iFind)
+				IBPrint("该商户本周期存在补帐金额:\t|%-16.2f\t|原因:\terror|", stSettInfo.dUpRePairAmt);
+			else
+			{
+				if(fabs(dActSum - stSettInfo.dUpRePairAmt) < 0.005)
+					IBPrint("  +清算统计:%12.2f\t流水金额差:%12.2f\t\t对平", dActSum, stSettInfo.dUpRePairAmt);
+				else
+					IBPrint("  +清算统计:%12.2f\t流水金额差:%12.2f\t\terror", dActSum, stSettInfo.dUpRePairAmt);
+			}
+		}
+		if(stSettInfo.dUpErrAmt > 0.00)
+		{
+			iFind = 0;
+			dActSum = 0.00;
+			g_stTrdCnt.dSettleAmt += stSettInfo.dUpErrAmt;
+			EXEC SQL DECLARE Cur_settle_err CURSOR FOR SELECT NVL(SETTLE_AMT, 0.00), NVL(NEXT_DO,' ') FROM 
+				TBL_SETTLE_ERR WHERE NEXT_DATE = :g_stTrdCnt.szDate AND MCHT_NO = :stAlgo.szMchtNo;
+			EXEC SQL OPEN Cur_settle_err;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_SETTLE_ERR标错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_settle_err;
+				EXEC SQL CLOSE Cur_algo_dtl;
+				return RC_FAIL;
+			}
+
+			while(1)
+			{
+				memset(szDesc, 0, sizeof(szDesc));
+				EXEC SQL FETCH Cur_settle_err INTO :dRepair, :szDesc;	
+				if(SQLERR)
+				{
+					IBPError("获取表TBL_STLM_REPAIR标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+					EXEC SQL CLOSE Cur_settle_err;
+					EXEC SQL CLOSE Cur_algo_dtl;
+					return RC_FAIL;
+				}
+				else if(SQLNOTFOUND)
+					break;
+				iFind ++;
+				dActSum += dRepair;
+				sTrimAll(szDesc);
+				sTrimAll(szDesc);
+				IBPrint("该商户本周期重新入账金额:\t|%-16.2f\t|原因:%s", dRepair, szDesc);
+			}
+			EXEC SQL CLOSE Cur_settle_err;
+			if(!iFind)
+				IBPrint("该商户本周期重新入账金额:\t|%-16.2f\t|原因:\terror|", stSettInfo.dUpErrAmt);
+			else
+			{
+				if(fabs(dActSum - stSettInfo.dUpErrAmt) < 0.005)
+					IBPrint("  +入账统计:%12.2f\t流水金额差:%12.2f\t\t对平", dActSum, stSettInfo.dUpErrAmt);
+				else
+					IBPrint("  +入账统计:%12.2f\t流水金额差:%12.2f\t\terror", dActSum, stSettInfo.dUpErrAmt);
+			}
+		}
+
+		IBPrint("-------------------------------------------------------------------------\n");
+		usleep(ERR_TIME);
+	}
+	EXEC SQL CLOSE Cur_algo_dtl;
+
+	//	还有可能没有交易明细，但是直接归还给商户的
+	EXEC SQL DECLARE Cur_mcht_dtl CURSOR FOR SELECT TX_NUM, TX_AMT, FEE_AMT, REPAIR_AMT, 
+			UNREPAIR_AMT, UPERR_AMT, SETTLE_AMT, IBOX42 FROM TBL_MCHT_SETTLE_DTL 
+		WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND TX_NUM = 0 AND SETTLE_NUM = :szSettleNum 
+			AND MOD(IBOX42,20) = :lTrace;
+
+	EXEC SQL OPEN Cur_mcht_dtl;
+	if(SQLERR)
+	{
+   		IBPError("打开表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		EXEC SQL CLOSE Cur_mcht_dtl;
+   		return RC_FAIL;
+	}
+
+	lDef = 0;
+	while(1)
+	{
+		memset(&stSettInfo, 0, sizeof(stSettInfo));		
+		EXEC SQL FETCH Cur_mcht_dtl INTO :stSettInfo.lCount, :stSettInfo.dTxAmt, :stSettInfo.dFeeAmt, 
+			:stSettInfo.dRePairAmt, :stSettInfo.dUpRePairAmt, :stSettInfo.dUpErrAmt, 
+			:stSettInfo.dSettleAmt, :stSettInfo.szMchtNo;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_MCHT_SETTLE_DTL标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_dtl;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		lDef ++;
+		sTrimAll(stSettInfo.szMchtNo);
+		memset(szMchtNm, 0, sizeof(szMchtNm));
+		nGetMchtRate(stSettInfo.dTxAmt, stSettInfo.szMchtNo, &stSettInfo.dRate, szMchtNm);
+
+		IBPrint("_________________________________________________________________________");
+		IBPrint("核对第%d个商户\t|tbl_algo_dtl\t|tbl_mcht_settle_dtl\t|比对结果|", iAlgoCount + lDef);
+		IBPrint("-------------------------------------------------------------------------");
+		IBPrint("商户号:%s\t商户名:%s\t核对结果:[%s]", stSettInfo.szMchtNo, szMchtNm, "对平");
+		IBPrint("-------------------------------------------------------------------------");
+		IBPrint("清算金额:\t|%16.2f\t|", stSettInfo.dSettleAmt);
+
+		if(stSettInfo.dRePairAmt > 0.00)
+		{
+			iFind = 0;
+			dActSum = 0.00;
+			g_stTrdCnt.dSettleAmt -= stSettInfo.dRePairAmt;
+			EXEC SQL DECLARE Cur_repair_def CURSOR FOR SELECT NVL(b.REPAIR_AMT, 0.00), NVL(a.REPAIR_DESC, ' ') FROM TBL_STLM_REPAIR a, TBL_REPAIR_TXN b 
+				WHERE b.REPAIR_ID = a.ID AND b.REPAIR_DATE = :g_stTrdCnt.szDate AND a.REPAIR_FLAG ='1' AND a.KEY_NO = :stSettInfo.szMchtNo;
+			EXEC SQL OPEN Cur_repair_def;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_STLM_REPAIR标错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_repair_def;
+				EXEC SQL CLOSE Cur_mcht_dtl;
+				return RC_FAIL;
+			}
+
+			while(1)
+			{
+				memset(szDesc, 0, sizeof(szDesc));
+				EXEC SQL FETCH Cur_repair_def INTO :dRepair, :szDesc;	
+				if(SQLERR)
+				{
+					IBPError("获取表TBL_STLM_REPAIR标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+					EXEC SQL CLOSE Cur_repair_def;
+					EXEC SQL CLOSE Cur_mcht_dtl;
+					return RC_FAIL;
+				}
+				else if(SQLNOTFOUND)
+					break;
+				iFind ++;
+				dActSum += dRepair;
+				sTrimAll(szDesc);
+				sTrimAll(szDesc);
+				IBPrint("该商户本周期存在补帐金额:\t|%-16.2f\t|原因:%s|", dRepair, szDesc);
+			}
+			EXEC SQL CLOSE Cur_repair_def;
+			if(!iFind)
+				IBPrint("该商户本周期存在补帐金额:\t|%-16.2f\t|原因:\terror|", stSettInfo.dRePairAmt);
+			else
+			{
+				if(fabs(dActSum - stSettInfo.dRePairAmt) < 0.005)
+					IBPrint("  -补帐统计:%12.2f\t流水金额差:%12.2f\t\t对平", dActSum, stSettInfo.dRePairAmt);
+				else
+					IBPrint("  -补帐统计:%12.2f\t流水金额差:%12.2f\t\terror", dActSum, stSettInfo.dRePairAmt);
+			}
+		}
+		if(stSettInfo.dUpRePairAmt > 0.00)
+		{
+			iFind = 0;
+			dActSum = 0.00;
+			g_stTrdCnt.dSettleAmt += stSettInfo.dUpRePairAmt;
+			EXEC SQL DECLARE Cur_def_settle CURSOR FOR SELECT NVL(NOW_AMT, 0.00), NVL(NEXT_DO, ' ') FROM TBL_STLM_REPAIR 
+				WHERE NEXT_DATE = :g_stTrdCnt.szDate AND REPAIR_FLAG ='1' AND KEY_NO = :stSettInfo.szMchtNo;
+			EXEC SQL OPEN Cur_def_settle;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_STLM_REPAIR标错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_def_settle;
+				EXEC SQL CLOSE Cur_mcht_dtl;
+				return RC_FAIL;
+			}
+
+			while(1)
+			{
+				memset(szDesc, 0, sizeof(szDesc));
+				EXEC SQL FETCH Cur_def_settle INTO :dRepair, :szDesc;	
+				if(SQLERR)
+				{
+					IBPError("获取表TBL_STLM_REPAIR标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+					EXEC SQL CLOSE Cur_def_settle;
+					EXEC SQL CLOSE Cur_mcht_dtl;
+					return RC_FAIL;
+				}
+				else if(SQLNOTFOUND)
+					break;
+				iFind ++;
+				dActSum += dRepair;
+				sTrimAll(szDesc);
+				sTrimAll(szDesc);
+				IBPrint("该商户本周期参与清算金额:\t|%-16.2f\t|原因:%s|", dRepair, szDesc);
+			}
+			EXEC SQL CLOSE Cur_def_settle;
+			if(!iFind)
+				IBPrint("该商户本周期存在补帐金额:\t|%-16.2f\t|原因:\terror|", stSettInfo.dUpRePairAmt);
+			else
+			{
+				if(fabs(dActSum - stSettInfo.dUpRePairAmt) < 0.005)
+					IBPrint("  +清算统计:%12.2f\t流水金额差:%12.2f\t\t对平", dActSum, stSettInfo.dUpRePairAmt);
+				else
+					IBPrint("  +清算统计:%12.2f\t流水金额差:%12.2f\t\terror", dActSum, stSettInfo.dUpRePairAmt);
+			}
+		}
+		if(stSettInfo.dUpErrAmt > 0.00)
+		{
+			iFind = 0;
+			dActSum = 0.00;
+			g_stTrdCnt.dSettleAmt += stSettInfo.dUpErrAmt;
+			EXEC SQL DECLARE Cur_def_err CURSOR FOR SELECT NVL(SETTLE_AMT, 0.00), NVL(NEXT_DO,' ') FROM 
+				TBL_SETTLE_ERR WHERE NEXT_DATE = :g_stTrdCnt.szDate AND MCHT_NO = :stSettInfo.szMchtNo;
+			EXEC SQL OPEN Cur_def_err;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_SETTLE_ERR标错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_def_err;
+				EXEC SQL CLOSE Cur_mcht_dtl;
+				return RC_FAIL;
+			}
+
+			while(1)
+			{
+				memset(szDesc, 0, sizeof(szDesc));
+				EXEC SQL FETCH Cur_def_err INTO :dRepair, :szDesc;	
+				if(SQLERR)
+				{
+					IBPError("获取表TBL_STLM_REPAIR标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+					EXEC SQL CLOSE Cur_def_err;
+					EXEC SQL CLOSE Cur_mcht_dtl;
+					return RC_FAIL;
+				}
+				else if(SQLNOTFOUND)
+					break;
+				iFind ++;
+				dActSum += dRepair;
+				sTrimAll(szDesc);
+				sTrimAll(szDesc);
+				IBPrint("该商户本周期重新入账金额:\t|%-16.2f\t|原因:%s", dRepair, szDesc);
+			}
+			EXEC SQL CLOSE Cur_def_err;
+			if(!iFind)
+				IBPrint("该商户本周期重新入账金额:\t|%-16.2f\t|原因:\terror|", stSettInfo.dUpErrAmt);
+			else
+			{
+				if(fabs(dActSum - stSettInfo.dUpErrAmt) < 0.005)
+					IBPrint("  +入账统计:%12.2f\t流水金额差:%12.2f\t\t对平", dActSum, stSettInfo.dUpErrAmt);
+				else
+					IBPrint("  +入账统计:%12.2f\t流水金额差:%12.2f\t\terror", dActSum, stSettInfo.dUpErrAmt);
+			}
+		}
+	}
+	EXEC SQL CLOSE Cur_mcht_dtl;
+
+	if(0 == iDtlCount && 0 == iAlgoCount)
+	{
+		IBPrint("-------------------------------------------------------------------------");
+		IBPWarm("\t~本周期(%s)(%s)->(%d)可能没清算的商户明细，请确认!", g_stTrdCnt.szDate, szSettleNum, lTrace);
+	}
+	if(!iFlag)
+		IBPrint("--------------------------------------------------------------------------------------------");
+	else
+		IBPrint("-------------------------------------------------------------------------");
+	
+	if((iAlgoCount + lDef) != iDtlCount || !bRunIsOk())
+		IBPrint("(%s)(%s)->(%d)账务不平(%d + %d)!=(%d)，请核对!!!(%d)error", g_stTrdCnt.szDate, szSettleNum, 
+			lTrace, iAlgoCount, lDef, iDtlCount, bRunIsOk());
+	else
+		IBPrint("核对(%d + %d)(%d)笔成功，(%s)(%s)->(%d)账务核对平完全一致, completed successfully!!!\n", 
+			iAlgoCount, lDef, iDtlCount, g_stTrdCnt.szDate, szSettleNum, lTrace);
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	核对清算是否和清分数据对平
+ *************************************************************************************************/
+int		nChkAlgoSettle()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long		iDtlCount = 0, iAlgoCount = 0;
+	EXEC SQL END DECLARE SECTION;
+	CMList		*pstRoot = NULL;
+	long		iRet = 0, lFork = 0;
+	pid_t		lPid = 0;
+	
+	iRet = lSetStep(3);
+	if(iRet)	return RC_FAIL;
+
+	IBPUserInfo(IBP_RACE, ">>Step 3:开始核对清算是否和清分数据对平<<");
+	//	总
+	EXEC SQL SELECT COUNT(*) INTO :iAlgoCount FROM TBL_ALGO_DTL WHERE ALGO_DATE = :g_stTrdCnt.szDate 
+		AND SETTLE_NUM = :g_stTrdCnt.szBatNum;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_ALGO_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL SELECT NVL(SUM(TX_NUM),0) INTO :iDtlCount FROM TBL_MCHT_SETTLE_DTL WHERE 
+		SETTLE_DATE = :g_stTrdCnt.szDate AND DISC_CYCLE > 0;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	if(iAlgoCount != iDtlCount)
+	{
+		IBPError("核对清分表与商户汇总表笔数不匹配(%d)!=(%d)", iAlgoCount, iDtlCount);
+		return RC_FAIL;
+	}
+	vDbsDisconnect();
+
+	//	分TC + TN校验?
+	for(lFork = 0; lFork < 20; lFork ++)
+	{
+		lPid = fork();
+		if(lPid < 0)
+		{
+			vIBPrint("fork子进程失败, err:(%d)(%s)\n", errno, strerror(errno));
+			exit(-1);
+		}
+		else if(lPid > 0)	//	父进程返回
+		{
+			if(RC_SUCC != lSaveProcess(&pstRoot, lPid))
+			{
+				HtLog(ERR_PARAM, "保存子进程Pid(%d)失败!", lPid);
+				return RC_FAIL;
+			}
+			continue;
+		}
+		else	//  if (lPid == 0)
+			;
+
+		if(RC_SUCC != lDbsConnect(DBS_BATCH))
+		{
+			IBPError("连接数据库失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+
+//		IBPrint("PART1:开始核对(TN00)->(%d)清算是否和清分数据对平", lFork);
+		if(RC_SUCC != nAlgoSettleCmp("TN00", lFork))	
+		{
+			IBPError("核对清分表与商户规则(%d)汇总表出错!", lFork);
+			vDbsDisconnect();
+			exit(-1);
+		}
+
+		//	分TC + TN校验?
+//		IBPrint("PART2:开始核对(TC00)->(%d)清算是否和清分数据对平", lFork);
+		if(RC_SUCC != nAlgoSettleCmp("TC00", lFork))	
+		{
+			IBPError("核对清分表与商户规则(%d)汇总表出错!", lFork);
+			vDbsDisconnect();
+			exit(-1);
+		}
+		vDbsDisconnect();
+
+		exit(0);		//	子进程任务处理完毕，单笔退出
+	}
+
+	if(RC_SUCC != lWaiteProcess(pstRoot))
+	{
+		IBPError("查询等待子进程出错, err:(%s)", sGetError());
+		return RC_FAIL;
+	}
+	
+	if(RC_SUCC != lDbsConnect(DBS_BATCH))
+	{
+		IBPError("连接数据库失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL 
+		SELECT NVL(SUM(TX_AMT), 0.00) - NVL(SUM(FEE_AMT), 0.00) - NVL(SUM(REPAIR_AMT), 0.00) + 
+				NVL(SUM(UNREPAIR_AMT), 0.00) + NVL(SUM(UPERR_AMT), 0.00)
+			INTO :g_stTrdCnt.dSettleAmt	FROM  TBL_MCHT_SETTLE_DTL 
+		WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM IN ('TN00', 'TC00');
+	if(SQLCODE)
+	{
+		IBPError("统计TBL_MCHT_SETTLE_DTL表失败, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	usleep(GAP_TIME);
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	核对清算流水
+ *************************************************************************************************/
+int		nMchtSettleCmp(char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	SettleInfo	stSettInfo;
+	SettleTxn	stSettleTxn;
+	char		szDesc[1025], szSettleNum[5];
+	long		iTxnCount = 0, lDCount = 0, lBatCount = 0, lBrno = 0;
+	double		dDAmt = 0.00, dDlyAmt = 0.00, dRepairAmt = 0.00;
+	EXEC SQL END DECLARE SECTION;
+	long		iRet = 0, lInit = 1;
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleNum, pszSettleNum, 4);
+	
+	EXEC SQL SELECT COUNT(*) INTO :lBatCount FROM TBL_MCHT_SETTLE_DTL WHERE 
+		SETTLE_NUM = :szSettleNum AND SETTLE_DATE = :g_stTrdCnt.szDate;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	g_stTrdCnt.lSettleCount += lBatCount;
+
+	iTxnCount = 0;
+	//	在txn表肯定是要清算的
+	EXEC SQL DECLARE Cur_txn_dtl CURSOR FOR SELECT ID, SETTLE_AMT, NVL(MCHT_NO, ' '), NVL(SETTLE_BRH_ID, ' '),
+		NVL(SETTLE_FLAG, ' '), NVL(TRACE_NO, ' ') FROM TBL_SETTLE_TXN WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND 
+		SETTLE_NUM = :szSettleNum;
+
+	EXEC SQL OPEN Cur_txn_dtl;
+	if(SQLERR)
+	{
+   		IBPError("打开表TBL_SETTLE_TXN标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stSettleTxn, 0, sizeof(stSettleTxn));		
+		EXEC SQL FETCH Cur_txn_dtl INTO :stSettleTxn.szId, :stSettleTxn.dSettleAmt, :stSettleTxn.szMchtNo, 
+			:stSettleTxn.szBrhNo, :stSettleTxn.szFlag, :stSettleTxn.szTraceNo;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_SETTLE_TXN标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_txn_dtl;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		sTrimAll(stSettleTxn.szId);
+		sTrimAll(stSettleTxn.szTraceNo);
+		sTrimAll(stSettleTxn.szMchtNo);
+		sTrimAll(stSettleTxn.szBrhNo);
+		iTxnCount ++;
+		memset(&stSettInfo, 0, sizeof(stSettInfo));
+		if(SETTLE_TXN_BRH == stSettleTxn.szFlag[0])	//	机构
+		{
+			EXEC SQL SELECT SETTLE_AMT INTO :stSettInfo.dSettleAmt FROM TBL_BRH_SETTLE_DTL WHERE ID = :stSettleTxn.szId;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_BRH_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_txn_dtl;
+				return RC_FAIL;
+			}
+			else if(SQLNOTFOUND)
+				IBPrint("商户(%s)异常，请检查! (%d)", stSettleTxn.szMchtNo, SQLCODE);
+			if(fabs(stSettleTxn.dSettleAmt - stSettInfo.dSettleAmt) < 0.005)
+				IBPrint("%5d|B|%s\t|%12.2f\t|%16.2f\t|%8s|", iTxnCount, stSettleTxn.szBrhNo, stSettleTxn.dSettleAmt, stSettInfo.dSettleAmt, "对平");
+			else
+				IBPError("%5d|B|%s\t|%12.2f\t|%16.2f\t|%8s|", iTxnCount, stSettleTxn.szBrhNo, stSettleTxn.dSettleAmt, stSettInfo.dSettleAmt, "error");
+		}
+		else if(SETTLE_MCHT_BRH == stSettleTxn.szFlag[0])	//	机构接入
+		{
+			EXEC SQL SELECT NVL(SUM(SETTLE_AMT), 0.00), COUNT(*) INTO :stSettInfo.dSettleAmt, :lBrno FROM TBL_MCHT_SETTLE_DTL 
+				WHERE TRACE_ALL = :stSettleTxn.szTraceNo AND SETTLE_DATE = :g_stTrdCnt.szDate AND BRH = :stSettleTxn.szBrhNo;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_BRH_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_txn_dtl;
+				return RC_FAIL;
+			}
+			else if(SQLNOTFOUND)
+				IBPrint("商户(%s)异常，请检查! (%d)", stSettleTxn.szMchtNo, SQLCODE);
+
+			iTxnCount += lBrno - 1;
+			if(fabs(stSettleTxn.dSettleAmt - stSettInfo.dSettleAmt) < 0.005)
+				IBPrint("%5d|B|%s\t|%12.2f\t|%16.2f\t|%8s|", iTxnCount, stSettleTxn.szBrhNo, stSettleTxn.dSettleAmt, stSettInfo.dSettleAmt, "对平");
+			else
+				IBPError("%5d|B|%s\t|%12.2f\t|%16.2f\t|%8s|", iTxnCount, stSettleTxn.szBrhNo, stSettleTxn.dSettleAmt, stSettInfo.dSettleAmt, "error");
+		}
+		else if(SETTLE_TXN_MCHT == stSettleTxn.szFlag[0])	//	正常商户
+		{
+			EXEC SQL SELECT SETTLE_AMT INTO :stSettInfo.dSettleAmt FROM TBL_MCHT_SETTLE_DTL WHERE ID = :stSettleTxn.szId;
+			if(SQLERR)
+			{
+				IBPError("打开表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+				EXEC SQL CLOSE Cur_txn_dtl;
+				return RC_FAIL;
+			}
+			else if(SQLNOTFOUND)
+				IBPrint("商户(%s)异常，请检查! (%d)", stSettleTxn.szMchtNo, SQLCODE);
+			if(fabs(stSettleTxn.dSettleAmt - stSettInfo.dSettleAmt) < 0.005)
+				IBPrint("%5d|M|%s\t|%12.2f\t|%16.2f\t|%8s|", iTxnCount, stSettleTxn.szMchtNo, stSettleTxn.dSettleAmt, stSettInfo.dSettleAmt, "对平");
+			else
+				IBPError("%5d|M|%s\t|%12.2f\t|%16.2f\t|%8s|", iTxnCount, stSettleTxn.szMchtNo, stSettleTxn.dSettleAmt, stSettInfo.dSettleAmt, "error");
+		}
+	}
+	EXEC SQL CLOSE Cur_txn_dtl;
+
+//	0金额未参与当日清算
+	EXEC SQL SELECT NVL(COUNT(*), 0), NVL(SUM(SETTLE_AMT), 0.00) INTO :lDCount, :dDAmt FROM TBL_MCHT_SETTLE_DTL WHERE 
+		SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum AND SETTLE_AMT <= 0.00 AND DC_FLAG = 'C';
+	if(SQLERR)
+	{
+   		IBPError("打开表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+//	商户清算流水可能存在'3'装载的数据, 肯定存在settle_err表中
+	EXEC SQL DECLARE Cur_settle_txn CURSOR FOR SELECT ID, NVL(SETTLE_AMT, 0.00), 
+			NVL(MCHT_NO, ' '), NVL(RESULT_FLAG, ' ') 
+		FROM TBL_SETTLE_TXN 
+	WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum AND RESULT_FLAG ='1' 
+		AND BATCH_NO IS NULL;
+
+	EXEC SQL OPEN Cur_settle_txn;
+	if(SQLERR)
+	{
+   		IBPError("打开表TBL_MCHT_SETTLE_DTL标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stSettleTxn, 0, sizeof(stSettleTxn));		
+		EXEC SQL FETCH Cur_settle_txn INTO :stSettleTxn.szId, :stSettleTxn.dSettleAmt, :stSettleTxn.szMchtNo, 
+			:stSettleTxn.szFlag;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_SETTLE_TXN标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_settle_txn;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		if(lInit)
+		{
+			lInit = 0;
+			IBPrint("=================>>账号异常导致出现的入账失败流水<<=========================");
+		}
+		
+		sTrimAll(stSettleTxn.szId);
+		sTrimAll(stSettleTxn.szMchtNo);
+
+		memset(&stSettInfo, 0, sizeof(stSettInfo));
+		EXEC SQL SELECT SETTLE_AMT INTO :stSettInfo.dSettleAmt FROM TBL_SETTLE_ERR WHERE ID = :stSettleTxn.szId;
+		if(SQLERR)
+		{
+			IBPError("打开表TBL_SETTLE_ERR错误, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_settle_txn;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			IBPrint("商户(%s)异常ID(%s)，请检查! (%d)", stSettleTxn.szMchtNo, stSettleTxn.szId, SQLCODE);
+
+		if(fabs(stSettleTxn.dSettleAmt - stSettInfo.dSettleAmt) < 0.005)
+			IBPrint("%5d|E|%s\t|%12.2f\t|%16.2f\t|%8s|", iTxnCount, stSettleTxn.szMchtNo, stSettleTxn.dSettleAmt, stSettInfo.dSettleAmt, "对平");
+		else
+			IBPError("%5d|E|%s\t|%12.2f\t|%16.2f\t|%8s|", iTxnCount, stSettleTxn.szMchtNo, stSettleTxn.dSettleAmt, stSettInfo.dSettleAmt, "error");
+	}
+	EXEC SQL CLOSE Cur_settle_txn;
+
+	if(iTxnCount != (lBatCount - lDCount))
+		IBPError("(%s)(%s)账务不平(%d)!=(%d)，请核对!!!!!!!!", g_stTrdCnt.szDate, szSettleNum, iTxnCount, lBatCount);
+	if(0 == lBatCount && 0 == iTxnCount)
+		IBPWarm("\t~本周期(%s)(%s)没有可清算的商户流水，请检查！", g_stTrdCnt.szDate, szSettleNum);
+	
+	IBPrint("-------------------------------------------------------------------------");
+	if(bRunIsOk())
+		IBPrint("核对(%d)(%d - %d)笔成功，(%s)账务核对平完全一致, completed successfully!!!\n", iTxnCount, lBatCount, lDCount, g_stTrdCnt.szDate);
+	else
+		IBPError("核对(%d)(%d - %d)笔失败，(%s)账务核有问题，请检查!!! error\n", iTxnCount, lBatCount, lDCount, g_stTrdCnt.szDate);
+
+	g_stTrdCnt.lSettleCount -= lDCount;
+//	g_stTrdCnt.dSettleAmt   -= dDAmt;
+
+	//	商户的
+	EXEC SQL SELECT NVL(SUM(REPAIR_AMT), 0.00), NVL(SUM(UNREPAIR_AMT), 0.00) INTO :dRepairAmt, :dDAmt FROM 
+		TBL_MCHT_SETTLE_DTL WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	g_stSetAct.repair_amt	 += dRepairAmt;
+	g_stSetAct.repair_settle += dDAmt;
+
+	//	机构的
+	EXEC SQL SELECT NVL(SUM(REPAIR_AMT), 0.00), NVL(SUM(UNREPAIR_AMT), 0.00) INTO :dRepairAmt, :dDAmt FROM 
+		TBL_BRH_SETTLE_DTL WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	g_stSetAct.repair_amt	 += dRepairAmt;
+	g_stSetAct.repair_settle += dDAmt;
+
+	EXEC SQL SELECT NVL(SUM(UPERR_AMT), 0.00) INTO :dDlyAmt  FROM TBL_MCHT_SETTLE_DTL WHERE 
+		SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum;
+	if(SQLERR)
+	{
+   		IBPError("统计表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+   		return RC_FAIL;
+	}
+	g_stSetAct.delay_settle += dDlyAmt;
+
+	EXEC SQL SELECT NVL(SUM(UPERR_AMT), 0.00) INTO :dDlyAmt FROM TBL_BRH_SETTLE_DTL WHERE 
+		SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum;
+	if(SQLERR)
+	{
+   		IBPError("统计表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+   		return RC_FAIL;
+	}
+
+	//	统计直接入入账失败表记录
+	EXEC SQL SELECT NVL(COUNT(*), 0), NVL(SUM(SETTLE_AMT), 0.00) INTO :lDCount, :dDAmt 
+		FROM TBL_MCHT_SETTLE_DTL 
+	WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum AND RESULT_FLAG = '3';
+	if(SQLERR)
+	{
+   		IBPError("打开表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	g_stTrdCnt.lSettleCount -= lDCount;
+//	g_stTrdCnt.dSettleAmt -= dDAmt;
+
+	g_stSetAct.delay_settle += dDlyAmt;
+	g_stSetAct.settle_amt += g_stTrdCnt.dSettleAmt - dDAmt;
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	核对清算流水
+ *************************************************************************************************/
+int		nChkSettleTxn()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szAuth[2];
+	double		dSettleAmt = 0.00;
+	EXEC SQL END DECLARE SECTION;
+	int			iRet = 0;
+
+	iRet = lSetStep(4);
+	if(iRet) return RC_FAIL;	
+
+	memset(szAuth, 0, sizeof(szAuth));
+	IBPUserInfo(IBP_RACE, ">>Step 4:开始核对清算流水是否和对平<<");
+
+//	是否 区分TC 和 TN？
+
+	IBPrint("---------------------------PART:TN00流水核对-----------------------------");
+	IBPrint("	S|N|商户号&机构号\t|tbl_settle_txn\t|tbl_mcht_settle_dtl\t|比对结果|");
+	IBPrint("-------------------------------------------------------------------------");
+
+	if(RC_SUCC != nMchtSettleCmp("TN00"))
+	{
+   		IBPError("核对(%s)(TN00)清算流水失败!", g_stTrdCnt.szDate);
+		return RC_FAIL;
+	}
+
+	IBPrint("---------------------------PART:TC00流水核对-----------------------------");
+	IBPrint("	S|N|商户号&机构号\t|tbl_settle_txn\t|tbl_mcht_settle_dtl\t|比对结果|");
+	IBPrint("-------------------------------------------------------------------------");
+	if(RC_SUCC != nMchtSettleCmp("TC00"))
+	{
+   		IBPError("核对(%s)(TC00)清算流水失败!", g_stTrdCnt.szDate);
+		return RC_FAIL;
+	}
+	
+	EXEC SQL SELECT NVL(SUM(SETTLE_AMT), 0.00) INTO :dSettleAmt 
+		FROM TBL_SETTLE_TXN 
+	WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM IN ('TN00', 'TC00');
+	if(SQLCODE)
+	{
+		IBPError("统计TBL_SETTLE_TXN表失败, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	if(fabs(dSettleAmt - g_stTrdCnt.dSettleAmt) > 0.005)
+	{
+		IBPError("检查清算金额失败, (%.2f)>(%.2f)!", dSettleAmt, g_stTrdCnt.dSettleAmt);
+		return RC_FAIL;
+	}	
+
+	g_stSetAct.auth_state[0] = '9';
+	//	统计直接入入账失败表记录
+	EXEC SQL SELECT NVL(AUTH_STATE, ' ') INTO :szAuth FROM  TBL_SETTLE_ACCOUNT WHERE 
+		SETTLE_DATE = :g_stTrdCnt.szDate;
+	if(SQLERR)
+	{
+   		IBPError("打开表TBL_MCHT_SETTLE_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	else if(SQLNOTFOUND)
+		szAuth[0] = '9';
+	else
+		;
+
+	//	已经审核了
+	if('9' != szAuth[0])	return RC_SUCC;
+
+	EXEC SQL DELETE FROM TBL_SETTLE_ACCOUNT WHERE ID = :g_stSetAct.id;
+	
+	return lTblSettleActIns();
+}
+
+/*************************************************************************************************
+	核对批次汇总流水
+ *************************************************************************************************/
+int		nSettleSumCmp(char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	SettleTxn	stSettleTxn;
+	char		szSettleNum[5];
+	long		lSum = 0;
+	double		dSumSettle = 0.00;
+	EXEC SQL END DECLARE SECTION;
+	long	iRet = 0;	
+	
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	strncpy(szSettleNum, pszSettleNum, 4);
+
+	//	核对每一笔汇总记录
+	EXEC SQL DECLARE Cur_sum_txn CURSOR FOR SELECT SUBSTR(BRH,1,3), COUNT(*), SUM(SETTLE_AMT) 
+		FROM TBL_SETTLE_TXN 
+	WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum GROUP BY SUBSTR(BRH,1,3) 
+		ORDER BY SUBSTR(BRH,1,3);
+
+	EXEC SQL OPEN Cur_sum_txn;
+	if(SQLERR)
+	{
+   		IBPError("打开表TBL_SETTLE_TXN标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	while(1)
+	{
+		memset(&stSettleTxn, 0, sizeof(stSettleTxn));		
+		EXEC SQL FETCH Cur_sum_txn INTO :stSettleTxn.szBrhNo, :stSettleTxn.lCount, :stSettleTxn.dSettleAmt;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_SETTLE_TXN标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_sum_txn;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		sTrimAll(stSettleTxn.szBrhNo);
+		EXEC SQL SELECT TOTAL_NUM, TOTAL_AMT INTO :lSum, :dSumSettle 
+			FROM TBL_SETTLE_SUM 
+		WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND BRH = :stSettleTxn.szBrhNo AND SETTLE_NUM = :szSettleNum;	
+		if(SQLERR)
+		{
+			IBPError("查询表TBL_SETTLE_SUM错误, (%d)(%s)", SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+		
+		if(lSum !=stSettleTxn.lCount || fabs(stSettleTxn.dSettleAmt - dSumSettle) > 0.01)
+		{
+			IBPError("机构(%s), 清算金额(%.2f)!=(%.2f)或清算笔数(%d)!=(%d)存在问题，请处理, error!!", stSettleTxn.szBrhNo, 
+				stSettleTxn.dSettleAmt, dSumSettle, stSettleTxn.lCount, lSum);
+			break;
+		}
+		IBPrint("今日机构(%s), 需清算笔数:%12d (笔)\t清算金额:%16.2f (元)", stSettleTxn.szBrhNo, stSettleTxn.lCount, stSettleTxn.dSettleAmt);
+	}
+	EXEC SQL CLOSE Cur_sum_txn;
+	IBPrint("-------------------------------------------------------------------------");
+
+	EXEC SQL SELECT SUM(TOTAL_NUM), NVL(SUM(TOTAL_AMT), 0.00) INTO :g_stTrdCnt.lSumCount, :g_stTrdCnt.dSumTxAmt FROM 
+		TBL_SETTLE_SUM WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_SETTLE_SUM错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	EXEC SQL SELECT COUNT(*), NVL(SUM(SETTLE_AMT),0.00) INTO :stSettleTxn.lCount, :stSettleTxn.dSettleAmt 
+		FROM TBL_SETTLE_TXN 
+	WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :szSettleNum;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_SETTLE_TXN错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	if(stSettleTxn.lCount != g_stTrdCnt.lSumCount || fabs(stSettleTxn.dSettleAmt - g_stTrdCnt.dSumTxAmt) >= 0.005)
+	{
+		IBPrint("(%s)(%s)账务不平:笔数(%d)(%d), 金额(%.2f)(%.2f)，请核对!!!!!!!!", g_stTrdCnt.szDate, szSettleNum,
+			g_stTrdCnt.lSumCount, stSettleTxn.lCount, g_stTrdCnt.dSumTxAmt, stSettleTxn.dSettleAmt);
+		return RC_FAIL;
+	}
+
+	IBPrint("清算笔数:%16d (笔)\t交易笔数:%16d (笔)\n清算金额:%16.2f (元)\t交易金额:%16.2f (元)", g_stTrdCnt.lSumCount, 
+		g_stTrdCnt.lSETCount, g_stTrdCnt.dSumTxAmt, g_stTrdCnt.dSETTxAmt);
+	if(g_stTrdCnt.dSumTxAmt > g_stTrdCnt.dSETTxAmt)	//	收比出的还多，有问题
+		IBPrint("清算金额(%.2f)>(%.2f)交易金额，可能存在问题，请核实!", g_stTrdCnt.dSumTxAmt, g_stTrdCnt.dSETTxAmt);
+
+	if(fabs(g_stTrdCnt.dSettleAmt - g_stTrdCnt.dSumTxAmt) > 0.005)
+		IBPError("清算金额(%.2f)>(%.2f)清分金额，存在问题，请处理, error!!", g_stTrdCnt.dSettleAmt, g_stTrdCnt.dSumTxAmt);
+	if(g_stTrdCnt.lSumCount == 0)
+	{
+		IBPrint("-------------------------------------------------------------------------");
+		IBPWarm("\t~本周期没有清算汇总信息，请核实！");
+	}
+	IBPrint("-------------------------------------------------------------------------");
+	if(bRunIsOk())
+		IBPrint("清算日期(%s)批次(%s), 账务核对平完全一致, completed successfully!!!\n", g_stTrdCnt.szDate, szSettleNum);
+	else
+		IBPError("清算日期(%s)批次(%s), 账务核对平异常!!!! error!\n", g_stTrdCnt.szDate, szSettleNum);
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	核对汇总数据和条数		
+ *************************************************************************************************/
+int		nChkSettleSum()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	SettleTxn	stSettleTxn;
+	long		lSum = 0;
+	double		dSumSettle = 0.00;
+	EXEC SQL END DECLARE SECTION;
+	long	iRet = 0;	
+	
+	iRet = lSetStep(5);
+	if(iRet)	return RC_FAIL;
+
+	IBPUserInfo(IBP_RACE, ">>Step 5:核对汇总数据和条数");
+
+/*	无需核对了
+	IBPUserInfo(IBP_RACE, ">>Step 5:核对汇总数据和条数");
+	IBPrint("-------------------------------------------------------------------------");
+	IBPrint("对清算日期(%s)清算统计如下:\n", g_stTrdCnt.szDate);
+	IBPrint("---------------------------统计(TN00)数据如下----------------------------");
+	if(RC_SUCC != nSettleSumCmp("TN00"))
+		return RC_FAIL;
+	
+	IBPrint("---------------------------统计(TC00)数据如下----------------------------");
+	if(RC_SUCC != nSettleSumCmp("TC00"))
+		return RC_FAIL;
+*/
+
+	vSettleTxnChk();
+	//	扩展其他的检查
+	vOtherActChk();
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	打印报表
+ *************************************************************************************************/
+int		nPrintReport()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	AlgoInfo	stAlgo;
+	EXEC SQL END DECLARE SECTION;
+
+	IBPrept("*****************************************************************************************************");
+	IBPrept(sGetVersion());
+	IBPrept("*****************************************************************************************************");
+//	IBPrept("_____________________________________________________________________________________________________");
+	IBPrept("%s|本地流水(汇总)\t|本周期日切延迟清算\t\t|本周期异常\t|上周期需要清算\t\t\t|参与本期清算\t|", g_stTrdCnt.szDate);
+	IBPrept("-----------------------------------------------------------------------------------------------------");
+	IBPrept("总笔数: |%14d\t|统计(笔)\t|%10d\t|%10d\t|统计(笔)\t|%10d\t|%14d\t|", g_stTrdCnt.lCount, g_stTrdCnt.lGAPCount, 
+		g_stTrdCnt.lErrCount, g_stTrdCnt.lLastGAPCnt, g_stTrdCnt.lLastCount);
+	IBPrept("总金额: |%14.2f\t|统计(金额)\t|%10.2f\t|%10.2f\t|统计(金额)\t|%10.2f\t|%14.2f\t|", g_stTrdCnt.dTxAmt, g_stTrdCnt.dGAPTxAmt, 
+		g_stTrdCnt.dErrTxAmt, g_stTrdCnt.dLastGAPAmt, g_stTrdCnt.dLastTxAmt);
+	IBPrept("-----------------------------------------------------------------------------------------------------");
+		
+	if(g_stTrdCnt.lErrCount > 0 || fabs(g_stTrdCnt.dErrTxAmt) > 0.001 || g_stTrdCnt.lLastCount > 0 || fabs(g_stTrdCnt.dLastTxAmt) > 0.001)
+		IBPrept("本周期异常,延迟清算:");
+
+	if(g_stTrdCnt.lErrCount > 0 || fabs(g_stTrdCnt.dErrTxAmt) > 0.001)	//	如果只有渠道多帐的那么将不会展示
+	{
+		IBPrept("(本周期延迟):\t笔数:%-6d金额:%-16.2f", g_stTrdCnt.lErrCount, g_stTrdCnt.dErrTxAmt);
+		vChkErrTrade(FALSE);
+	}
+	if(g_stTrdCnt.lLastCount > 0 || fabs(g_stTrdCnt.dLastTxAmt) > 0.001)
+	{
+		IBPrept("(参与清算):\t\t笔数:%-6d金额:%-16.2f", g_stTrdCnt.lLastCount, g_stTrdCnt.dLastTxAmt);
+		vChkErrTrade(TRUE);
+	}
+
+	if(g_stTrdCnt.lErrCount > 0 || g_stTrdCnt.dErrTxAmt > 0.00 || g_stTrdCnt.lLastCount > 0 || g_stTrdCnt.dLastTxAmt > 0.00)
+		IBPrept("-----------------------------------------------------------------------------------------------------");
+	else
+		IBPrept("\n-----------------------------------------------------------------------------------------------------");
+
+	IBPrept("本期延迟清算笔数:\t%-16d\t\t\t|在本周期中需清算笔数:\t%-16d\t\t\t|", g_stTrdCnt.lGAPCount + g_stTrdCnt.lErrCount, 
+		g_stTrdCnt.lLastGAPCnt + g_stTrdCnt.lLastCount);
+	IBPrept("本期延迟清算金额:\t%-16.2f\t\t\t|在本周期中需清算金额:\t%-16.2f\t\t\t|", g_stTrdCnt.dGAPTxAmt + g_stTrdCnt.dErrTxAmt, 
+		g_stTrdCnt.dLastGAPAmt + g_stTrdCnt.dLastTxAmt);
+	IBPrept("-----------------------------------------------------------------------------------------------------");
+
+	memset(&stAlgo, 0, sizeof(stAlgo));
+	EXEC SQL SELECT COUNT(*), NVL(SUM(TX_AMT), 0.00), NVL(SUM(FEE_AMT), 0.00), NVL(SUM(TX_AMT) - SUM(FEE_AMT), 0.00), 
+		NVL(SUM(CUP_FEE), 0.00), NVL(SUM(OTHER_FEE), 0.00) INTO :stAlgo.lCount, :stAlgo.dTxAmt, :stAlgo.dFeeAmt, :stAlgo.dSettleAmt, 
+		:stAlgo.dCupAmt, :stAlgo.dOtherAmt FROM TBL_ALGO_DTL WHERE ALGO_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :g_stTrdCnt.szBatNum;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_ALGO_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+		
+	IBPrept("汇总如下:");
+	IBPrept("_____________________________________________________________________________________________________");
+	IBPrept("本周期联机交易数:\t%-16d\t\t\t|本周期联机交易总金额:\t%-16.2f\t\t\t|", g_stTrdCnt.lSETCount, g_stTrdCnt.dSETTxAmt);
+	IBPrept("本周期结算商户数:\t%-16d\t\t\t|本周期总清算交易金额:\t%-16.2f\t\t\t|", g_stTrdCnt.lSettleCount, g_stTrdCnt.dSettleAmt);
+	IBPrept("本周期结算总笔数:\t%-16d\t\t\t|本周期统计结算总金额:\t%-16.2f\t\t\t|", g_stTrdCnt.lSumCount, g_stTrdCnt.dSumTxAmt);
+	IBPrept("T + 0 已清算笔数:\t%-16d\t\t\t|T + 0 已经结算总金额:\t%-16.2f\t\t\t|", g_stTrdCnt.lRealCount, g_stTrdCnt.dRealAmt);
+	IBPrept("-----------------------------------------------------------------------------------------------------");
+	IBPrept("清算笔数\t|\t交易金额\t|\t商户手续费\t|\t渠道手续费\t|\t机构手续费\t|\t公司盈利\t|  结果 |");
+
+	IBPrint2("统计清分表笔数(%d)交易金额(%.2f)手续费(%.2f)清算金额(%.2f)渠道手续费(%.2f)盈利(%.2f)", stAlgo.lCount, stAlgo.dTxAmt, 
+		stAlgo.dFeeAmt, g_stTrdCnt.dSettleAmt, stAlgo.dCupAmt, stAlgo.dOtherAmt);
+	if((g_stTrdCnt.lSETCount - g_stTrdCnt.lRealCount) != stAlgo.lCount || fabs(stAlgo.dTxAmt - g_stTrdCnt.dSETTxAmt + g_stTrdCnt.dRealAmt) > 0.005)
+//		fabs(stAlgo.dSettleAmt - g_stTrdCnt.dSettleAmt) > 0.005)	可能有补帐或者资金截留的，所以这里无法判断
+		IBPrept("%8d\t|%14.2f\t|%14.2f\t|%14.2f\t|%14.2f\t|%14.2f\t|error\t|", g_stTrdCnt.lSETCount - g_stTrdCnt.lRealCount, 
+			g_stTrdCnt.dSETTxAmt - g_stTrdCnt.dRealAmt, stAlgo.dFeeAmt, stAlgo.dCupAmt, stAlgo.dBrhFee, stAlgo.dOtherAmt);
+	else
+		IBPrept("%8d\t|%14.2f\t|%14.2f\t|%14.2f\t|%14.2f\t|%14.2f\t|\tOK\t|", g_stTrdCnt.lSETCount, g_stTrdCnt.dSETTxAmt, 
+			stAlgo.dFeeAmt, stAlgo.dCupAmt, stAlgo.dBrhFee, stAlgo.dOtherAmt);
+
+	IBPrept("*****************************************************************************************************\n\n\n\n");
+	IBPrint("-------------------------------------------------------------------------");
+	IBPrint("今日(%s)报表生成成功, completed successfully！！", g_stTrdCnt.szDate);
+
+	return RC_SUCC;
+}
+
+/*************************************************************************************************
+	扩展对其他一些检查
+ *************************************************************************************************/
+void	vOtherActChk()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSum = 0;
+	EXEC SQL END DECLARE SECTION;
+
+	IBPrint("\n>>附加:其他数据检查<<");
+	vStoreLogAttrib();
+	vSetLogGloble(LOG_ONE);
+
+/*
+//	现在存在数据备份，该条也无检查必要
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_ALGO_DTL WHERE SUBSTR(CUPS_NO,1,1) != '2' AND 
+		ID NOT IN (SELECT ID FROM TBL_STLM_SUCC WHERE RESULT_FLAG = '0'); 
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_ALGO_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return ;
+	}
+
+	if(lCount > 0)
+		IBPrint("在TBL_ALGO_DTL表中存在已清算的(%d)笔记录，但是在对账成功表中未发现！！error", lCount);
+	else
+		IBPrint("检查在TBL_STLM_SUCC表中已清分记录, 未发现异常记录!");
+*/
+
+	EXEC SQL SELECT COUNT(*) INTO :lSum FROM TBL_STLM_ERR WHERE RESULT_FLAG = '0';
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_STLM_ERR错误, (%d)(%s)", SQLCODE, sDbsError());
+		return ;
+	}
+
+	IBPrint2("统计TBL_STLM_ERR表中参与清分记录条数(%d)!", lSum);
+
+	//	将现网数据剔除出来
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_ALGO_DTL WHERE SUBSTR(CUPS_NO,1,1) != '2' AND 
+		ID IN (SELECT ID FROM TBL_STLM_ERR WHERE RESULT_FLAG = '0');
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_ALGO_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return ;
+	}
+
+	if(lCount != lSum)
+		IBPrint("在TBL_ALGO_DTL表中存在记录与差错表中参与清分记录(%d)!=(%d)不相等，严重错误！error", lCount, lSum);
+	else
+		IBPrint("检查差错表参与清算记录，未发现异常!");
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_ALGO_DTL WHERE ID IN 
+		(SELECT ID FROM TBL_STLM_ERR WHERE RESULT_FLAG != '0') AND DISC_CYCLE > 0;
+	if(SQLERR)
+	{
+		IBPError("统计表TBL_ALGO_DTL错误, (%d)(%s)", SQLCODE, sDbsError());
+		return ;
+	}
+
+	if(0 != lCount)
+		IBPrint("在查找差错表未参与清算的记录时发现在TBL_ALGO_DTL表中存在该记录(%d), 严重错误！error", lCount);
+	else
+		IBPrint("检查差错表未参与清算的记录，未发现异常!");
+
+	vRestoreLogAttrib();
+}
+
+/*************************************************************************************************
+	仅仅对清算流水待清算的进行检查
+ *************************************************************************************************/
+void	vSettleTxnChk()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szId[23], szMcht[26], szBrh[21], szFlag[2];
+	long	lInit = 0, lCount = 0;
+	EXEC SQL END DECLARE SECTION;
+
+	//	只核对TN00流水
+	IBPrint(">>>开始核对卸载清算流水异常信息检查<<<\n");
+	IBPrint("----------------------------------------------------");
+
+	EXEC SQL DECLARE Cur_err_txn CURSOR FOR 
+	SELECT ID, NVL(MCHT_NO, ' '), NVL(SETTLE_BRH_ID, ' '), NVL(SETTLE_FLAG, ' ')
+		FROM TBL_SETTLE_TXN
+	WHERE SETTLE_DATE = :g_stTrdCnt.szDate AND SETTLE_NUM = :g_stTrdCnt.szBatNum AND 
+		RESULT_FLAG <> '1' AND (SETTLE_BANK_NO IS NULL OR  
+		LENGTHB(TRIM(SETTLE_BANK_NO)) != 12 OR
+		(SETTLE_NETPAY_NO IS NOT NULL AND LENGTHB(TRIM(SETTLE_NETPAY_NO)) != 12) OR
+		SETTLE_ACCT_TYPE IS NULL OR
+		SETTLE_BANK_NM IS NULL OR
+		TRACE_REV IS NULL);
+
+	EXEC SQL OPEN Cur_err_txn;
+	if(SQLERR)
+	{
+		IBPError("打开表TBL_SETLE_TXN标错误, (%d)(%s)", SQLCODE, sDbsError());
+		return ;
+	}
+
+	while(1)
+	{
+		memset(szId, 0, sizeof(szId));
+		memset(szFlag, 0, sizeof(szFlag));
+		memset(szMcht, 0, sizeof(szMcht));
+		memset(szBrh, 0, sizeof(szBrh));
+		EXEC SQL FETCH Cur_err_txn INTO :szId, :szMcht, :szBrh, :szFlag;
+		if(SQLERR)
+		{
+			IBPError("获取表TBL_SETLE_TXN标数据出错, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_err_txn;
+			return ;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		++ lCount;
+		sTrimAll(szId);
+		sTrimAll(szMcht);
+		sTrimAll(szBrh);
+		sTrimAll(szFlag);
+
+		if(0 == lInit)
+		{
+			lInit = 1;
+			IBPrint("清算流水|%22s|N|%18s|", "ID", "商户号/机构号");
+		}
+		
+		if('1' == szFlag[0])
+			IBPrint("InfoErr: %22s|M|%18s|", szId, szMcht);
+		else
+			IBPrint("InfoErr: %22s|B|%18s|", szId, szBrh);
+	}
+	EXEC SQL CLOSE Cur_err_txn;
+
+	IBPrint("----------------------------------------------------");
+	IBPrint("统计完毕，总计(%d)笔账号信息异常流水", lCount);
+
+	return ;
+}
+
+/*************************************************************************************************
+	运行步骤	
+ *************************************************************************************************/
+void	vCoreRunStep()
+{
+	int		iRet = 0;
+	long	lStep = nGetNeedStep(), lMask = MASK_STEP;
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		IBPError("dbsconnect error(%d)(%s)", iRet, sDbsError());
+		return ;
+	}
+	if(0 < nGetSetStep())
+		vLogDisable();
+
+	lStep = lStep & lMask;
+	while(lMask)
+	{
+		if(0 == lStep)
+		{
+			lMask = lMask << 1;
+			lStep = nGetNeedStep() & lMask;
+			continue;
+		}
+
+		if(nGetSetStep() & lStep)
+			vLogEnable();
+		vRunSelectStep(lStep);
+		if(!bRunIsOk())
+		{
+			IBPError("步骤(%d)运行失败, 请检查!", lStep);
+			break ;
+		}
+		if(nGetSetStep() & lStep)
+			vLogDisable();
+
+		lMask = lMask << 1;
+		lStep = nGetNeedStep() & lMask;
+	}
+	vLogEnable();
+	if(nGetNeedStep() > 0 && (nGetSetStep() > lStep) && lStep > 0)
+		IBPError("步骤(%d)所依赖的步骤还未运行或未正确运行，请先运行！", lStep);
+	vDbsDisconnect();
+}
+
+/*************************************************************************************************
+	输出功能
+ *************************************************************************************************/
+void	vPrintFunc(char *s)
+{
+	vIBPrint("Usage:\t%s -[atkp][d]\n", s);
+	vIBPrint("\t-a\t\t--打印查询所有\n");
+	vIBPrint("\t-p filename\t--打印报表\n");
+	vIBPrint("\t-t\t\t--其他类型检查(无须依赖批量状态)\n");
+	vIBPrint("\t-k\t\t--清算流水检查(无须依赖批量状态)\n");
+	vIBPrint("\t-d\t\t--指定运行检查的步骤，最大1~5之间\n\n");
+}
+
+/*************************************************************************************************
+	主函数	
+ *************************************************************************************************/
+int		main(int argc, char *argv[])
+{
+	int	 iChoose = 0, iRet = 0, iAction = 0, iNeed = 0;
+
+	vInitTradeCnt(sGetDate(), "TN00", 6);
+	vLogSetName("Settle%s.rpt", ((TrdCnt *)pGetTrdCnt())->szDate);
+	strcpy(((TrdCnt *)pGetTrdCnt())->stLog.szRptName, "IBPReport.rpt");
+
+	if(RC_SUCC != lWakeupLog())
+	{
+		vIBPrint("启动日志服务失败!\n");
+		return RC_FAIL;
+	}
+
+	while(-1 != (iChoose = getopt(argc, argv, "d:t::k::a::p::v")))
+	{
+		switch(iChoose)
+		{
+		case	'a':
+			((TrdCnt *)pGetTrdCnt())->lSetStep = ((TrdCnt *)pGetTrdCnt())->lSetStep | 0x1f;
+			iAction = iAction | 0x1f;
+			break;
+		case	'p':
+			((TrdCnt *)pGetTrdCnt())->lSetStep = ((TrdCnt *)pGetTrdCnt())->lSetStep | 0x80;
+			iAction = iAction | 0x9f;
+			break;
+		case	'd':
+			iChoose = atol(optarg);
+			iNeed = nGetStepNeed(iChoose);
+			iRet = nTransferStep(&iChoose);
+			if(iRet)
+			{
+				vIBPrint("步骤错误，请输入1~5之间的数字\n");	
+				vPrintFunc(argv[0]);
+				return RC_FAIL;
+			}
+			((TrdCnt *)pGetTrdCnt())->lSetStep = ((TrdCnt *)pGetTrdCnt())->lSetStep | iChoose;
+			iAction = iAction | iChoose | iNeed;
+			break;
+		case	't':
+			if(RC_SUCC != lDbsConnect(DBS_BATCH))
+			{
+				vIBPrint("连接数据库失败, err:(%d)(%s)\n", iRet, sDbsError());
+				return ;
+			}
+			vOtherActChk();
+			vDbsDisconnect();
+			vShutDownLog();
+			return RC_SUCC;
+		case	'k':
+			if(RC_SUCC != lDbsConnect(DBS_BATCH))
+			{
+				vIBPrint("连接数据库失败, err:(%d)(%s)\n", iRet, sDbsError());
+				return ;
+			}
+			vSettleTxnChk();
+			vDbsDisconnect();
+			vShutDownLog();
+			return RC_SUCC;
+		case	'v':
+			vIBPrint("%s\n", sGetVersion());			
+			vShutDownLog();
+			return RC_SUCC;
+		default:
+			vPrintFunc(argv[0]);
+			vShutDownLog();
+			return RC_SUCC;
+		}
+	}
+	if(!iAction || (0xc0 == iAction))
+	{
+		vPrintFunc(argv[0]);
+		vShutDownLog();
+		return RC_SUCC;
+	}
+
+	IBPrint("*****************************************************************************************************");
+	IBPrint(sGetVersion());
+	IBPrint("*****************************************************************************************************");
+	IBPUserInfo(IBP_DEBUG, "---------------------begin task--------------------\n");
+	vSetStepNeed(iAction);
+	vCoreRunStep();
+	IBPUserInfo(IBP_DEBUG, "----------------------end task---------------------\n\n");
+	vShutDownLog();
+	return RC_SUCC;
+}

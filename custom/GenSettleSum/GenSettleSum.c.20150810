@@ -1,0 +1,842 @@
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+
+#include "pos_stlm.h"
+#include "DbsDef.h"
+#include "Ibp.h"
+#include "tbl_settle_err_c.h"
+#include "tbl_settle_sum_c.h"
+#include "tbl_settle_txn_c.h"
+#include "tbl_mcht_settle_dtl_c.h"
+#include "tbl_brh_settle_dtl_c.h"
+#include "load.h"
+
+/************************************************************************************/
+/*   函数名：                       结算主函数                                      */
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )                                   */
+/*   功能  ： 完成清算全流程                                                        */
+/*   参数  ： argc (参数个数 -- 输入)                                               */
+/*         ： argv (参数列表 -- 输出)                                               */
+/*            argv[1] --  清算日期(可选)                                            */ 
+/*  返回值 ： 0--  成功                                                             */ 
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+    int		iRet;
+    char	szSettleDate[9], szSettleNum[10];
+   
+    memset(gsLogFile, 0, sizeof(gsLogFile));
+    sprintf(gsLogFile, "GenSettleSum.log");
+
+    /*判断参数个数*/
+    if(argc < 5)
+    {
+        HtLog(ERR_PARAM, "参数个数有误argc[%d].exec:%s stlm_date settle_num bat_id ", 
+			argc, argv[0]);
+        return RC_FAIL;
+    }
+    
+    memset(szSettleDate, 0, sizeof(szSettleDate));
+    memset(szSettleNum, 0, sizeof(szSettleNum));
+
+    memcpy(szSettleDate, argv[1], sizeof(szSettleDate) - 1);
+    memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);
+
+	if(!memcmp(szSettleNum, "TC00", 4))
+	{
+		HtLog(ERR_PARAM, "不支持的业务批次号(%s)", szSettleNum);
+		return RC_FAIL;
+	}
+    
+    /*连接数据库*/
+    iRet = DbsConnect();
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "数据库连接失败sqlcode[%d]",iRet);
+        return RC_FAIL;
+    }
+    
+    iRet = GenSettleSum(szSettleDate, szSettleNum);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "汇总当日(%s)(%s)清算数据失败, err:(%d)\n", szSettleDate, 
+			szSettleNum, iRet);
+        DbsDisconnect();
+        return RC_FAIL;
+    }
+   
+    /*断开数据库*/
+    iRet = DbsDisconnect();
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "数据库断开连接失败, err:(%d)\n", iRet);
+        return RC_FAIL;
+    }
+           
+    return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nSettleActErr(struct tbl_settle_txn_c *pstSettleTxn)				*/
+/*   功能  ： 根据商户清算表生成清算流水表                                          */
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int		nSettleActErr(struct tbl_settle_txn_c *pstSettleTxn, long lType)
+{
+	int		iRet = 0;
+	struct	tbl_settle_err_c	stStlErr;
+
+	memset(&stStlErr, 0, sizeof(stStlErr));
+	stStlErr.do_flag[0] = SETTLE_ERR_NOT_DEAL;
+	stStlErr.err_type[0] = SETTLE_ERR_FAILED;
+	memcpy(stStlErr.id, pstSettleTxn->id, sizeof(stStlErr.id) - 1);
+	memcpy(stStlErr.settle_date, pstSettleTxn->settle_date, sizeof(stStlErr.settle_date) - 1);
+
+	if(SETTLE_MCHT_BRH == pstSettleTxn->settle_flag[0])
+		memcpy(stStlErr.settle_brh_id, pstSettleTxn->settle_brh_id, sizeof(stStlErr.settle_brh_id) - 1);
+	else if(SETTLE_TXN_MCHT == pstSettleTxn->settle_flag[0])
+		memcpy(stStlErr.mcht_no, pstSettleTxn->mcht_no, sizeof(stStlErr.mcht_no) - 1);
+	else
+		;
+
+	memcpy(stStlErr.trace_no, pstSettleTxn->trace_no, sizeof(stStlErr.trace_no) - 1);	
+	stStlErr.settle_acct_type[0] = pstSettleTxn->settle_acct_type[0];
+	memcpy(stStlErr.settle_bank_no, pstSettleTxn->settle_bank_no, sizeof(stStlErr.settle_bank_no) - 1);	
+	memcpy(stStlErr.settle_bank_nm, pstSettleTxn->settle_bank_nm, sizeof(stStlErr.settle_bank_nm) - 1);	
+	memcpy(stStlErr.settle_bank_code, pstSettleTxn->settle_bank_code, sizeof(stStlErr.settle_bank_code) - 1);	
+	memcpy(stStlErr.settle_acct_nm, pstSettleTxn->settle_acct_nm, sizeof(stStlErr.settle_acct_nm) - 1);	
+	memcpy(stStlErr.settle_acct, pstSettleTxn->settle_acct, sizeof(stStlErr.settle_acct) - 1);	
+	stStlErr.settle_amt = pstSettleTxn->settle_amt;
+	memcpy(stStlErr.rec_crt_ts, pstSettleTxn->rec_crt_ts, sizeof(stStlErr.rec_crt_ts) - 1);	
+	memcpy(stStlErr.settle_num, pstSettleTxn->settle_num, sizeof(stStlErr.settle_num) - 1);	
+	memcpy(stStlErr.cups_no, pstSettleTxn->cups_no, sizeof(stStlErr.cups_no) - 1);
+	memcpy(stStlErr.brh, pstSettleTxn->brh, sizeof(stStlErr.brh) - 1);	
+	stStlErr.expand = pstSettleTxn->expand;
+
+   	iRet = Tbl_settle_err_Ins(&stStlErr); 
+   	if(iRet)
+   	{
+        HtLog(ERR_PARAM, "新增入账失败流水失败，err:(%d)(%s)", iRet, DbsError());
+		return RC_FAIL; 
+	}
+
+    //  商户账号差错在本层级更新
+    if(ACCT_INFO_MCHT == lType)
+        return RC_SUCC;
+ 
+	iRet = sql_execute("update tbl_mcht_settle_dtl set result_flag = '%c' where settle_date = '%s' "
+		"and trace_all ='%s'", SETTLE_MCHT_HL_WAITE, pstSettleTxn->settle_date, pstSettleTxn->trace_no);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "更新商户清算流水清算状态失败, err:(%d)(%s)(%s)", iRet, DbsError(), 
+			pstSettleTxn->trace_no);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nInitMchtSettle(struct tbl_settle_txn_c *pstSettleTxn, long lActType) */
+/*   功能  ： 根据商户清算表生成清算流水表                                          */
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */
+/*           -1--  失败                                                             */
+/************************************************************************************/
+long	nInitMchtSettle(struct tbl_settle_txn_c *pstSettleTxn, long lActType, char *pszFlag)
+{
+	int			iRet = 0;
+	dbAcctInfo	stActInfo;
+
+	memset(&stActInfo, 0x00, sizeof(stActInfo));
+	if(lActType == ACCT_INFO_BRH)
+		iRet = lGetAcctInfo(&stActInfo, pstSettleTxn->settle_brh_id, ACCT_INFO_BRH, ACCT_INFO_DEFAULT);
+	else if(lActType == ACCT_INFO_MCHT)
+		iRet = lGetAcctInfo(&stActInfo, pstSettleTxn->mcht_no, ACCT_INFO_MCHT, ACCT_INFO_DEFAULT);
+	else
+		iRet = RC_FAIL;
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "(%d)查找机构(%s)/商户(%s)对应默认账号信息失败，err:(%d)(%s)", lActType, 
+			pstSettleTxn->settle_brh_id, pstSettleTxn->mcht_no, iRet, sGetError());
+		return RC_FAIL; 
+	}
+
+   	pstSettleTxn->result_flag[0] = SETTLE_IN_FLAG_INIT;
+   	memcpy(pstSettleTxn->settle_acct_type, stActInfo.acct_type, sizeof(pstSettleTxn->settle_acct_type)-1);
+   	CommonAllTrim(stActInfo.acct_zbank_no);  
+   	CommonAllTrim(stActInfo.acct_bank_no);  
+	
+   	/* 开户行总行行号 */
+   	memcpy(pstSettleTxn->res, stActInfo.acct_bank_no, sizeof(stActInfo.acct_bank_no)-1);
+   	memcpy(pstSettleTxn->settle_netpay_no, stActInfo.acct_net_no, sizeof(pstSettleTxn->settle_netpay_no)-1);
+   	memcpy(pstSettleTxn->settle_netpay_name, stActInfo.acct_bank_nm, sizeof(pstSettleTxn->settle_netpay_name)-1);
+   	CommonAllTrim(pstSettleTxn->res);  
+   	CommonAllTrim(pstSettleTxn->settle_netpay_no);  
+   	CommonAllTrim(pstSettleTxn->settle_netpay_name);  
+	/* 支行号 */
+	memcpy(pstSettleTxn->settle_bank_no, stActInfo.acct_zbank_no, sizeof(pstSettleTxn->settle_bank_no)-1);
+/*
+	if(IBP_LARGE_AMT <= stMchtDtl.settle_amt)	// 大额	开户行支行号
+   		memcpy(pstSettleTxn->settle_bank_no, stActInfo.acct_zbank_no, sizeof(pstSettleTxn->settle_bank_no)-1);
+	else	// 小于5W 2中汇路   小额 跟网银互联
+	{
+		memset(&stZBankInfo, 0, sizeof(stZBankInfo));
+		iRet = Tbl_zbank_info_Sel(&stZBankInfo, "zbank_no = '%c'", stActInfo.acct_zbank_no);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "Tbl_zbank_info error iRet(%d)(%s),zbank[%s]", iRet, DbsError(), stActInfo.acct_zbank_no);
+			return -1; 
+		}
+		CommonAllTrim(stZBankInfo.netpay_no);
+			
+		if(!strlen(stZBankInfo.netpay_no))	//	没有网银支付号， 采用小额付款
+			memcpy(pstSettleTxn->settle_bank_no, stActInfo.acct_zbank_no, sizeof(pstSettleTxn->settle_bank_no)-1);
+		else							// 可以用网银转账，银行号为总行号
+			memcpy(pstSettleTxn->settle_bank_no, stActInfo.acct_bank_no, sizeof(pstSettleTxn->settle_bank_no)-1);
+	}
+	CommonAllTrim(pstSettleTxn->settle_bank_no);
+*/
+
+	/* 开户行支行名称 */
+	memcpy(pstSettleTxn->settle_bank_nm, stActInfo.acct_zbank_nm, sizeof(pstSettleTxn->settle_bank_nm)-1);      
+	/* 账户开户支行地址 */
+	memcpy(pstSettleTxn->settle_bank_addr, stActInfo.acct_zbank_addr, sizeof(pstSettleTxn->settle_bank_addr)-1);
+	/* 账户开户支行地区号 */
+   	memcpy(pstSettleTxn->settle_bank_code, stActInfo.acct_zbank_code, sizeof(pstSettleTxn->settle_bank_code)-1);
+   	/* 账户名称  settle_acct_nm */
+   	memcpy(pstSettleTxn->settle_acct_nm, stActInfo.acct_nm, sizeof(pstSettleTxn->settle_acct_nm)-1);
+   	/* 账号 */
+   	memcpy(pstSettleTxn->settle_acct, stActInfo.acct_no, sizeof(pstSettleTxn->settle_acct)-1);
+	
+	//  用来重置状态， 用于机构接入账号异常后 导致下一个商户状态异常
+	pszFlag[0] = SETTLE_MCHT_NOT_DEAL;
+   	CommonGetCurrentTime(pstSettleTxn->rec_crt_ts);
+	if(!strlen(stActInfo.acct_no) || !strlen(stActInfo.acct_nm) || !strlen(stActInfo.acct_bank_no) || 
+		!strlen(stActInfo.acct_zbank_no) || !strlen(stActInfo.acct_union_no))
+	{
+		pszFlag[0] = SETTLE_MCHT_HL_WAITE;
+
+		HtLog(NML_PARAM, "机构(%s)/商户(%s)对应默认账号信息异常, 作为入账错误处理!", 
+			pstSettleTxn->settle_brh_id, pstSettleTxn->mcht_no);
+		iRet = nSettleActErr(pstSettleTxn, lActType);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "账号缺失信息放入差错表失败, 机构号(%s)/商户(%s) (%d)!", pstSettleTxn->settle_brh_id, 
+				pstSettleTxn->mcht_no, iRet);
+			return RC_FAIL;
+		}
+
+		pstSettleTxn->result_flag[0] = SETTLE_IN_FLAG_FAIL;
+	}
+
+   	iRet = Tbl_settle_txn_Ins(pstSettleTxn); 
+   	if(iRet)
+   	{
+        HtLog(ERR_PARAM, "新增清算流水失败，err:(%d)(%s)(%d), 商户号(%s)接入机构号(%s), id(%s)", iRet, 
+			DbsError(), lActType, pstSettleTxn->mcht_no, pstSettleTxn->settle_brh_id, pstSettleTxn->id);
+		return RC_FAIL; 
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGenMchtSettleTxn(char *pszSettleDate)                             */
+/*   功能  ： 根据商户清算表生成清算流水表                                          */
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int nGenMchtSettleTxn(char *pszSettleDate, char *pszSettleNum)
+{
+    char	szNum[10];
+    int		iRet, iCount = 0, iMchtNum = 0, iInit = 0;
+	long	lChkRes = 0, lRecord = 0;
+    struct tbl_mcht_settle_dtl_c stMchtDtl;    
+    struct tbl_settle_txn_c      stSettleTxn;
+    
+    memset(&stMchtDtl, 0, sizeof(stMchtDtl));
+    iRet = Tbl_mcht_settle_dtl_Sel(&stMchtDtl, "id = (select max(id) from tbl_mcht_settle_dtl "
+		"where settle_date = '%s' and settle_num = '%s')", pszSettleDate, pszSettleNum);
+    if(0 != iRet && DBS_NOTFOUND != iRet)
+    {
+        HtLog(ERR_PARAM, "查询商户清算流水表最大序号失败， err:(%d)(%s)", iRet, DbsError());
+        return RC_FAIL;
+    }
+    else if(DBS_NOTFOUND == iRet)
+        iMchtNum = 0;
+    else
+    {
+	//	机构流水号 分进程跑, 流水号13位
+		CommonAllTrim(stMchtDtl.trace_all);
+        memset(szNum, 0, sizeof(szNum));
+        memcpy(szNum, stMchtDtl.trace_all + 7, 6);
+        iMchtNum = atol(szNum);
+    }
+
+	iRet = Tbl_mcht_settle_dtl_Dec_Sel("result_flag ='%c' and settle_date ='%s' and "
+		"settle_num = '%s' order by brh", SETTLE_MCHT_NOT_DEAL, pszSettleDate, pszSettleNum);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "查询周期(%s)(%s)清算流水失败，err:(%d)(%s)", pszSettleDate, 
+			pszSettleNum, iRet, DbsError());
+        return RC_FAIL;
+    }
+
+	iInit = 0;
+    while(1)
+    {
+        memset(&stMchtDtl, 0, sizeof(stMchtDtl));
+        iRet = Tbl_mcht_settle_dtl_Fet_Sel(&stMchtDtl);
+        if(iRet == DBS_NOTFOUND)
+        {
+            HtLog(NML_PARAM, "处理商户清算流水完成！");
+            Tbl_mcht_settle_dtl_Clo_Sel();
+            break;
+        }
+        else if(iRet)
+        {
+            HtLog(ERR_PARAM, "查询周期(%s)(%s)清算流水失败，iRet(%d)(%s)", pszSettleDate, 
+				pszSettleNum, iRet, DbsError());
+            Tbl_mcht_settle_dtl_Clo_Sel();
+            return RC_FAIL;  
+        }
+
+		lRecord ++;
+        CommonAllTrim(stMchtDtl.ibox42);  
+        CommonAllTrim(stMchtDtl.brh);  
+		iRet = lIsMchtSettle(stMchtDtl.brh, &lChkRes);
+        if(iRet)
+        {
+            HtLog(ERR_PARAM, "检查商户是否是机构接入失败, err:(%d)(%s), mcht(%s)(%s)", iRet, 
+				sGetError(), stMchtDtl.ibox42, stMchtDtl.brh);
+            Tbl_mcht_settle_dtl_Clo_Sel();
+            return RC_FAIL; 
+        }
+
+       	if(0 == iInit && RC_SUCC == lChkRes)
+       	{
+           	iInit = 1;
+       		iMchtNum ++;
+           	iCount = 0;
+           	memset(&stSettleTxn, 0x00, sizeof(stSettleTxn));
+           	memcpy(stSettleTxn.id, stMchtDtl.id, sizeof(stSettleTxn.id)-1);
+           	memcpy(stSettleTxn.settle_brh_id, stMchtDtl.brh, sizeof(stSettleTxn.settle_brh_id) - 1);
+           	memcpy(stSettleTxn.settle_date, pszSettleDate, sizeof(stSettleTxn.settle_date)-1);
+           	memcpy(stSettleTxn.brh, stMchtDtl.brh, sizeof(stSettleTxn.brh)-1);
+			memcpy(stSettleTxn.cups_no, stMchtDtl.cups_no, sizeof(stSettleTxn.cups_no)-1);
+			stSettleTxn.expand = stMchtDtl.expand;
+			stSettleTxn.settle_flag[0] = SETTLE_MCHT_BRH;
+
+			//  机构接入新生成流水号
+			if(!memcmp(pszSettleNum, "TN00", 4))
+           		snprintf(stMchtDtl.trace_all, sizeof(stMchtDtl.trace_all), "8%5s%06d", pszSettleDate + 3, iMchtNum);
+			else
+           		snprintf(stMchtDtl.trace_all, sizeof(stMchtDtl.trace_all), "%c%5s%06d", pszSettleNum[3], pszSettleDate + 3, iMchtNum);
+
+			memcpy(stSettleTxn.trace_no, stMchtDtl.trace_all, sizeof(stSettleTxn.trace_no)-1);
+ 			memcpy(stSettleTxn.trace_rev, stMchtDtl.trace_all, sizeof(stSettleTxn.trace_rev)-1);
+			memcpy(stSettleTxn.batch_no, stMchtDtl.batch_no, sizeof(stSettleTxn.batch_no)-1);
+			memcpy(stSettleTxn.settle_num, pszSettleNum, sizeof(stSettleTxn.settle_num)-1);
+			strcpy(stSettleTxn.remark, "机构接入清算");
+		}
+
+		// 新的商户 并且是机构汇总的
+		if(memcmp(stSettleTxn.settle_brh_id, stMchtDtl.brh, strlen(stSettleTxn.settle_brh_id)) && iCount > 0)
+		{
+           	iCount = 0;
+			iRet = nInitMchtSettle(&stSettleTxn, ACCT_INFO_BRH, stMchtDtl.result_flag);
+			if(iRet)
+			{
+				HtLog(ERR_PARAM, "初始化商户接入清算机构流水失败, err:(%d), 接入清算机构(%s)(%s)", iRet, 
+					stSettleTxn.settle_brh_id, stSettleTxn.trace_no);
+           		Tbl_mcht_settle_dtl_Clo_Sel();
+  				return RC_FAIL;
+			}
+
+    		if(lRecord > 500)
+    		{
+        		DbsCommit();
+        		lRecord = 0;
+    		}
+
+			if(RC_SUCC == lChkRes)
+			{
+       			iMchtNum ++;
+           		memset(&stSettleTxn, 0x00, sizeof(stSettleTxn));
+           		memcpy(stSettleTxn.id, stMchtDtl.id, sizeof(stSettleTxn.id)-1);
+           		memcpy(stSettleTxn.settle_brh_id, stMchtDtl.brh, sizeof(stSettleTxn.settle_brh_id) - 1);
+           		memcpy(stSettleTxn.settle_date, pszSettleDate, sizeof(stSettleTxn.settle_date)-1);
+           		memcpy(stSettleTxn.brh, stMchtDtl.brh, sizeof(stSettleTxn.brh)-1);
+				memcpy(stSettleTxn.cups_no, stMchtDtl.cups_no, sizeof(stSettleTxn.cups_no)-1);
+				stSettleTxn.expand = stMchtDtl.expand;
+				stSettleTxn.settle_flag[0] = SETTLE_MCHT_BRH;
+
+				//  机构接入新生成流水号
+				if(!memcmp(pszSettleNum, "TN00", 4))
+           			snprintf(stMchtDtl.trace_all, sizeof(stMchtDtl.trace_all), "8%5s%06d", pszSettleDate + 3, iMchtNum);
+				else
+           			snprintf(stMchtDtl.trace_all, sizeof(stMchtDtl.trace_all), "%c%5s%06d", pszSettleNum[3], pszSettleDate + 3, iMchtNum);
+
+   	       		//	应业管清算要求, 将主和备用流水号填写一样
+				memcpy(stSettleTxn.trace_no, stMchtDtl.trace_all, sizeof(stSettleTxn.trace_no)-1);
+ 				memcpy(stSettleTxn.trace_rev, stMchtDtl.trace_all, sizeof(stSettleTxn.trace_rev)-1);
+				memcpy(stSettleTxn.batch_no, stMchtDtl.batch_no, sizeof(stSettleTxn.batch_no)-1);
+				memcpy(stSettleTxn.settle_num, pszSettleNum, sizeof(stSettleTxn.settle_num)-1);
+				strcpy(stSettleTxn.remark, "机构接入清算");
+			}
+		}
+
+		if(RC_FAIL == lChkRes)     //  直接清算给商户的
+		{
+			iInit = 0;
+			memset(&stSettleTxn, 0x00, sizeof(stSettleTxn));
+			memcpy(stSettleTxn.id, stMchtDtl.id, sizeof(stSettleTxn.id)-1);
+			memcpy(stSettleTxn.mcht_no, stMchtDtl.ibox42, sizeof(stSettleTxn.mcht_no) - 1);
+			memcpy(stSettleTxn.settle_date, pszSettleDate, sizeof(stSettleTxn.settle_date)-1);
+			memcpy(stSettleTxn.brh, stMchtDtl.brh, sizeof(stSettleTxn.brh)-1);
+			memcpy(stSettleTxn.cups_no, stMchtDtl.cups_no, sizeof(stSettleTxn.cups_no)-1);
+			stSettleTxn.expand = stMchtDtl.expand;
+			stSettleTxn.settle_flag[0] = SETTLE_TXN_MCHT;
+			// 	应业管清算要求, 将主和备用流水号填写一样
+ 			memcpy(stSettleTxn.trace_no, stMchtDtl.trace_no, sizeof(stSettleTxn.trace_no)-1);
+			memcpy(stSettleTxn.trace_rev, stMchtDtl.trace_no, sizeof(stSettleTxn.trace_rev)-1);
+			memcpy(stSettleTxn.batch_no, stMchtDtl.batch_no, sizeof(stSettleTxn.batch_no)-1);
+			memcpy(stSettleTxn.settle_num, pszSettleNum, sizeof(stSettleTxn.settle_num)-1);
+   			stSettleTxn.settle_amt = stMchtDtl.settle_amt;
+   			strcpy(stSettleTxn.remark, "商户清算");
+
+			iRet = nInitMchtSettle(&stSettleTxn, ACCT_INFO_MCHT, stMchtDtl.result_flag);
+			if(iRet)
+			{
+				HtLog(ERR_PARAM, "初始化商户清算流水失败, err:(%d), 商户号(%s)(%s)", iRet, 
+					stSettleTxn.mcht_no, stSettleTxn.trace_no);
+           		Tbl_mcht_settle_dtl_Clo_Sel();
+  				return RC_FAIL;
+			}
+
+    		if(lRecord > 500)
+    		{
+        		DbsCommit();
+        		lRecord = 0;
+    		}
+		}
+		else		//	清算给机构的金额和笔数汇总
+		{
+			stSettleTxn.settle_amt += stMchtDtl.settle_amt;
+			iCount ++;
+		}
+
+		CommonGetCurrentTime(stMchtDtl.rec_upd_ts);
+ 		iRet = sql_execute("update tbl_mcht_settle_dtl set trace_all = '%s', rec_upd_ts = '%s' where rowid = '%s' ",
+			stSettleTxn.trace_no, stMchtDtl.rec_upd_ts, stMchtDtl.rowid);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "更新清算商户流水失败，err:(%d)(%s), mcht(%s)", iRet, DbsError(), stSettleTxn.mcht_no);
+    		Tbl_mcht_settle_dtl_Clo_Sel();
+			return RC_FAIL;
+		}
+
+        //  对单个商户 类 账号有异常的处理
+        if(SETTLE_MCHT_NOT_DEAL != stMchtDtl.result_flag[0] && RC_FAIL == lChkRes)
+		{
+			iRet = sql_execute("update tbl_mcht_settle_dtl set result_flag = '%c' where id = '%s'", 
+				stMchtDtl.result_flag[0], stMchtDtl.id); 
+			if(iRet)
+			{
+				HtLog(ERR_PARAM, "更新商户清算流水清算状态失败, err:(%d)(%s)(%s)", iRet, DbsError(), stSettleTxn.trace_no);
+				return RC_FAIL;
+			}
+		}
+    }
+
+	if(iCount > 0)
+	{
+		iRet = nInitMchtSettle(&stSettleTxn, ACCT_INFO_BRH, stMchtDtl.result_flag);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "初始化商户接入清算机构流水失败, err:(%d), 接入清算机构(%s)", iRet, 
+				stSettleTxn.settle_brh_id);
+  			return RC_FAIL;
+		}
+	}
+
+    return RC_SUCC; 
+}
+
+/************************************************************************************/
+/*   声明  ： int nInitBrhSettle(tbl_settle_txn_c *pstSettleTxn)                    */
+/*   功能  ： 初始化一笔清算流水表的记录                                            */
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int nInitBrhSettle(struct tbl_settle_txn_c *pstSettleTxn)
+{
+    int    iRet = 0;
+//	struct   tbl_acct_info_c       stActInfo;
+	dbAcctInfo		stActInfo;    
+
+    memset(&stActInfo, 0x00, sizeof(stActInfo));
+	iRet = lGetAcctInfo(&stActInfo, pstSettleTxn->settle_brh_id, ACCT_INFO_BRH, ACCT_INFO_DEFAULT);
+//    iRet = Tbl_acct_info_Sel(&stActInfo, "app_type = %d  and app_id = '%s' and acct_flag = '%c' and acct_default = %d", 
+//				ACCT_INFO_BRH, pstSettleTxn->settle_brh_id, ACCT_INFO_ENABLE, ACCT_INFO_DEFAULT);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "Tbl_acct_info error iRet(%d)(%s),brnno[%s]", iRet, sGetError(), pstSettleTxn->settle_brh_id);
+        return RC_FAIL;
+    }
+
+    pstSettleTxn->result_flag[0] = SETTLE_IN_FLAG_INIT;
+    memcpy(pstSettleTxn->settle_acct_type, stActInfo.acct_type, sizeof(pstSettleTxn->settle_acct_type)-1);
+
+    /* 开户行总行行号 */
+    memcpy(pstSettleTxn->res, stActInfo.acct_bank_no, sizeof(stActInfo.acct_bank_no)-1);
+    CommonAllTrim(pstSettleTxn->res);
+    memcpy(pstSettleTxn->settle_netpay_no, stActInfo.acct_net_no, sizeof(pstSettleTxn->settle_netpay_no)-1);
+    memcpy(pstSettleTxn->settle_netpay_name, stActInfo.acct_bank_nm, sizeof(pstSettleTxn->settle_netpay_name)-1);
+    CommonAllTrim(pstSettleTxn->settle_netpay_no);
+    CommonAllTrim(pstSettleTxn->settle_netpay_name);
+
+	/* 支行号 */
+    memcpy(pstSettleTxn->settle_bank_no, stActInfo.acct_zbank_no, sizeof(pstSettleTxn->settle_bank_no)-1);
+    CommonAllTrim(pstSettleTxn->settle_bank_no);
+
+    memcpy(pstSettleTxn->settle_bank_nm, stActInfo.acct_zbank_nm, sizeof(pstSettleTxn->settle_bank_nm)-1);
+    memcpy(pstSettleTxn->settle_bank_addr, stActInfo.acct_zbank_addr, sizeof(pstSettleTxn->settle_bank_addr)-1);
+    memcpy(pstSettleTxn->settle_bank_code, stActInfo.acct_zbank_code, sizeof(pstSettleTxn->settle_bank_code)-1);
+    memcpy(pstSettleTxn->settle_acct_nm, stActInfo.acct_nm, sizeof(pstSettleTxn->settle_acct_nm)-1);
+    memcpy(pstSettleTxn->settle_acct, stActInfo.acct_no, sizeof(pstSettleTxn->settle_acct)-1);
+
+    strcpy(pstSettleTxn->remark, "机构清算");
+    CommonGetCurrentTime(pstSettleTxn->rec_crt_ts);
+    iRet = Tbl_settle_txn_Ins(pstSettleTxn); 
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "新增清算流水失败，err:(%d)(%s), 机构号(%s)", iRet, DbsError(), 
+			pstSettleTxn->settle_brh_id);
+		return RC_FAIL; 
+    }
+    
+    return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int GenBrhSettleTxn(char *pszSettleDate)                              */
+/*   功能  ： 根据机构清算表生成清算流水表                                          */
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int GenBrhSettleTxn(char *psStlmDate, char *pszSettleNum)
+{
+    int      iRet, iInit = 0, iCount = 0, iBrhNum = 0;    
+    char     szNum[10], szTraceAll[13];
+    struct   tbl_brh_settle_dtl_c  stBrhStlDtl;
+    struct   tbl_settle_txn_c      stSettleTxn;
+    
+    // 获取当日唯一序号
+    memset(&stBrhStlDtl, 0x00, sizeof(stBrhStlDtl));
+    iRet = Tbl_brh_settle_dtl_Sel(&stBrhStlDtl, "id = (select max(id) from tbl_brh_settle_dtl "
+		"where settle_date = '%s' and settle_num = '%s' and substr(id,1,1) = '9' )", 
+		psStlmDate, pszSettleNum);
+    if(0 != iRet && DBS_NOTFOUND != iRet)
+    {
+         HtLog(ERR_PARAM, "查询机构清算表最大流水序号失败, err:(%d)(%s)", iRet, DbsError());
+         return RC_FAIL;
+    }
+    else if(DBS_NOTFOUND == iRet)
+        iBrhNum = 0;
+    else
+    {
+	//	机构流水号未 分进程跑, 流水号12位
+		CommonAllTrim(stBrhStlDtl.trace_all);
+        memset(szNum, 0, sizeof(szNum));
+        memcpy(szNum, stBrhStlDtl.trace_all + 6, 6);
+        iBrhNum = atol(szNum);
+    }
+
+    iRet = sql_execute("update tbl_brh_settle_dtl set id = id where result_flag = '%c' and "
+		"settle_date <= '%s' and settle_num = '%s'", SETTLE_BRH_OK_SETTLE, psStlmDate, pszSettleNum);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "锁表tbl_brh_settle_dtl记录失败，iRet(%d)(%s)", iRet, DbsError());
+        return RC_FAIL;
+    }
+	
+    // 汇总相同代理商的批次 mdf 20140415 代理商几个月清算一下的情况
+    iRet = Tbl_brh_settle_dtl_Dec_Sel("result_flag='%c' and settle_date <= '%s' and settle_num = '%s' order by "
+		"settle_brh_id", SETTLE_BRH_OK_SETTLE, psStlmDate, pszSettleNum);
+    if(iRet)
+    {
+         HtLog(ERR_PARAM, "查询机构清算流水失败，err:(%d)(%s)", iRet, DbsError());
+         return RC_FAIL;
+    }
+    
+    while(1)
+    {
+        memset(&stBrhStlDtl, 0, sizeof(stBrhStlDtl));
+        iRet = Tbl_brh_settle_dtl_Fet_Sel(&stBrhStlDtl);
+        if(iRet == DBS_NOTFOUND)
+        {
+            HtLog(NML_PARAM, "处理机构清算流水完成!");
+            Tbl_brh_settle_dtl_Clo_Sel();
+            break;
+        }
+        else if(iRet)
+        {
+            HtLog(ERR_PARAM, "查询机构清算流水失败, err:(%d)(%s)", iRet, DbsError(), psStlmDate);
+            Tbl_brh_settle_dtl_Clo_Sel();
+            return RC_FAIL;
+        }
+        
+        CommonAllTrim(stBrhStlDtl.settle_brh_id); 
+        if(0 == iInit)
+        {
+            iInit ++;
+            iBrhNum ++;     
+            iCount = 0;
+            memset(&stSettleTxn, 0x00, sizeof(struct tbl_settle_txn_c));
+            memcpy(stSettleTxn.id, stBrhStlDtl.id, sizeof(stSettleTxn.id)-1);
+            memcpy(stSettleTxn.settle_brh_id, stBrhStlDtl.settle_brh_id, sizeof(stSettleTxn.settle_brh_id) - 1);
+            memcpy(stSettleTxn.settle_date, psStlmDate, sizeof(stSettleTxn.settle_date)-1);
+			memcpy(stSettleTxn.cups_no, IBP_COM_CUPSNO, 4);
+        	memcpy(stSettleTxn.brh, stBrhStlDtl.brh, sizeof(stSettleTxn.brh)-1);
+
+            // 第二跟踪号
+            snprintf(stBrhStlDtl.trace_all, sizeof(stBrhStlDtl.trace_all), "9%5s%06d", psStlmDate + 3, iBrhNum);
+
+            // 第一跟踪号
+            memcpy(stSettleTxn.trace_no, stBrhStlDtl.trace_all, sizeof(stSettleTxn.trace_no)-1);
+			memcpy(stSettleTxn.trace_rev, stBrhStlDtl.trace_all, sizeof(stSettleTxn.trace_no)-1);
+
+            memcpy(stSettleTxn.batch_no, stBrhStlDtl.batch_no, sizeof(stSettleTxn.batch_no)-1);
+			stSettleTxn.settle_flag[0] = SETTLE_TXN_BRH;
+        }
+
+        // 新的商户
+        if(memcmp(stSettleTxn.settle_brh_id, stBrhStlDtl.settle_brh_id, strlen(stSettleTxn.settle_brh_id)))
+        {
+			memcpy(stSettleTxn.settle_num, pszSettleNum, sizeof(stSettleTxn.settle_num)-1);
+            iRet = nInitBrhSettle(&stSettleTxn);
+            if(iRet)
+            {
+                HtLog(ERR_PARAM, "初始化机构清算流水失败, err:(%d)机构号(%s)", iRet, stSettleTxn.settle_brh_id);
+                Tbl_brh_settle_dtl_Clo_Sel();
+                return RC_FAIL; 
+            }
+
+            iBrhNum ++;     
+            iCount = 0;
+            memset(&stSettleTxn, 0x00, sizeof(struct tbl_settle_txn_c));
+            memcpy(stSettleTxn.id, stBrhStlDtl.id, sizeof(stSettleTxn.id)-1);
+            memcpy(stSettleTxn.settle_brh_id, stBrhStlDtl.settle_brh_id, sizeof(stSettleTxn.settle_brh_id) - 1);
+            //mdf 20140424
+            //memcpy(stSettleTxn.settle_date, stBrhStlDtl.settle_date, sizeof(stSettleTxn.settle_date)-1);
+            memcpy(stSettleTxn.settle_date, psStlmDate, sizeof(stSettleTxn.settle_date)-1);
+        	memcpy(stSettleTxn.brh, stBrhStlDtl.brh, sizeof(stSettleTxn.brh)-1);
+			memcpy(stSettleTxn.cups_no, IBP_COM_CUPSNO, 4);
+			stSettleTxn.settle_flag[0] = SETTLE_TXN_BRH;
+
+            // 第二跟踪号
+            snprintf(stBrhStlDtl.trace_all, sizeof(stBrhStlDtl.trace_all), "9%5s%06d", psStlmDate + 3, iBrhNum);
+
+            // 第一跟踪号
+            memcpy(stSettleTxn.trace_no, stBrhStlDtl.trace_all, sizeof(stSettleTxn.trace_no)-1);
+            memcpy(stSettleTxn.trace_rev, stBrhStlDtl.trace_all, sizeof(stSettleTxn.trace_no)-1);
+
+            memcpy(stSettleTxn.batch_no, stBrhStlDtl.batch_no, sizeof(stSettleTxn.batch_no)-1);
+        }
+        stSettleTxn.settle_amt += stBrhStlDtl.settle_amt;
+        iCount ++;
+         
+        CommonGetCurrentTime(stBrhStlDtl.rec_upd_ts);
+        // mdf 20140415
+        //iRet = sql_execute("update tbl_brh_settle_dtl set trace_all = '%s', rec_upd_ts = '%s' where rowid = '%s' ",
+        iRet = sql_execute("update tbl_brh_settle_dtl set trace_all = '%s', settle_date = '%s', result_flag='%c', "
+			"rec_upd_ts = '%s' where rowid = '%s' ", stSettleTxn.trace_no, psStlmDate, SETTLE_BRH_NOT_DEAL, 
+			stBrhStlDtl.rec_upd_ts, stBrhStlDtl.rowid);
+        if(iRet)
+        {
+            HtLog(ERR_PARAM, "更新机构清算流水信息失败，err:(%d)(%s)机构号[%s]", iRet, DbsError(), 
+				stSettleTxn.settle_brh_id);
+            Tbl_brh_settle_dtl_Clo_Sel();
+            return RC_FAIL; 
+        }
+   } 
+    
+   if(0 != iCount)
+   {
+		memcpy(stSettleTxn.settle_num, pszSettleNum, sizeof(stSettleTxn.settle_num)-1);
+		iRet = nInitBrhSettle(&stSettleTxn);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "初始化机构清算流水失败, err:(%d)机构号(%s)", iRet, stSettleTxn.settle_brh_id);
+			return RC_FAIL; 
+		}
+   }
+
+   return RC_SUCC; 
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetSumByBrh(char *psStlmDate, char *pszStlNum)                  */
+/*   功能  ： 按机构生成汇总流水													*/
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int		nGetSumByBrh(char *psStlmDate, char *pszStlNum)
+{
+	int		iRet = 0, iInit = 0;
+    struct tbl_settle_sum_c       stSettleSum;
+    struct tbl_settle_txn_c       stSettleTxn;
+
+	iRet = sql_execute("delete from tbl_settle_sum where settle_date = '%s' and settle_num = '%s'", 
+			psStlmDate, pszStlNum);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "清理当日汇总冗余数据失败，err:iRet(%d)(%s)", iRet, DbsError());
+        return RC_FAIL;
+    }
+
+    memset(&stSettleSum, 0x00, sizeof(stSettleSum));
+	iRet = Tbl_settle_txn_Dec_Sel("settle_date = '%s' and settle_num = '%s' and result_flag = '%c' "
+		"order by brh", psStlmDate, pszStlNum, SETTLE_IN_FLAG_INIT);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "查询清算流水记录失败，err:iRet(%d)(%s)", iRet, DbsError());
+        return RC_FAIL;
+    }
+
+	while(1)
+	{
+    	memset(&stSettleTxn, 0, sizeof(stSettleTxn));
+        iRet = Tbl_settle_txn_Fet_Sel(&stSettleTxn);
+        if(iRet == DBS_NOTFOUND)
+        {
+            HtLog(NML_PARAM, "处理清算流水按机构汇总完成!");
+            Tbl_settle_txn_Clo_Sel();
+            break;
+        }
+        else if(iRet)
+        {
+            HtLog(ERR_PARAM, "查询清算流水记录失败，err:iRet(%d)(%s)", iRet, DbsError());
+            Tbl_settle_txn_Clo_Sel();
+            return RC_FAIL;
+        }
+        
+        CommonAllTrim(stSettleTxn.brh); 
+        if(0 == iInit)
+        {
+            iInit ++;
+            memset(&stSettleSum, 0x00, sizeof(stSettleSum));
+			memcpy(stSettleSum.brh, stSettleTxn.brh, 3);
+			snprintf(stSettleSum.id, sizeof(stSettleSum.id), "%s%s%s", psStlmDate, pszStlNum, stSettleSum.brh);
+    		memcpy(stSettleSum.settle_date, psStlmDate, sizeof(stSettleSum.settle_date) - 1);
+    		memcpy(stSettleSum.settle_num, pszStlNum, sizeof(stSettleSum.settle_num) - 1);
+    		stSettleSum.do_flag[0] = SETTLE_SUM_IN_INIT;
+    		strcpy(stSettleSum.settle_mode, "0");
+    		CommonGetCurrentTime(stSettleSum.rec_crt_ts);
+        }
+
+        // 新的机构
+        if(memcmp(stSettleSum.brh, stSettleTxn.brh, strlen(stSettleSum.brh)))
+        {
+    		iRet = Tbl_settle_sum_Ins(&stSettleSum);
+    		if(iRet)
+    		{
+       			HtLog(ERR_PARAM, "新增机构汇总清算数据失败, err:(%d)(%s)", iRet, DbsError());
+        		return RC_FAIL;
+    		}
+
+            memset(&stSettleSum, 0x00, sizeof(stSettleSum));
+			memcpy(stSettleSum.brh, stSettleTxn.brh, 3);
+			snprintf(stSettleSum.id, sizeof(stSettleSum.id), "%s%s%s", psStlmDate, pszStlNum, stSettleSum.brh);
+    		memcpy(stSettleSum.settle_date, psStlmDate, sizeof(stSettleSum.settle_date) - 1);
+    		memcpy(stSettleSum.settle_num, pszStlNum, sizeof(stSettleSum.settle_num) - 1);
+    		stSettleSum.do_flag[0] = SETTLE_SUM_IN_INIT;
+    		strcpy(stSettleSum.settle_mode, "0");
+    		CommonGetCurrentTime(stSettleSum.rec_crt_ts);
+        }
+        stSettleSum.total_amt += stSettleTxn.settle_amt;
+		stSettleSum.total_num ++;
+	}
+	if(0 != stSettleSum.total_num)
+	{
+    	/*** 商户清算信息 ***/
+    	iRet = Tbl_settle_sum_Ins(&stSettleSum);
+    	if(iRet)
+    	{
+			HtLog(ERR_PARAM, "新增机构汇总清算数据失败, err:(%d)(%s)", iRet, DbsError());
+			return RC_FAIL;
+    	}
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int GenSettleSum(char *psStlmDate, char *pszStlNum)                   */
+/*   功能  ： 根据商户和机构清算表生成清算流水表, 清算汇总表                        */
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int GenSettleSum(char *psStlmDate, char *pszStlNum)
+{
+    int  iRet;
+    int  iCount = 0;
+    
+    HtLog(NML_PARAM, "开始汇总(%s)(%s)清算流水数据.", psStlmDate, pszStlNum);
+
+    /*  商户清算表导入流水表*/
+    DbsBegin();
+    iRet = nGenMchtSettleTxn(psStlmDate, pszStlNum);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "对商户清算明细汇总失败, err:(%d)", iRet);
+        DbsRollback();
+        return RC_FAIL;
+    }
+	DbsCommit();
+
+    /*  机构清算表导入流水表*/
+    iRet = GenBrhSettleTxn(psStlmDate, pszStlNum);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "对机构清算明细汇总失败, err:(%d)", iRet);
+        DbsRollback();
+        return RC_FAIL;
+    }
+	DbsCommit();
+
+	//	按照机构生成汇总信息
+	iRet = nGetSumByBrh(psStlmDate, pszStlNum);
+	if(iRet)
+	{
+        HtLog(ERR_PARAM, "按照清算流水生成汇总信息失败, err:(%d)", iRet);
+        DbsRollback();
+        return RC_FAIL;
+	}
+	DbsCommit();
+ 
+    HtLog(NML_PARAM, "汇总(%s)(%s)清算流水数据, 处理完毕!\n", psStlmDate, pszStlNum);
+    return RC_SUCC;
+}
+

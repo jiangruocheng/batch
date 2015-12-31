@@ -1,0 +1,179 @@
+#include	"DbsApi.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"tbl_txn_succ.h"
+#include	"tbl_cup_succ.h"
+#include	"tbl_stlm_err.h"
+#include	"tbl_stlm_succ.h"
+#include	"tbl_algo_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	根据表TBL_TXN_SUCC字段CUP_KEY获取单条记录
+ ****************************************************************************************/
+long	dbGetTxnKey(TTxnSucc *pstTxn, char *pszCupKey)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szKey[50];
+	TTxnSucc	stTxn;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szKey, 0, sizeof(szKey));
+	memset(&stTxn, 0, sizeof(stTxn));
+	memcpy(szKey, pszCupKey, sizeof(szKey) - 1);
+
+	EXEC SQL SELECT * INTO :stTxn FROM TBL_TXN_SUCC WHERE CUP_KEY = :szKey;
+	if(SQLNOTFOUND) return SQLCODE;
+	else if(SQLERR)
+	{
+		vSetErrMsg("SQLCODE(%d)(%s)", SQLCODE, sDbsError());
+		return SQLCODE;
+	}	
+
+	vTrimAlgoDtl(&stTxn);
+	memcpy(pstTxn, &stTxn, sizeof(TTxnSucc));
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	根据表TBL_CUP_SUCC字段CUP_KEY获取单条记录
+ ****************************************************************************************/
+long	dbGetCupKey(TCupSucc *pstCupSucc, char *pszCupKey)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szKey[50];
+	TCupSucc	stCup;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szKey, 0, sizeof(szKey));
+	memset(&stCup, 0, sizeof(stCup));
+	memcpy(szKey, pszCupKey, sizeof(szKey) - 1);
+
+	EXEC SQL SELECT * INTO :stCup FROM TBL_CUP_SUCC WHERE CUP_KEY = :szKey;
+	if(SQLNOTFOUND) return SQLCODE;
+	else if(SQLERR)
+	{
+		vSetErrMsg("SQLCODE(%d)(%s)", SQLCODE, sDbsError());
+		return SQLCODE;
+	}	
+
+	vTrimAlgoDtl(&stCup);
+	memcpy(pstCupSucc, &stCup, sizeof(TCupSucc));
+
+	return RC_SUCC;
+}
+
+/*******************************************************************************
+	根据表TBL_TXN_SUCC字段ID获取单条记录
+ *******************************************************************************/
+long	dbGetTxnSucc(TTxnSucc *pstTxnSucc, char *pszId)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szId[50];
+	TTxnSucc	stTxnSucc;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szId, 0, sizeof(szId));
+	memset(&stTxnSucc, 0, sizeof(TTxnSucc));
+	strcpy(szId, pszId);
+
+	EXEC SQL SELECT * INTO :stTxnSucc FROM TBL_TXN_SUCC WHERE ID = :szId;
+	if(SQLNOTFOUND) return SQLCODE;
+	else if(SQLERR)
+	{
+		vSetErrMsg("SQLCODE(%d)(%s)", SQLCODE, sDbsError());
+		return SQLCODE;
+	}
+
+	vTrimTxnSucc(&stTxnSucc);
+	memcpy(pstTxnSucc, &stTxnSucc, sizeof(TTxnSucc));
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	根据差错表ID获取差错相关信息
+ ****************************************************************************************/
+long	dbGetStlmErr(TStlmErr *pstErr, char *pszId)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szId[50];
+	TStlmErr	stErr;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szId, 0, sizeof(szId));
+	memset(&stErr, 0, sizeof(stErr));
+	memcpy(szId, pszId, sizeof(szId) - 1);
+
+	EXEC SQL SELECT * INTO :stErr FROM TBL_STLM_ERR WHERE ID = :szId;
+	if(SQLNOTFOUND) return SQLCODE;
+	else if(SQLERR)
+	{
+		vSetErrMsg("SQLCODE(%d)(%s)", SQLCODE, sDbsError());
+		return SQLCODE;
+	}	
+
+	vTrimAlgoDtl(&stErr);
+	memcpy(pstErr, &stErr, sizeof(TStlmErr));
+
+	return RC_SUCC;
+}
+
+/*******************************************************************************
+	根据表TBL_STLM_SUCC字段ID获取单条记录
+ *******************************************************************************/
+long	dbGetStlmSucc(TStlmSucc *pstStlmSucc, char *pszId)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szId[50];
+	TStlmSucc   stStlmSucc;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szId, 0, sizeof(szId));
+	memset(&stStlmSucc, 0, sizeof(TStlmSucc));
+	strcpy(szId, pszId);
+
+	EXEC SQL SELECT * INTO :stStlmSucc FROM TBL_STLM_SUCC WHERE ID = :szId;
+	if(SQLNOTFOUND) return SQLCODE;
+	else if(SQLERR)
+	{
+		vSetErrMsg("SQLCODE(%d)(%s)", SQLCODE, sDbsError());
+		return SQLCODE;
+	}
+
+	vTrimStlmSucc(&stStlmSucc);
+	memcpy(pstStlmSucc, &stStlmSucc, sizeof(TStlmSucc));
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	根据ID获取清分表单条记录	
+ ****************************************************************************************/
+long	dbGetAlgoDtl(TAlgoDtl *pstAlgo, char *pszId)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szId[50];
+	TAlgoDtl	stAlgo;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szId, 0, sizeof(szId));
+	memset(&stAlgo, 0, sizeof(stAlgo));
+	strcpy(szId, pszId);
+
+	EXEC SQL SELECT * INTO :stAlgo FROM TBL_ALGO_DTL WHERE ID = :szId;
+	if(SQLNOTFOUND) return SQLCODE;
+	else if(SQLERR)
+	{
+		vSetErrMsg("SQLCODE(%d)(%s)", SQLCODE, sDbsError());
+		return SQLCODE;
+	}	
+
+	vTrimAlgoDtl(&stAlgo);
+	memcpy(pstAlgo, &stAlgo, sizeof(TAlgoDtl));
+
+	return RC_SUCC;
+}

@@ -1,0 +1,487 @@
+#include	"load.h"
+#include	"pos_stlm.h"
+#include	"Ibp.h"
+#include	"DbsApi.h"
+
+//	TBL_MEM_MCHT_CUR 定义在业管的批量表
+EXEC SQL INCLUDE SQLCA;
+
+/****************************************************************************************
+	新增集团商户信息
+ ****************************************************************************************/
+long	lInitBusMcht(char *pszFile, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+   	char	szSettleNum[5], szLine[512], szKind[2];
+	EXEC SQL END DECLARE SECTION;
+	char	szUnFile[512], szCmd[512];
+	FILE	*fp = NULL;
+	long	lRet = 0, lCount = 0;
+
+	memset(szCmd, 0, sizeof(szCmd));
+	memset(szUnFile, 0, sizeof(szUnFile));
+	memset(szKind, 0, sizeof(szKind));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	memcpy(szSettleNum, pszSettleNum, 4);
+	snprintf(szUnFile, sizeof(szUnFile), "%s_tmp", pszFile);
+	snprintf(szCmd, sizeof(szCmd), "sort %s|uniq > %s", pszFile, szUnFile);
+	lRet = system(szCmd);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "调用系统执行命令[%s]失败, err:%s", szCmd, strerror(errno));
+		return RC_FAIL;
+	}
+
+	lRet = lDbsConnect(DBS_BUSS);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL DELETE FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum; 
+	if(SQLCODE && 1403 != SQLCODE)
+	{
+		HtLog(ERR_PARAM, "删除内存商户信息失败, (%d)(%s)", SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+//	if(NULL == (po = popen(szCmd, "r")))		//	不用管道，怕数据大对管道阻塞
+	if(NULL == (fp = fopen(szUnFile, "r")))
+	{
+		HtLog(ERR_PARAM, "打开文件(%s)失败, err:(%s)", szUnFile, strerror(errno));
+		EXEC SQL ROLLBACK WORK;
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+	
+	memset(szLine, 0, sizeof(szLine));
+	while(fgets(szLine, sizeof(szLine), fp))
+	{
+		sTrimAll(szLine);			
+		sTrimCRLF(szLine);			
+		if(!strlen(szLine))
+			continue;
+
+		EXEC SQL INSERT INTO TBL_MEM_MCHT_CUR VALUES(:szLine, :szSettleNum);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "插入内存商户信息失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL ROLLBACK WORK;
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+		memset(szLine, 0, sizeof(szLine));
+		
+		if( ++ lCount % 1000)
+			EXEC SQL COMMIT WORK;
+		
+	}
+	fclose(fp);
+	EXEC SQL COMMIT WORK;
+
+	//	删除临时文件
+	HtLog(NML_PARAM, "删除临时文件:%s", szUnFile);
+	lRet = unlink(szUnFile);
+
+	szKind[0] = 'C';
+
+	EXEC SQL 
+		INSERT INTO TBL_MEM_MCHT_CUR SELECT MCHT_NO IBOX42, :szSettleNum FROM 
+		TBL_MCHT_BASE WHERE SUBSTR(MCHT_KIND, 1, 1) = :szKind AND MCHT_NO NOT IN 
+		(SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "插入内存商户信息失败, (%d)(%s)", SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+	
+	EXEC SQL COMMIT WORK;
+	vDbsDisconnect();
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	加载内存商户信息
+ ****************************************************************************************/
+int		nCreatMemMcht(char *pszFile, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+   	char	szCode[3], szSub[3], szInit[2];
+	char	szFlag[2], szType[2], szDoFlag[2];
+	char	szEtcMcht[26], szCheck[5];
+	EXEC SQL END DECLARE SECTION;
+	long	lRet = 0;
+	FILE	*fp = NULL;
+
+	lRet = lDbsConnect(DBS_BATCH);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "dbsconnect error(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	memset(szSub, 0, sizeof(szSub));
+	memset(szCode, 0, sizeof(szCode));
+	strcpy(szCode, "31");
+	strcpy(szSub, "51");
+
+	HtLog(NML_PARAM, "正在创建本次(%s)(%s)清算内存商户信息表", pszSettleDate, pszSettleNum);
+
+	if(NULL == (fp = fopen(pszFile, "w")))
+	{
+		HtLog(ERR_PARAM, "打开文件(%s)失败, err:(%s)", pszFile, strerror(errno));
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	memset(szInit, 0, sizeof(szInit));
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szType, 0, sizeof(szType));
+	memset(szCheck, 0, sizeof(szCheck));
+	memset(szDoFlag, 0, sizeof(szDoFlag));
+	szDoFlag[0]='9';
+	szFlag[0]='3';
+	szInit[0]='2';
+	szCheck[0] = '5';
+	szType[0]='1';
+	
+	EXEC SQL DECLARE tbl_mem_mcht_tn CURSOR FOR (SELECT IBOX42 FROM TBL_TXN_SUCC WHERE 
+			RESULT_FLAG IN (:szInit, :szCheck)
+			AND TX_SUB_CODE IN (:szCode, :szSub) AND IBOX42 IS NOT NULL
+		UNION ALL
+			SELECT IBOX42 FROM TBL_STLM_ERR WHERE IBOX42 IS NOT NULL GROUP BY IBOX42
+		UNION ALL
+			SELECT IBOX42 FROM TBL_STLM_SUCC WHERE RESULT_FLAG = :szType 
+		UNION ALL
+			SELECT MCHT_NO IBOX42 FROM TBL_SETTLE_ERR WHERE DO_FLAG IN (:szDoFlag, :szFlag, :szType) 
+				AND MCHT_NO IS NOT NULL
+		UNION ALL
+		  SELECT APP_ID IBOX42 FROM TBL_STLM_REPAIR_SUM WHERE APP_TYPE = :szType AND APP_ID IS NOT NULL
+		UNION ALL
+		  SELECT SETTLE_MCHT IBOX42 FROM TBL_ALGO_DTL WHERE MCHT_FLAG = :szType AND SETTLE_MCHT IS NOT NULL);
+
+	EXEC SQL OPEN tbl_mem_mcht_tn;
+	if(SQLCODE)
+	{
+		fclose(fp);
+		HtLog(ERR_PARAM, "插入内存商户信息失败, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szEtcMcht, 0, sizeof(szEtcMcht));
+		EXEC SQL FETCH tbl_mem_mcht_tn INTO :szEtcMcht;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "导出批次(%s)所需的业管数据失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE tbl_mem_mcht_tn;
+			fclose(fp);
+			return RC_FAIL;
+		}
+
+		sTrimAll(szEtcMcht);
+
+		fprintf(fp, "%s\n", szEtcMcht);
+	}
+	EXEC SQL CLOSE tbl_mem_mcht_tn;
+
+	strcpy(szEtcMcht, sGetDbsEnv("MCHT_UP_NO"));
+	sTrimAll(szEtcMcht);
+	fprintf(fp, "%s\n", szEtcMcht);
+	fclose(fp);
+	vDbsDisconnect();
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	加载T+0需要的商户数据
+ ****************************************************************************************/
+int		nLoadMemMcht(char *pszFile, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lDisc = 0;
+   	char	szCode[3], szSub[3], szEtcMcht[26];
+	char	szFlag[2], szType[2], szDoFlag[2], szTemp[2];
+	EXEC SQL END DECLARE SECTION;
+	FILE	*fp = NULL;
+	long	lRet = 0;
+
+	lRet = lDbsConnect(DBS_BATCH);
+	if(lRet)
+	{
+		HtLog(ERR_PARAM, "dbsconnect error(%d)(%s)", lRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szType, 0, sizeof(szType));
+	memset(szTemp, 0, sizeof(szTemp));
+	memset(szDoFlag, 0, sizeof(szDoFlag));
+	memset(szSub, 0, sizeof(szSub));
+	memset(szCode, 0, sizeof(szCode));
+	szDoFlag[0] = '9';
+	szFlag[0]   = '3';
+	szType[0]   = '1';
+	szTemp[0]   = '6';
+	strcpy(szCode, "31");
+	strcpy(szSub, "51");
+
+	HtLog(NML_PARAM, "批次序号:%s 内存商户数据:%s", pszSettleNum, pszFile);
+	if(NULL == (fp = fopen(pszFile, "a+")))
+	{
+		HtLog(ERR_PARAM, "打开文件(%s)失败, err:(%s)", pszFile, strerror(errno));
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	EXEC SQL DECLARE tbl_mem_mcht_t0 CURSOR FOR SELECT NVL(IBOX42, ' ') FROM (SELECT IBOX42 
+		FROM TBL_STLM_ERR WHERE RESULT_FLAG IN (:szType, :szDoFlag, :szTemp)
+	UNION ALL
+		SELECT IBOX42 FROM TBL_STLM_SUCC WHERE RESULT_FLAG = :szType AND DISC_CYCLE = :lDisc
+	UNION ALL
+		SELECT MCHT_NO IBOX42 FROM TBL_SETTLE_ERR WHERE DO_FLAG IN (:szDoFlag, :szFlag, :szType) AND MCHT_NO IS NOT NULL
+	UNION ALL
+		SELECT APP_ID IBOX42 FROM TBL_STLM_REPAIR_SUM WHERE APP_TYPE = :szType AND APP_ID IS NOT NULL)
+	GROUP BY IBOX42;
+
+	EXEC SQL OPEN tbl_mem_mcht_t0;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "插入内存商户信息失败, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szEtcMcht, 0, sizeof(szEtcMcht));
+		EXEC SQL FETCH tbl_mem_mcht_t0 INTO :szEtcMcht;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "导出批次(%s)所需的业管数据失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE tbl_mem_mcht_t0;
+			fclose(fp);
+			return RC_FAIL;
+		}
+
+		sTrimAll(szEtcMcht);
+
+		fprintf(fp, "%s\n", szEtcMcht);
+	}
+	EXEC SQL CLOSE tbl_mem_mcht_t0;
+
+	strcpy(szEtcMcht, sGetDbsEnv("MCHT_UP_NO"));
+	sTrimAll(szEtcMcht);
+	fprintf(fp, "%s\n", szEtcMcht);
+	fclose(fp);
+	vDbsDisconnect();
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	保存子进程函数
+ ****************************************************************************************/
+/*
+long	lSaveProcess(CMList **ppstRoot, long lPid)
+{
+	CMList	*pstList = *ppstRoot;
+
+	pstList = pInsertList(pstList, (void *)&lPid, sizeof(long));
+	if(!pstList)
+	{
+		vDestroyList(pstList);
+		return RC_FAIL;
+	}
+	
+	*ppstRoot = pstList;
+
+	return RC_SUCC;
+}
+*/
+
+/****************************************************************************************
+	保存子进程函数
+ ****************************************************************************************/
+/*
+long	lWaiteProcess(CMList *pstRoot)
+{
+	long	lPid = 0, lStatus = 0, lRet;
+	pid_t	lPr = 0;
+	CMList	*pstNode = pstRoot;
+
+	while(pstNode)
+	{
+		for(memcpy(&lPid, pstNode->pstData, sizeof(lPid));;)
+		{
+			if(-1 == (lPr = waitpid(lPid, (int *)&lStatus, WNOHANG)))
+			{
+				vSetErrMsg("%s", strerror(errno));
+				vDestroyList(pstRoot);
+				pstRoot = NULL;
+				return RC_FAIL;
+			}
+			else if(0 == lPr)
+				continue;
+			else
+				break;
+		}
+
+ 		if(WIFEXITED(lStatus))	//	如果是正常处理退出
+		{
+			if(RC_SUCC != WEXITSTATUS(lStatus))	//	判断退出返回值
+			{
+				vSetErrMsg("进程(%d)处理异常, 请查看日志(%s)", lPid, gsLogFile);
+				vDestroyList(pstRoot);
+				pstRoot = NULL;
+				return RC_FAIL;
+			}
+		}
+		else
+		{
+			vSetErrMsg("子进程异(%d)常退出", lPid);
+			vDestroyList(pstRoot);
+			pstRoot = NULL;
+			return RC_FAIL;
+		}
+		pstNode = pstNode->pstNext;
+	}
+	
+	vDestroyList(pstRoot);
+	pstRoot = NULL;
+
+	return RC_SUCC;
+}
+*/
+
+/****************************************************************************************
+	主函数
+ ****************************************************************************************/
+int		main(int argc, char** argv)
+{
+	long	iRet = 0, lCount = 0;
+	pid_t	lPid = 0;
+	CMList	*pstRoot = NULL;
+	TABLE	table, *pTable = NULL;;
+	char	szSettleDate[15], szSettleNum[5], szFile[512];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	sprintf(gsLogFile, "InitShmData.log");
+
+	//判断参数个数
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memcpy(szSettleDate, argv[1], 8);
+	memcpy(szSettleNum, argv[2], 4);
+
+	HtLog(NML_PARAM, "装载日期(%s)装载批次(%s)", szSettleDate, szSettleNum);
+	//	统计T+N需要装载的商户
+
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "%s/MCHT%s_%s.txt", getenv("POSP_FILE_PATH"),
+		szSettleDate, szSettleNum);
+
+	if(!memcmp(szSettleNum, "TN00", 4) || !memcmp(szSettleNum, "TC00", 4))
+		iRet = nCreatMemMcht(szFile, szSettleDate, szSettleNum);
+	else	//  T+0的装载的卸载T+0的流水完成
+		iRet = nLoadMemMcht(szFile, szSettleDate, szSettleNum);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "加载内存商户信息表失败, err:%d", iRet);
+		return RC_FAIL;
+	}
+
+	//  对C类商户  集团商户加载
+	iRet = lInitBusMcht(szFile, szSettleNum);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "新增集团商户信息失败, err:(%d)", iRet);
+		EXEC SQL COMMIT WORK RELEASE;
+		return RC_FAIL;
+	}
+
+	iRet = lInitTblShm(TYPE_SYSTEM);
+	if(RC_SUCC != iRet)
+		HtLog(NML_PARAM, "将所需的表数据导入内存表中:(%s), 继续处理!", sGetError());
+	else
+		HtLog(NML_PARAM, "清理共享内存ID(%d), Key(0X%08X)", lGetShmId(), yGetShmKey());
+	lDropTables(TABLE_ALL, 0, false);
+
+  	if(RC_SUCC != lBuildSysParam())
+	{
+		fprintf(stderr, "加载内存数据出错, err:%s", sGetError());
+ 		return RC_FAIL;
+	}
+
+	if(RC_SUCC != lGetLoadList(&pTable, (long *)&lCount))
+	{
+ 		fprintf(stdout, "查询装载表列表失败, err:%s\n", sGetError());
+		return RC_FAIL;
+	}
+
+	for(table = 0; table < lCount; table ++)
+	{
+		lPid = fork();
+		if(lPid < 0)
+		{
+			IBPFree(pTable);
+			HtLog(ERR_PARAM, "fork子进程失败, err:(%d)(%s)", errno, strerror(errno));
+			exit(-1);
+		}
+		else if(lPid > 0)
+		{
+			if(RC_SUCC != lSaveProcess(&pstRoot, lPid))
+			{
+				HtLog(ERR_PARAM, "保存子进程Pid(%d)失败!", lPid);
+				return RC_FAIL;
+			}		
+			continue;
+		}
+		else 	//	if (lPid == 0)
+			;
+
+		//	子进程处理逻辑
+		HtLog(NML_PARAM, "进程(%d)处理(%s)", getpid(), sGetTableName(pTable[table]));
+		if(RC_SUCC != lDbsConnect(lGetConnect(pTable[table])))
+		{
+			HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)(%s)", lGetConnect(pTable[table]), 	
+				sGetError(), sDbsError());
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != lCreateTable(szSettleDate, szSettleNum, pTable[table]))
+		{
+			fprintf(stderr, "加载内存数据出错, err:%s\n", sGetError());
+			vDbsDisconnect();
+			return RC_FAIL;
+		}
+
+		vDbsDisconnect();
+		IBPFree(pTable);
+		return RC_SUCC;
+	}
+
+	IBPFree(pTable);
+
+	if(RC_SUCC != lWaiteProcess(pstRoot))
+	{
+		HtLog(ERR_PARAM, "查询等待子进程出错, err:(%s)", sGetError());
+		return RC_FAIL;	
+	}
+
+	return RC_SUCC;
+}

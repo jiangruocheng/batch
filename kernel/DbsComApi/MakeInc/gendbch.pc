@@ -1,0 +1,299 @@
+/****************************************************************************/
+/* 文件名称：makech.c														*/
+/* 功能描述：根据配置文件table_name中的表名生成[表名]_c.h的头文件			*/
+/* 作	者：LZH																*/
+/*																			*/	
+/* 创建日期：2015.04.16														*/
+/* 说	明：头文件存放的相对路径$DBSDIR/incl								*/
+/*		   表名文件存放的相对路径$DBSDIR/etc/table_name						*/
+/****************************************************************************/
+#include "Ibp.h"
+#include "load.h"
+
+EXEC SQL INCLUDE sqlca;
+EXEC SQL BEGIN DECLARE SECTION;
+char  szSID[40], szUser[20], szPwd[20];
+EXEC SQL END DECLARE SECTION;
+
+char*   sGetTabName(char *pszTable)
+{
+	static  char	szName[512];
+	char	szGap[2], *p = NULL, *q = NULL;
+	long	l = 0, lOfs = 0;
+
+	memset(szGap, 0, sizeof(szGap));
+	szGap[0] = '_';
+	lOfs = strlen(szGap);
+	sLower(pszTable);
+	memset(szName, 0, sizeof(szName));
+	if(!pszTable || !strlen(pszTable))
+		return szName;
+
+	l = 0;
+	szName[0] = 'T';
+	while(p = strstr(pszTable + l, szGap))
+	{
+		p[0 + lOfs]= p[0 + lOfs] - 32;
+		q = strstr(p + lOfs, szGap);
+		if(!q)
+			strcat(szName, p + lOfs);
+		else
+			strncpy(szName + strlen(szName), p + lOfs, q - p - lOfs);
+		l = p - pszTable + lOfs;
+	}
+	return szName;
+}
+
+
+void	vGenApiFile(char *pszTable, char *pszName)
+{
+	static	BOOL	bApi = FALSE;
+	FILE	*fpo = NULL;
+
+	if(!bApi)
+	{
+		bApi = TRUE;
+		if(NULL == (fpo = fopen("DbsApi_tmp.pc", "w")))
+		{
+			fprintf(stdout, "打DbsTrim.pc开文件失败, err:%s\n", strerror(errno));
+			return RC_FAIL;
+		}
+		fprintf(fpo, "#include\t\"DbsApi.h\"\n\n");
+		fprintf(fpo, "EXEC SQL INCLUDE SQLCA;\n\n");
+		fprintf(fpo, "EXEC SQL BEGIN DECLARE SECTION;\n");
+		fprintf(fpo, "input header file here!!\n\n\n");
+		fprintf(fpo, "EXEC SQL END DECLARE SECTION;\n\n");
+	}
+	else
+	{
+		if(NULL == (fpo = fopen("DbsApi_tmp.pc", "a+")))
+		{
+			fprintf(stdout, "打DbsTrim.pc开文件失败, err:%s\n", strerror(errno));
+			return RC_FAIL;
+		}
+	}
+	fprintf(fpo,"/*******************************************************************************\n");
+	fprintf(fpo, "\t根据表%s字段ID获取单条记录\n", pszTable);
+	fprintf(fpo," *******************************************************************************\/\n");
+	fprintf(fpo,"long\tdbGet%s(%s *pst%s, char *pszId)\n{\n", pszName + 1, pszName, pszName + 1);
+	fprintf(fpo,"\tEXEC SQL BEGIN DECLARE SECTION;\n");
+	fprintf(fpo,"\tchar\tszId[50];\n");
+	fprintf(fpo,"\t%s\tst%s;\n", pszName, pszName + 1);
+	fprintf(fpo,"\tEXEC SQL END DECLARE SECTION;\n\n");
+	fprintf(fpo,"\tmemset(szId, 0, sizeof(szId));\n");
+	fprintf(fpo,"\tmemset(&st%s, 0, sizeof(%s));\n", pszName + 1, pszName);
+	fprintf(fpo,"\tstrcpy(szId, pszId);\n\n");
+	fprintf(fpo,"\tEXEC SQL SELECT * INTO :st%s FROM %s WHERE ID = :szId;\n", pszName + 1, pszTable);
+	fprintf(fpo,"\tif(SQLNOTFOUND)\treturn SQLCODE;\n");
+	fprintf(fpo,"\telse if(SQLERR)\n\t{\n");
+	fprintf(fpo,"\t\tvSetErrMsg(\"SQLCODE(%%d)(%%s)\", SQLCODE, sDbsError());\n");
+	fprintf(fpo,"\t\treturn SQLCODE;\n\t}\n\n");
+	fprintf(fpo,"\tvTrim%s(&st%s);\n", pszName + 1, pszName + 1);
+	fprintf(fpo,"\tmemcpy(pst%s, &st%s, sizeof(%s));\n\n", pszName + 1, pszName + 1, pszName);
+	fprintf(fpo,"\treturn RC_SUCC;\n}\n\n");
+	fclose(fpo);
+
+	return ;
+}
+
+/***后台输入表名生成头文件***/
+long	lGenDbIncl(char *pszTable)
+{
+	char	szCwd[512];
+	EXEC SQL BEGIN DECLARE SECTION;
+		varchar		stTabAt[30];
+		varchar		flag[2];
+		varchar		stSqlName[31];
+		varchar		stSqlType[107];
+		long		sql_data_length;
+		long		sql_data_precision;
+		long		sql_data_scale;
+	EXEC SQL END DECLARE SECTION;
+	char	szHeader[100], szName[100];
+	FILE	*fp = NULL, *fpc = NULL;
+	static	BOOL	bGen = FALSE;
+
+	memset(&stSqlType, 0, sizeof(stSqlType));
+	memset(&stSqlName, 0, sizeof(stSqlName));
+	memset(&stTabAt, 0, sizeof(stTabAt));
+	memset(&flag, 0, sizeof(flag));
+
+	sql_data_length = 0;
+	sql_data_scale = 0;
+
+	strcpy(stTabAt.arr, pszTable);
+	sLower(stTabAt.arr);
+	stTabAt.len = strlen(stTabAt.arr);
+
+	/***查询***/		
+	EXEC SQL DECLARE query_makeh CURSOR FOR select column_name, data_type, data_length,
+		nvl(data_precision,0), nvl(data_scale,0) from dba_tab_columns where 
+		lower(owner)=:szUser and lower(table_name)=:stTabAt order by column_id;
+		
+	EXEC SQL OPEN query_makeh;
+	if(sqlca.sqlcode)
+	{
+		printf("打开游标错误[%d]\n",sqlca.sqlcode);
+		exit(1);
+	}
+
+	if(!bGen)
+	{
+		bGen = TRUE;
+		if(NULL == (fpc = fopen("DbsTrim_tmp.pc", "w")))
+		{
+			fprintf(stdout, "打DbsTrim.pc开文件失败, err:%s\n", strerror(errno));
+			return RC_FAIL;
+		}
+		fprintf(fpc,"#include\t\"DbsApi.h\"\n\n");
+	}
+	else
+	{
+		if(NULL == (fpc = fopen("DbsTrim_tmp.pc", "a+")))
+		{
+			fprintf(stdout, "打DbsTrim.pc开文件失败, err:%s\n", strerror(errno));
+			return RC_FAIL;
+		}
+	}
+
+	/***取参数写文件***/
+	memset(szCwd, 0, sizeof(szCwd));
+	getcwd(szCwd, sizeof(szCwd));
+	sprintf(szHeader, "%s/incl_c/%s.h", getenv("HOME"), stTabAt.arr);
+	if(NULL == (fp = fopen(szHeader,"w")))
+	{
+		fclose(fpc);
+		fprintf(stdout, "打开%s文件失败, err:%s\n", szHeader, strerror(errno));
+		return RC_FAIL;
+	}
+	fprintf(fp,"#ifndef __%s_CH__\n", stTabAt.arr);
+	fprintf(fp,"#define __%s_CH__\n", stTabAt.arr);
+
+	/*****在此生成函数声明结束****/
+	fprintf(fp,"typedef struct %s_c\n",stTabAt.arr);
+	fprintf(fp,"{\n");
+
+	memset(szName, 0, sizeof(szName));
+	strcpy(szName, sGetTabName(stTabAt.arr));
+	vGenApiFile(sUpper(stTabAt.arr), szName);
+
+	fprintf(fpc,"/*******************************************************************************\n");
+	fprintf(fpc, "\t去掉表%s空格\n", sUpper(stTabAt.arr));
+	fprintf(fpc," *******************************************************************************\/\n");
+	fprintf(fpc,"void	vTrim%s(%s *pst%s)\n{\n", szName + 1, szName, szName + 1);
+
+	while(1)
+	{
+		EXEC SQL FETCH query_makeh into :stSqlName,:stSqlType,
+			:sql_data_length,:sql_data_precision,:sql_data_scale;
+		if(sqlca.sqlcode!=0 && sqlca.sqlcode!=1403)
+		{
+			fclose(fp);
+			fclose(fpc);
+			printf("%s,%d, 数据库错误[%d]\n",__FILE__,__LINE__,sqlca.sqlcode);
+			exit(1);
+		}	 
+		if(sqlca.sqlcode==1403)
+			break;
+		
+		stSqlType.arr[stSqlType.len]='\0';
+		stSqlName.arr[stSqlName.len]='\0';
+		sLower(stSqlName.arr);
+		sLower(stSqlType.arr);
+		fprintf(fp,"\t");
+		if(strcmp(stSqlType.arr, "varchar2")==0|| strcmp(stSqlType.arr, "char") == 0)
+		{
+			fprintf(fp,"char	  %s[%d];\n",stSqlName.arr,sql_data_length+1);
+			fprintf(fpc, "	sTrimRight(pst%s->%s);\n", szName + 1, stSqlName.arr);
+		}
+		else if(strcmp(stSqlType.arr,"number")==0)
+		{
+			if(sql_data_scale > 0 )
+			{
+				/****整数****/
+				/*
+				if(sql_data_precision>9)
+					fprintf(fp,"double	%s;\n",stSqlName.arr);
+				else
+					fprintf(fp,"long	  %s;\n",stSqlName.arr);
+				*/
+				fprintf(fp,"double	%s;\n",stSqlName.arr);
+			}
+			else /****小数****/
+				fprintf(fp,"long	  %s;\n",stSqlName.arr);
+		}
+		else if(strncmp(stSqlType.arr, "timestamp", 9)==0)
+			fprintf(fp,"char	  %s[32];\n",stSqlName.arr);
+		else
+		{
+			fprintf(stderr, "%s, %d, 不支持的数据类型[%s][%s]\n", __FILE__, __LINE__,
+				stSqlName.arr, stSqlType.arr);
+			fclose(fp);
+			fclose(fpc);
+			return RC_FAIL;
+		}
+	}
+	fprintf(fp, "}%s;\n", sGetTabName(stTabAt.arr));
+	fprintf(fp, "#endif \n");
+	fprintf(fpc, "}\n\n");
+	fclose(fp);
+	fclose(fpc);
+	EXEC SQL CLOSE query_makeh;
+	return 0;	
+}
+
+void	vDbsConnect()
+{
+	memset(szSID, 0, sizeof(szSID));
+	memset(szUser, 0, sizeof(szUser));
+	memset(szPwd, 0, sizeof(szPwd));
+
+	strcpy(szUser, sGetDbsEnv("DB_USER"));
+	strcpy(szPwd, sGetDbsEnv("DB_PASSWD"));
+	strcpy(szSID, sGetDbsEnv("DORACLE_SID"));
+
+	EXEC SQL CONNECT :szUser IDENTIFIED BY :szPwd using :szSID;
+	if(sqlca.sqlcode != 0)
+	{
+		printf("\n Connect Database Error, code = %d, (%s)(%s)(%s)", sqlca.sqlcode, 
+			szUser, szPwd, szSID);
+		exit(1);
+	}
+
+	EXEC SQL alter session set optimizer_goal = all_rows;
+}
+
+int		main()
+{
+	FILE	*fp = NULL;
+	char	szFile[512], szLine[1024];
+
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "table.txt");
+	if(NULL == (fp = fopen(szFile, "rb")))
+	{
+		printf("无法打开文件[%s]\n", szFile);
+		exit(1);
+	}
+
+	/****连接数据库****/
+	vDbsConnect();
+
+	memset(szLine, 0, sizeof(szLine));
+	while(fgets(szLine, sizeof(szLine) - 1, fp) != NULL)
+	{
+		sTrimAll(szLine);
+		sTrimCRLF(szLine);
+		if(szLine[0]=='\0' || szLine[0] == '#')	
+			continue;
+
+		sLower(szLine);
+		fprintf(stdout, "生成[%s.h]...\n", szLine);
+		if(0 != lGenDbIncl(szLine))
+			break;
+	}
+	fclose(fp);
+	EXEC SQL ROLLBACK WORK RELEASE;
+
+	return(0);
+}

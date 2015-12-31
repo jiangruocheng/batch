@@ -1,0 +1,130 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取系统启动所需表大小	
+ ****************************************************************************************/
+long	lDefine_MchtCard(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MCHT_CARD WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbMCard), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(mcht_no)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbMCard, mcht_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(mcht_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(disc_id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbMCard, disc_id, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(disc_id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+	return lSize;
+}
+
+/****************************************************************************************
+	创建客户表
+ ****************************************************************************************/
+long	lLoad_MchtCard(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMCard	stCard;
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL DECLARE Cur_mcht_card CURSOR FOR 
+		SELECT NVL(MCHT_NO, ' '), NVL(DISC_ID, ' ') FROM TBL_MCHT_CARD ORDER BY MCHT_NO;
+
+	EXEC SQL OPEN Cur_mcht_card;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stCard, 0, sizeof(stCard));
+		EXEC SQL FETCH Cur_mcht_card INTO :stCard.mcht_no, :stCard.disc_id;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_card;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载(%d)<(%d)!", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_mcht_card;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		sTrimAll(stCard.mcht_no);
+		sTrimAll(stCard.disc_id);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stCard.mcht_no, ++(pGetTblDef(t)->lTreeNode),
+			dbMCard, mcht_no, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载地区编号(%s)失败, 原因:%s", stCard.mcht_no, sGetError());
+			EXEC SQL CLOSE Cur_mcht_card;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != IBPInsertData(t, &stCard, sizeof(stCard)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t),
+				stCard.mcht_no, sGetError());
+			EXEC SQL CLOSE Cur_mcht_card;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_mcht_card;
+
+	*pstNode = pstRoot;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t),
+		pGetTblDef(t)->lValid);
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

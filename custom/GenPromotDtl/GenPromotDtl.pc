@@ -1,0 +1,252 @@
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "Ibp.h"
+#include "load.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_promotions_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INCLUDE SQLCA;
+
+int	 g_iVouch = 1;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*		   ： argv (参数列表 -- 输出)												*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		main(int argc, char **argv)
+{
+	int		iRet;
+	char	szSettleNum[5],szLastNum[2], szSettlmtDate[9];			 /*清算日期*/
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	sprintf(gsLogFile, "GenPromotDtl.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettlmtDate, 0, sizeof(szSettlmtDate));
+	memset(szLastNum, 0, sizeof(szLastNum));
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);
+	memcpy(szSettlmtDate, argv[1], sizeof(szSettlmtDate) - 1);
+	memcpy(szLastNum, argv[4], sizeof(szLastNum) - 1);
+
+	snprintf(gsLogFile, sizeof(gsLogFile), "GenPromotDtl%s.log", szLastNum);
+	HtLog(NML_PARAM, "生成商户优惠明细开始...");
+	HtLog(NML_PARAM, "清算日期(%s) 清算批序号(%s) 商户尾号(%s)", szSettlmtDate, szSettleNum, szLastNum);
+
+	if(szLastNum[0] < '0' || szLastNum[0] > '9')
+	{
+		HtLog(ERR_PARAM, "分配进程任务(%c)为无效字符", szLastNum[0]);
+		return RC_FAIL;
+	}
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "数据库连接失败sqlcode(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	iRet = nGetPromoteInf(szSettlmtDate, szSettleNum, szLastNum);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "生成商户优惠明细失败, err:(%d)\n", iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	HtLog(ERR_PARAM, "生成商户优惠明细完成!\n");
+	vDbsDisconnect();
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGenPromotDtl(char *pszTraceNo, char *pszSettleDate, 				*/
+/*					char *pszSettleNum, char *pszLastNum)							*/
+/*   功能  ： 获取清算明细表ID														*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		nGenPromotDtl(char *pszTraceNo, char *pszSettleDate, char *pszSettleNum, char *pszLastNum)
+{
+	int		iRet;
+	dbMchtBase  dbMBase;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szTraceNo[21], szMcht_nm[257];
+	char	szSettleDate[9], szSettleNum[5];
+	TPromotionsDtl	stPromte;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szTraceNo, 0, sizeof(szTraceNo));
+	memset(szMcht_nm, 0, sizeof(szMcht_nm));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	memcpy(szTraceNo, pszTraceNo, sizeof(szTraceNo) - 1);
+	memcpy(szSettleNum, pszSettleNum, 4);
+	memcpy(szSettleDate, pszSettleDate, 8);
+
+	EXEC SQL DECLARE Cur_algo_dtl CURSOR FOR 
+		SELECT SETTLE_MCHT, PROMTS_ID, PROMTS_MODE, 
+			SUM(FREE_FEE) AS FREE_FEE 
+		FROM TBL_ALGO_DTL WHERE MCHT_TRACE_NO = :szTraceNo AND 
+			ALGO_DATE = :szSettleDate GROUP BY SETTLE_MCHT, PROMTS_ID, PROMTS_MODE;
+
+	EXEC SQL OPEN Cur_algo_dtl;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询清分明细失败 err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stPromte, 0, sizeof(stPromte));
+		EXEC SQL FETCH Cur_algo_dtl INTO :stPromte.obj_no, :stPromte.promts_id, 
+			:stPromte.promts_mode, :stPromte.deal_amount;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "获取清分表商户数据失败，err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_algo_dtl;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		if(stPromte.deal_amount <= 0.00)
+			continue;
+		
+		sTrimAll(stPromte.obj_no);
+		sTrimAll(stPromte.promts_mode);
+		
+		memcpy(stPromte.promts_date, pszSettleDate, 8);
+		sprintf(stPromte.id, "%c%s%s%06d", pszLastNum[0], pszSettleDate, szSettleNum, g_iVouch);
+
+		memset(&dbMBase, 0, sizeof(dbMBase));
+		if(RC_SUCC != lGetMchtBase(&dbMBase, stPromte.obj_no))
+		{
+			HtLog(ERR_PARAM, "获取商户基本信息失败, err:(%s), mcht(%s).", sGetError(),
+				stPromte.obj_no);
+			return RC_FAIL;
+		}
+		memcpy(stPromte.obj_name, dbMBase.mcht_nm, sizeof(stPromte.obj_name) - 1);
+			
+		EXEC SQL INSERT INTO TBL_PROMOTIONS_DTL VALUES(:stPromte);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM,"新增(%s)(%s)优惠明细失败 err:(%d)(%s)", stPromte.id,
+				stPromte.obj_no, SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_algo_dtl;
+			return RC_FAIL;
+		}
+		g_iVouch ++;
+	}
+
+	EXEC SQL CLOSE Cur_algo_dtl;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetPromoteInf(char *psStlmDate, char *pszSettleNum, 				*/
+/*					char *pszLastNum)												*/
+/*   功能  ： 生成商户清算明细														*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		nGetPromoteInf(char *psStlmDate, char *pszSettleNum, char *pszLastNum)
+{
+	int		iRet;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szMchtNo[26], szTraceNo[21], szID[20];
+	char	szSettleDate[9], szTrace[2], szSettleNum[5];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szTrace, 0, sizeof(szTrace));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szID, 0, sizeof(szID));
+
+	szTrace[0] = pszLastNum[0];
+	memcpy(szSettleDate, psStlmDate, 8);
+	memcpy(szSettleNum, pszSettleNum, 4);
+	sprintf(szID, "%c%s%s", szTrace[0], szSettleDate, szSettleNum);
+
+	EXEC SQL DELETE FROM TBL_PROMOTIONS_DTL WHERE SUBSTR(ID, 1, 13) = :szID;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "删除手续费减免明细(%s)失败 err:(%d)(%s)", szID, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	EXEC SQL COMMIT WORK;
+	
+	EXEC SQL DECLARE Cur_mcht_settle_dtl CURSOR FOR SELECT NVL(IBOX42, ' '), 
+		NVL(TRACE_NO, ' ') FROM TBL_MCHT_SETTLE_DTL WHERE SETTLE_DATE = :szSettleDate 
+		AND SUBSTR(IBOX42, LENGTH(RTRIM(IBOX42)), 1) = :szTrace AND 
+		SETTLE_NUM = :szSettleNum AND FREE_AMT > 0.00;
+
+	EXEC SQL OPEN Cur_mcht_settle_dtl;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询优惠商户信息失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szMchtNo, 0, sizeof(szMchtNo));
+		memset(szTraceNo, 0, sizeof(szTraceNo));
+   		EXEC SQL FETCH Cur_mcht_settle_dtl INTO :szMchtNo, :szTraceNo;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "查询优惠商户信息失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_settle_dtl;
+			return RC_FAIL;
+		}
+
+		sTrimAll(szTraceNo);
+		sTrimAll(szMchtNo);
+		HtLog(NML_PARAM, "商户(%s)存在减免, 跟踪流水号(%s)", szMchtNo, szTraceNo);
+		iRet = nGenPromotDtl(szTraceNo, szSettleDate, szSettleNum, szTrace);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "生成优惠明细失败 err:%d", iRet);
+			EXEC SQL CLOSE Cur_mcht_settle_dtl;
+			return RC_FAIL;
+		}
+	}
+
+	EXEC SQL CLOSE Cur_mcht_settle_dtl;
+	EXEC SQL COMMIT WORK;
+	return RC_SUCC;
+}
+

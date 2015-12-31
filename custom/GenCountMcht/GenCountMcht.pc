@@ -1,0 +1,412 @@
+/*****************************************************************
+ *  功能: 流水清分处理程序(商户资金清分)
+ *  Author：DeffPuzzL
+ *  Edit History:
+ ****************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"tbl_mcht_settle_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INCLUDE SQLCA;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int main(int argc, char **argv )										*/
+/*   功能  ： 完成商户代发数据初始化												*/
+/*  返回值 ： RC_SUCC	   --  成功													*/
+/*			  RC_FAIL	   --  失败													*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	int		iRet;
+	char	szSettleNum[5],szLastNum[2], szSettleDate[9];  
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	sprintf(gsLogFile, "GenMchtCont.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szLastNum, 0, sizeof(szLastNum));
+
+	memcpy(szSettleDate, argv[1], sizeof(szSettleDate) - 1);
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);
+	memcpy(szLastNum, argv[4], sizeof(szLastNum) - 1);
+
+	snprintf(gsLogFile, sizeof(gsLogFile), "GenCountMcht_%s.log", szLastNum);
+	HtLog(NML_PARAM, "统计本周期商户入账流水开始...");
+	HtLog(NML_PARAM, "清算日期(%s) 清算批序号(%s) 商户尾号(%s)", szSettleDate, 
+			szSettleNum, szLastNum);
+
+	if(szLastNum[0] < '0' || szLastNum[0] > '9')
+	{
+		HtLog(ERR_PARAM, "分配进程任务(%c)为无效字符", szLastNum[0]);
+		return RC_FAIL;
+	}
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "数据库连接失败sqlcode(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	iRet = nGenMchtIns(szSettleDate, szSettleNum, szLastNum);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "生成商户清算明细失败, err:(%d)", iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetSettleQue(char *pszSettleDate,char *pszSettleNum, long *plSeq)*/
+/*   功能  ： 获取清算明细表ID														*/
+/*  返回值 ： RC_SUCC		--  成功			   									*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		nGetSettleQue(char *pszSettleDate, char *pszSettleNum, long *plSeq)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szSettleDate[9], szSettleNum[5];
+	char	szTemp[23];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+
+	memcpy(szSettleDate, pszSettleDate, 8);
+	memcpy(szSettleNum, pszSettleNum, 4);
+
+	memset(szTemp, 0, sizeof(szTemp));
+	EXEC SQL SELECT NVL(MAX(SUBSTR(ID, 13, 8)), ' ') INTO :szTemp FROM TBL_MCHT_SETTLE_DTL WHERE 
+		SETTLE_DATE = :szSettleDate AND SETTLE_NUM = :szSettleNum;
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "查询商户 明细序号出错, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	else if(SQLNOTFOUND)
+		(*plSeq) = 0;
+	else
+	{
+		sTrimAll(szTemp);
+		(*plSeq) = atol(szTemp);
+	}
+	
+	++ (*plSeq);
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nInsertMchtDtl(TMchtSettleDtl *pstMchtDtl, long *plSeq)			*/
+/*   功能  ： 生成商户清算明细														*/
+/*  返回值 ： RC_SUCC		--  成功			   									*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		nInsertMchtDtl(TMchtSettleDtl *pstMchtDtl, char *pszLast, long *plSeq)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TMchtSettleDtl	stMchtDtl;
+	EXEC SQL END DECLARE SECTION;
+
+	sTrimAll(pstMchtDtl->cups_no);
+	sTrimAll(pstMchtDtl->ibox42);
+	sTrimAll(pstMchtDtl->brh);
+	sTrimAll(pstMchtDtl->tx_date);
+	memcpy(pstMchtDtl->rec_crt_ts, sGetCurrentTime(), sizeof(pstMchtDtl->rec_crt_ts) - 1);
+	pstMchtDtl->result_flag[0] = SETTLE_MCHT_NOT_DEAL;
+
+	snprintf(pstMchtDtl->id, sizeof(pstMchtDtl->id), "%3s%8s%c%08d", 
+		pstMchtDtl->settle_num + 1, pstMchtDtl->settle_date, pszLast[0], *plSeq);
+
+	snprintf(pstMchtDtl->trace_no, sizeof(pstMchtDtl->trace_no), "%5s%3s%c%06d",
+		pstMchtDtl->settle_date + 3, pstMchtDtl->settle_num + 1, pszLast[0], *plSeq);
+
+	if(pstMchtDtl->settle_amt <= 0.00 )
+	{
+		pstMchtDtl->dc_flag[0] = 'C';
+		pstMchtDtl->result_flag[0] = SETTLE_MCHT_SUCC;			  //  0金额 入账成功
+	}
+	else
+		pstMchtDtl->dc_flag[0] = 'D';
+
+	memcpy(&stMchtDtl, pstMchtDtl, sizeof(stMchtDtl));
+
+	EXEC SQL INSERT INTO TBL_MCHT_SETTLE_DTL VALUES (:stMchtDtl);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增商户(%s)代发数据失败, err:(%d)(%s)", pstMchtDtl->ibox42, 	
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	++ (*plSeq);
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nInitialMchtDtl(TMchtSettleDtl *pstMchtDtl, char *pszLast, 		*/
+/*					long *plSeq)													*/
+/*   功能  ： 生成商户清算明细														*/
+/*  返回值 ： RC_SUCC		--  成功			   									*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		nInitialMchtDtl(TMchtSettleDtl *pstMchtDtl, char *pszLast, long *plSeq)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char			szInit[2], szSucc[2];
+	char			szSettle[2], szClear[2];
+	long			lDisc = 0;
+	TMchtSettleDtl	stMchtDtl;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szInit, 0, sizeof(szInit));
+	memset(szSucc, 0, sizeof(szSucc));
+	memset(szClear, 0, sizeof(szClear));
+	memset(szSettle, 0, sizeof(szSettle));
+
+	if(RC_SUCC != nInsertMchtDtl(pstMchtDtl, pszLast, plSeq))
+	{
+		HtLog(ERR_PARAM, "新增商户(%s)代发数据失败!", pstMchtDtl->ibox42);
+		return RC_FAIL;
+	}
+
+	memcpy(&stMchtDtl, pstMchtDtl, sizeof(stMchtDtl));
+	szInit[0] = ALGO_MCHT_FLAG_INIT;
+	szSucc[0] = ALGO_MCHT_FLAG_SUCC;
+
+	if(!memcmp(pstMchtDtl->settle_num, "TN00", 4))
+	{
+		szSettle[0] = CHANNEL_SETTLE_DONE;
+		szClear[0]  = CHANNEL_CLEAR_NO;
+
+		EXEC SQL UPDATE TBL_ALGO_DTL SET
+			MCHT_FLAG = :szSucc,
+			MCHT_TRACE_NO = :stMchtDtl.trace_no,
+			REC_UPD_TS = :stMchtDtl.rec_crt_ts
+		WHERE SETTLE_MCHT = :stMchtDtl.ibox42 AND MCHT_FLAG = :szInit 
+			AND DISC_CYCLE > :lDisc AND CUPS_NO IN (SELECT CUPS_NO FROM 
+				TBL_CHN_SETTLE WHERE SETTLE_DATE = :stMchtDtl.settle_date 
+				AND SETTLE_FLAG = :szSettle AND CLEAR_FLAG = :szClear);
+	}
+	else if(!memcmp(pstMchtDtl->settle_num, "TC00", 4))
+	{
+		EXEC SQL UPDATE TBL_ALGO_DTL SET
+			MCHT_FLAG = :szSucc,
+			MCHT_TRACE_NO = :stMchtDtl.trace_no,
+			REC_UPD_TS = :stMchtDtl.rec_crt_ts
+		WHERE SETTLE_MCHT = :stMchtDtl.ibox42 AND MCHT_FLAG = :szInit 
+			AND DISC_CYCLE > :lDisc AND CUPS_NO = :stMchtDtl.cups_no;
+	}
+	else 
+	{
+		EXEC SQL UPDATE TBL_ALGO_DTL SET
+			MCHT_FLAG = :szSucc,
+			MCHT_TRACE_NO = :stMchtDtl.trace_no,
+			REC_UPD_TS = :stMchtDtl.rec_crt_ts
+		WHERE SETTLE_MCHT = :stMchtDtl.ibox42 AND
+			MCHT_FLAG = :szInit AND DISC_CYCLE = :lDisc AND 
+			SETTLE_NUM = :stMchtDtl.settle_num;
+	}
+	if(SQLERR || EFFECT_NUM != pstMchtDtl->tx_num)
+	{
+		HtLog(ERR_PARAM, "更新商户号(%s)渠道(%s)清分(%d)汇总标识失败, err:(%d)(%s)",
+			stMchtDtl.ibox42, stMchtDtl.cups_no, pstMchtDtl->tx_num, SQLCODE, sDbsError()); 
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGenMchtIns(char *psStlmDate)								   		*/
+/*   功能  ： 生成商户清算明细														*/
+/*  返回值 ： RC_SUCC		--  成功			   									*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		nGenMchtIns(char *pszSettleDate, char *pszSettleNum, char *pszLastNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TMchtSettleDtl	stMchtDtl;
+	char	szSettleDate[9], szSettleNum[5], szComNo[5], szLastNum[2];
+	char	szInit[2], szSettle[2], szClear[2];
+	long	lDisc = 0;
+	EXEC SQL END DECLARE SECTION;
+	long	lCount = 0, lSeq = 0;
+	BOOL	bFlag = false;
+
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szLastNum, 0, sizeof(szLastNum));
+	memset(szInit, 0, sizeof(szInit));
+	memset(szComNo, 0, sizeof(szComNo));
+	memset(szClear, 0, sizeof(szClear));
+	memset(szSettle, 0, sizeof(szSettle));
+
+	if(RC_SUCC != nGetSettleQue(pszSettleDate, pszSettleNum, &lSeq))
+		return RC_FAIL;
+
+	memcpy(szSettleDate, pszSettleDate, 8);
+	memcpy(szSettleNum, pszSettleNum, sizeof(szSettleNum) - 1);
+	memcpy(szComNo, IBP_COM_CUPSNO, 4);
+	szLastNum[0]= pszLastNum[0];
+	szInit[0] = ALGO_MCHT_FLAG_INIT;
+
+	szSettle[0] = CHANNEL_SETTLE_DONE;
+	if(!memcmp(pszSettleNum, "TN00", 4))
+	{
+		szClear[0] = CHANNEL_CLEAR_NO;
+		HtLog(NML_PARAM, "获取清算批序号(%s)商户尾号(%s)清算标识(%s)二清标识(%s)(%d)(%s)明细", 
+			pszSettleNum, szLastNum, szSettle, szClear, lDisc, szInit);
+
+//#		SUM(DECODE(AC_TYPE, 2, 1, 3, 1, 0)), 
+//#		SUM(DECODE(AC_TYPE,2,1,3,1,0))/COUNT(*) * 100
+		EXEC SQL DECLARE Cur_algo_dtl_tn CURSOR FOR
+			SELECT :szComNo, NVL(SETTLE_MCHT, ' '), NVL(MAX(EXPAND), 0), 
+				MAX(DISC_CYCLE), NVL(MAX(BRNO), ' '), NVL(MAX(TX_DATE), ' '), 
+				COUNT(*), NVL(SUM(TX_AMT), 0.00), NVL(SUM(FREE_FEE), 0.00),
+				NVL(SUM(FEE_AMT), 0.00) + NVL(SUM(MCHT_SERVE_FEE), 0.00) + NVL(SUM(SERV_FEE_KQDA), 0.00) - NVL(SUM(FREE_FEE), 0.00)
+			FROM TBL_ALGO_DTL
+			WHERE MCHT_FLAG = :szInit AND DISC_CYCLE > :lDisc AND 
+				SUBSTR(SETTLE_MCHT, LENGTH(SETTLE_MCHT), 1) = :szLastNum AND 
+				CUPS_NO IN (SELECT CUPS_NO FROM TBL_CHN_SETTLE WHERE 
+					SETTLE_DATE = :szSettleDate AND SETTLE_FLAG = :szSettle 
+					AND CLEAR_FLAG = :szClear)
+			GROUP BY SETTLE_MCHT;
+	}
+	else if(!memcmp(pszSettleNum, "TC00", 4))
+	{
+		szClear[0] = CHANNEL_CLEAR_YES;
+
+		HtLog(NML_PARAM, "获取清算批序号(%s)商户尾号(%s)汇总标识(%s)一清标识(%s)明细", 
+			pszSettleNum, szLastNum, szSettle, szClear);
+		EXEC SQL DECLARE Cur_algo_dtl_tc CURSOR FOR
+			SELECT CUPS_NO, NVL(SETTLE_MCHT, ' '), NVL(MAX(EXPAND), 0),
+				MAX(DISC_CYCLE), NVL(MAX(BRNO), ' '), NVL(MAX(TX_DATE), ' '),
+				COUNT(*), NVL(SUM(TX_AMT), 0.00), NVL(SUM(FREE_FEE), 0.00),
+				NVL(SUM(FEE_AMT), 0.00) + NVL(SUM(MCHT_SERVE_FEE), 0.00) + NVL(SUM(SERV_FEE_KQDA), 0.00) - NVL(SUM(FREE_FEE), 0.00)
+			FROM TBL_ALGO_DTL
+			WHERE MCHT_FLAG = :szInit AND DISC_CYCLE > :lDisc AND 
+				SUBSTR(SETTLE_MCHT, LENGTH(SETTLE_MCHT), 1) = :szLastNum AND 
+				CUPS_NO IN (SELECT CUPS_NO FROM TBL_CHN_SETTLE WHERE 
+					SETTLE_DATE = :szSettleDate AND SETTLE_FLAG = :szSettle 
+					AND CLEAR_FLAG = :szClear)
+			GROUP BY CUPS_NO, SETTLE_MCHT;
+	}
+	else
+	{
+		EXEC SQL DECLARE Cur_algo_dtl_t0 CURSOR FOR
+			SELECT :szComNo, NVL(SETTLE_MCHT, ' '), NVL(MAX(EXPAND), 0), 
+				MAX(DISC_CYCLE), NVL(MAX(BRNO), ' '), NVL(MAX(TX_DATE), ' '), 
+				COUNT(*), NVL(SUM(TX_AMT), 0.00), NVL(SUM(FREE_FEE), 0.00),
+				NVL(SUM(FEE_AMT), 0.00) + NVL(SUM(MCHT_SERVE_FEE), 0.00) + NVL(SUM(SERV_FEE_KQDA), 0.00) - NVL(SUM(FREE_FEE), 0.00)
+			FROM TBL_ALGO_DTL
+			WHERE MCHT_FLAG = :szInit AND DISC_CYCLE = :lDisc AND 
+				SUBSTR(SETTLE_MCHT, LENGTH(SETTLE_MCHT), 1) = :szLastNum AND 
+				SETTLE_NUM = :szSettleNum GROUP BY SETTLE_MCHT;
+	}
+
+	if(!memcmp(pszSettleNum, "TN00", 4))
+		EXEC SQL OPEN Cur_algo_dtl_tn;
+	else if(!memcmp(pszSettleNum, "TC00", 4))
+		EXEC SQL OPEN Cur_algo_dtl_tc;
+	else
+		EXEC SQL OPEN Cur_algo_dtl_t0;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询清分明细失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stMchtDtl, 0, sizeof(stMchtDtl));
+		if(!memcmp(pszSettleNum, "TN00", 4))
+			EXEC SQL FETCH Cur_algo_dtl_tn INTO :stMchtDtl.cups_no, :stMchtDtl.ibox42,
+				:stMchtDtl.expand, :stMchtDtl.disc_cycle, :stMchtDtl.brh, :stMchtDtl.tx_date,
+				:stMchtDtl.tx_num, :stMchtDtl.tx_amt, :stMchtDtl.free_amt, :stMchtDtl.fee_amt;
+		else if(!memcmp(pszSettleNum, "TC00", 4))
+			EXEC SQL FETCH Cur_algo_dtl_tc INTO :stMchtDtl.cups_no, :stMchtDtl.ibox42,
+				:stMchtDtl.expand, :stMchtDtl.disc_cycle, :stMchtDtl.brh, :stMchtDtl.tx_date,
+				:stMchtDtl.tx_num, :stMchtDtl.tx_amt, :stMchtDtl.free_amt, :stMchtDtl.fee_amt;
+		else
+			EXEC SQL FETCH Cur_algo_dtl_t0 INTO :stMchtDtl.cups_no, :stMchtDtl.ibox42,
+				:stMchtDtl.expand, :stMchtDtl.disc_cycle, :stMchtDtl.brh, :stMchtDtl.tx_date,
+				:stMchtDtl.tx_num, :stMchtDtl.tx_amt, :stMchtDtl.free_amt, :stMchtDtl.fee_amt;
+		if(SQLERR)
+		{
+			bFlag = true;
+			HtLog(ERR_PARAM, "获取清分明细失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			break;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		sTrimAll(stMchtDtl.cups_no);
+		sTrimAll(stMchtDtl.ibox42);
+		sTrimAll(stMchtDtl.brh);
+		sTrimAll(stMchtDtl.tx_date);
+ 
+		memcpy(stMchtDtl.settle_num, pszSettleNum, 4);
+		memcpy(stMchtDtl.settle_date, pszSettleDate, 8);
+		stMchtDtl.settle_amt = stMchtDtl.tx_amt - stMchtDtl.fee_amt;
+
+		if(RC_SUCC != nInitialMchtDtl(&stMchtDtl, szLastNum, &lSeq))
+		{
+			bFlag = true;
+			HtLog(ERR_PARAM, "初始化商户清算明细数据失败!");
+			break;
+		}
+
+		if(0 == (++ lCount % 500))
+			EXEC SQL COMMIT WORK;
+	} 
+	if(!memcmp(pszSettleNum, "TN00", 4))
+  		EXEC SQL CLOSE Cur_algo_dtl_tn;
+	else if(!memcmp(pszSettleNum, "TC00", 4))
+  		EXEC SQL CLOSE Cur_algo_dtl_tc;
+ 	else
+   		EXEC SQL CLOSE Cur_algo_dtl_t0;
+	if(bFlag)
+	{
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "生成商户代发初始化明细完成，规则号(%s)商户笔数(%d)\n", pszLastNum, lCount);
+	return RC_SUCC;
+}
+

@@ -1,0 +1,557 @@
+/*****************************************************************
+ *  功能: 计算渠道手续费(商户资金清分)
+ *	Author：DeffPuzzL
+ *  Edit History:
+ ****************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_stlm_succ.h"
+#include "tbl_chn_accout.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INCLUDE SQLCA;
+
+extern	int	nCalcCupsFee(TStlmSucc *pstSucc, double *pdFee, double dTotalAmt);
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int main(int argc, char **argv )										*/
+/*   功能  ： 完成计算渠道手续费全流程												*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int main(int argc , char ** argv)
+{
+	int		iRet = 0;
+
+	char	szSettleDate[9], szTransDate[9],szCupsNo[5], szSettleNum[5]; 
+	
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	sprintf(gsLogFile, "CalChannelFee.log");
+   
+	vPrintVersion(argv[1]);
+	if(argc != 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memcpy(szCupsNo, argv[4], sizeof(szCupsNo) - 1);
+
+	snprintf(gsLogFile, sizeof(gsLogFile), "CalChannelFee_%s.log", szCupsNo);
+
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleDate, argv[1], sizeof(szSettleDate) - 1);
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);  
+
+	HtLog(NML_PARAM, "日期(%s)(%s), 渠道编号(%s)计算渠道手续费开始.", szSettleDate, 
+		szSettleNum, szCupsNo);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "数据库连接失败, err:(%d)(%s)\n", iRet, sDbsError());
+		return RC_FAIL;
+	}
+	
+	iRet = nGetChannelFeeByTranDate(szSettleDate, szSettleNum, szCupsNo);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "计算渠道手续费失败, err:(%d)\n", iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	} 
+
+	vDbsDisconnect();
+	HtLog(NML_PARAM, "计算渠道手续费结束.\n");
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： void vAnalyzeStamp((char *pszStamp, long *plDisc, char *pszBegin, 	*/
+/*					char *pszEnd)													*/
+/*   功能  ： 根据渠道计算通道成本													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+void	vAnalyzeStamp(char *pszStamp, long *plDisc, char *pszBegin, char *pszEnd)
+{
+	char	szTemp[50];
+
+	if(!pszStamp || !strlen(pszStamp))
+		return ;
+
+	sTrimAll(pszStamp);
+	memset(szTemp, 0, sizeof(szTemp));
+	strcpy(szTemp, sGetValueByIdx(pszStamp, ",", 1));
+	(*plDisc) = atol(szTemp);
+
+	memset(szTemp, 0, sizeof(szTemp));
+	strcpy(szTemp, sGetValueByIdx(pszStamp, ",", 2));
+
+	
+	memcpy(pszBegin, sGetValueByIdx(szTemp, "~", 1), 6);
+	memcpy(pszEnd, sGetValueByIdx(szTemp, "~", 2), 6);
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetIboxAccout(TChnAccout *pstChnAct)								*/
+/*   功能  ： 根据渠道计算通道成本													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nGetIboxAccout(TChnAccout *pstChnAct)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szInit[2], szErr[2], szSucc[2];
+	char	szStamp[50], szBTime[9], szETime[9];
+	char	szBDate[9], szEDate[9], szCheck[2];
+	long	lDisc = 0;
+	TChnAccout	stChnAct;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szInit, 0, sizeof(szInit));
+	memset(szErr, 0, sizeof(szErr));
+	memset(szSucc, 0, sizeof(szSucc));
+	memset(szCheck, 0, sizeof(szCheck));
+	memset(szBTime, 0, sizeof(szBTime));
+	memset(szETime, 0, sizeof(szETime));
+	memset(szBDate, 0, sizeof(szBDate));
+	memset(szEDate, 0, sizeof(szEDate));
+	memset(&stChnAct, 0, sizeof(stChnAct));
+
+	szInit[0]  = TRADE_TXN_INIT;
+	szErr[0]   = TRADE_TXN_NOTMATCH;
+	szSucc[0]  = TRADE_TXN_SUCCESS;
+	szCheck[0]  = TRADE_TXN_CHECK;
+
+	//	szStamp 格式  "1,230000~230000"
+	memset(szStamp, 0, sizeof(szStamp));
+	snprintf(szStamp, sizeof(szStamp), "%s", sGetCupsStamp(pstChnAct->cups_no));
+	vAnalyzeStamp(szStamp, &lDisc, szBTime, szETime);
+
+	memcpy(stChnAct.stlm_date, pstChnAct->stlm_date, sizeof(stChnAct.stlm_date) - 1);
+	memset(szStamp, 0, sizeof(szStamp));
+	EXEC SQL SELECT MIN(TO_CHAR(TO_DATE(TRANS_DATE, 'YYYYMMDD') - :lDisc + 1, 'YYYYMMDD')), 
+		MAX(TO_CHAR(TO_DATE(TRANS_DATE, 'YYYYMMDD') - :lDisc + 1, 'YYYYMMDD')) INTO 
+		:szStamp, :szEDate FROM TBL_STLM_DATE WHERE STLM_DATE = :stChnAct.stlm_date;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "根据清算日期(%s)查询交易日期失败,err:(%d)(%s)", 
+			stChnAct.stlm_date, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	sTrimAll(szStamp);
+
+	memcpy(stChnAct.cups_no, pstChnAct->cups_no, sizeof(stChnAct.cups_no) - 1);
+	HtLog(NML_PARAM, "开始统计渠道(%s)账务日期内金额:(%d)周期, 时间(%s)~(%s)", 
+		pstChnAct->cups_no, lDisc, szBTime, szETime);
+
+//	如果日切时间点为000000~000000则开始日期和时间都是一天
+	if(!memcmp(szBTime, "000000", 6) && !memcmp(szETime, "000000", 6))
+	{
+		HtLog(NML_PARAM, "=>统计状态:渠道时间戳(%s)统计日期(%s-%s) 统计状态(%s)(%s)(%s)(%s)", 
+			szStamp, szEDate, szEDate, szInit, szErr, szSucc, szCheck);
+
+		EXEC SQL SELECT 
+			NVL(COUNT(*), 0), 
+			NVL(SUM(T.TX_AMT), 0.00), 
+			NVL(SUM(S.CUP_FEE), 0.00), 
+			NVL(SUM(T.TX_AMT) - SUM(S.CUP_FEE), 0.00)
+		INTO 
+			:stChnAct.ibox_num, 
+			:stChnAct.ibox_amt, 
+			:stChnAct.ibox_fee, 
+			:stChnAct.ibox_recv
+		FROM TBL_STLM_SUCC S, TBL_TXN_SUCC T WHERE 
+   			(S.TX_DATE >= :szStamp AND S.TX_DATE <= :szEDate) AND S.ID = T.ID 
+			AND T.RESULT_FLAG IN (:szInit, :szErr, :szSucc, :szCheck) 
+			AND S.CUPS_NO = :stChnAct.cups_no;
+	}
+	else
+	{
+		strcpy(szBDate, sGetChgDate(szStamp, -1));
+		HtLog(NML_PARAM, "=>统计状态:渠道时间戳(%s)统计日期(%s-%s) 统计状态(%s)(%s)(%s)(%s)", 
+			szStamp, szBDate, szEDate, szInit, szErr, szSucc, szCheck);
+
+		EXEC SQL SELECT 
+			NVL(COUNT(*), 0), 
+			NVL(SUM(T.TX_AMT), 0.00), 
+			NVL(SUM(S.CUP_FEE), 0.00), 
+			NVL(SUM(T.TX_AMT) - SUM(S.CUP_FEE), 0.00)
+		INTO 
+			:stChnAct.ibox_num, 
+			:stChnAct.ibox_amt, 
+			:stChnAct.ibox_fee, 
+			:stChnAct.ibox_recv
+		FROM TBL_STLM_SUCC S, TBL_TXN_SUCC T WHERE 
+			((S.TX_DATE = :szBDate AND S.TX_TIME >= :szBTime) OR S.TX_DATE > :szBDate)
+   			AND ((S.TX_DATE = :szEDate AND S.TX_TIME < :szETime) OR S.TX_DATE < :szEDate)
+			AND S.ID = T.ID AND T.RESULT_FLAG IN (:szInit, :szErr, :szSucc, :szCheck) 
+			AND S.CUPS_NO = :stChnAct.cups_no;
+	}
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "统计渠道(%s)账单失败, err:(%d)(%s)", stChnAct.cups_no,
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	pstChnAct->ibox_num = stChnAct.ibox_num; 
+	pstChnAct->ibox_amt = stChnAct.ibox_amt; 
+	pstChnAct->ibox_fee = stChnAct.ibox_fee;
+	pstChnAct->ibox_recv= stChnAct.ibox_recv;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCreateChnAct(char *pszAlgoDate, char *pszSettleNum, 				*/
+/*				char *pszCupsNo)													*/
+/*   功能  ： 根据渠道计算通道成本													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nCreateChnAct(char *pszStlmDate, char *pszSettleNum, char *pszCupsNo)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szInit[2], szErr[2], szSucc[2];
+	char	szBegin[7], szEnd[7];
+	long	lDisc = 0;
+	TChnAccout	stChnAct;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szInit, 0, sizeof(szInit));
+	memset(szErr, 0, sizeof(szErr));
+	memset(szEnd, 0, sizeof(szEnd));
+	memset(szSucc, 0, sizeof(szSucc));
+	memset(szBegin, 0, sizeof(szBegin));
+	memset(&stChnAct, 0, sizeof(stChnAct));
+	szInit[0] = TRADE_TXN_INIT;
+	szErr[0]  = TRADE_TXN_NOTMATCH;
+	szSucc[0] = TRADE_TXN_SUCCESS;
+
+	memcpy(stChnAct.stlm_date, pszStlmDate, sizeof(stChnAct.stlm_date) - 1);
+	memcpy(stChnAct.cups_no, pszCupsNo, sizeof(stChnAct.cups_no) - 1);
+	snprintf(stChnAct.cups_nm, sizeof(stChnAct.cups_nm), "%s", 
+		sGetCupsName(pszCupsNo));
+	snprintf(stChnAct.id, sizeof(stChnAct.id), "%s%s", stChnAct.stlm_date, 
+		stChnAct.cups_no);
+
+	EXEC SQL DELETE FROM TBL_CHN_ACCOUT WHERE ID = :stChnAct.id;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "清理渠道(%s)本周期(%s)账务失败, err:(%d)(%s)", 
+			stChnAct.cups_no, stChnAct.stlm_date, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	if(RC_SUCC != nGetIboxAccout(&stChnAct))
+	{
+		HtLog(ERR_PARAM, "根据渠道(%s)账务时间统计盒子账单失败, err:(%d)(%s)", 
+			pszCupsNo, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL SELECT 
+		NVL(COUNT(*), 0), 
+		NVL(SUM(TX_AMT), 0.00), 
+		NVL(SUM(CUP_FEE), 0.00), 
+		NVL(SUM(TX_AMT) - SUM(CUP_FEE), 0.00)
+	INTO 
+		:stChnAct.cups_num, 
+		:stChnAct.cups_amt, 
+		:stChnAct.cups_fee, 
+		:stChnAct.cups_recv
+	FROM TBL_CUP_SUCC WHERE STLM_DATE IN
+		(SELECT TO_CHAR(TO_DATE(TRANS_DATE, 'YYYYMMDD') + 1, 'YYYYMMDD')
+			FROM TBL_STLM_DATE WHERE STLM_DATE = :stChnAct.stlm_date)
+	AND CUPS_NO = :stChnAct.cups_no
+	AND RESULT_FLAG IN (:szInit, :szErr, :szSucc);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "统计渠道(%s)账单失败, err:(%d)(%s)", pszCupsNo,
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL SELECT 
+		NVL(COUNT(*), 0), 
+		NVL(SUM(TX_AMT), 0.00), 
+		NVL(SUM(CUP_FEE), 0.00), 
+		NVL(SUM(TX_AMT) - SUM(CUP_FEE), 0.00)
+	INTO 
+		:stChnAct.right_num, 
+		:stChnAct.right_amt, 
+		:stChnAct.right_fee, 
+		:stChnAct.right_recv
+	FROM TBL_CUP_SUCC WHERE STLM_DATE IN
+		(SELECT TO_CHAR(TO_DATE(TRANS_DATE, 'YYYYMMDD') + 1, 'YYYYMMDD')
+			FROM TBL_STLM_DATE WHERE STLM_DATE = :stChnAct.stlm_date)
+	AND CUPS_NO = :stChnAct.cups_no
+	AND RESULT_FLAG = :szSucc;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "统计渠道对平(%s)账单失败, err:(%d)(%s)", pszCupsNo,
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL INSERT INTO TBL_CHN_ACCOUT VALUES(:stChnAct);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "统计渠道(%s)相关金额失败, err:(%d)(%s)(%s)", stChnAct.cups_no,
+			SQLCODE, sDbsError(), stChnAct.id);
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nUpdateCupsAmt(TStlmSucc *pstSucc)								*/
+/*   功能  ： 根据渠道计算通道成本													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nUpdateCupsAmt(TStlmSucc *pstSucc, char *pszSettleDate, double dTotalAmt)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	double	dCupFee = 0.00;
+	char	szTime[15], szId[23];
+	EXEC SQL END DECLARE SECTION;
+
+	//	针对每一个渠道计算渠道手续费
+	if(RC_SUCC != nCalcCupsFee(pstSucc,&pstSucc->cup_fee, dTotalAmt))
+	{
+		HtLog(ERR_PARAM, "获取渠道(%s)费率规则出错, id(%s), fd42(%s)fd41(%s)", 
+			pstSucc->cups_no, pstSucc->id, pstSucc->fd42, pstSucc->fd41);
+		return RC_FAIL;
+	}
+
+	if(STLM_SUCC_FLG_OK != pstSucc->result_flag[0])
+		return RC_SUCC;	
+
+	memset(szTime, 0, sizeof(szTime));	
+	memset(szId, 0, sizeof(szId));	
+	memcpy(szTime, pstSucc->rec_upd_ts, 14);
+	memcpy(szId, pstSucc->id, sizeof(szId) - 1);
+	dCupFee = pstSucc->cup_fee;
+
+	EXEC SQL UPDATE TBL_ALGO_DTL SET 
+		CUP_FEE = :dCupFee,
+		OTHER_FEE = FEE_AMT - :dCupFee,
+		REC_UPD_TS = :szTime
+	WHERE ID = :szId;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "更新清分表渠道金额失败, err:(%d)(%s)ID(%s)", 
+			SQLCODE, sDbsError(), pstSucc->id);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetChannelFeeByTranDate(char *pszSettleDate, char *pszSettleNum,	*/
+/*				char *pszCupsNo)													*/
+/*   功能  ： 清分处理流程															*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int	nGetChannelFeeByTranDate(char* pszSettleDate, char* pszSettleNum, char* pszCupsNo)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szSettleDate[9], szTransDate[9],szCupsNo[5], szSettleNum[5];
+	double  dTotalAmt = 0;
+	char szCode[3], szChk[3];
+	char szStat[2];
+	int iRet = 0;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szCode, 0, sizeof(szCode));
+	memset(szChk, 0, sizeof(szChk));
+	memset(szStat,0, sizeof(szStat));
+
+	strcpy(szCode, "31");
+	strcpy(szChk, "51");
+	strcpy(szStat, "0");
+
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+
+	memcpy(szSettleDate, pszSettleDate, 8);
+	memcpy(szSettleNum, pszSettleNum, 4);
+	memcpy(szCupsNo, pszCupsNo, 4);
+
+	EXEC SQL DECLARE Cur_stlm_date CURSOR FOR		
+ 				SELECT TRANS_DATE FROM TBL_STLM_DATE
+				WHERE STLM_DATE = :szSettleDate;		
+
+	EXEC SQL OPEN Cur_stlm_date;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询节假日表出错, err:(%d)(%s)",
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&szTransDate, 0, sizeof(szTransDate));
+		EXEC SQL FETCH Cur_stlm_date INTO :szTransDate;
+		if(SQLCODE == DBS_NOTFOUND)
+		{
+			HtLog(ERR_PARAM, "select tbl_stlm_date over");
+			break;
+		}
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "查询节假日表出错, err:(%d)(%s)",
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_stlm_date;
+			return RC_FAIL;
+		}
+		
+		//目前仅仅银视通计算交易总金额
+		if (strcmp(szCupsNo, "cntp") == 0)
+		{
+			EXEC SQL SELECT SUM(TX_AMT) INTO
+				:dTotalAmt FROM TBL_TXN_SUCC WHERE
+				TX_DATE = :szTransDate
+				and TX_SUB_CODE = :szCode OR TX_SUB_CODE = :szChk
+				and STAT = :szStat
+				and CUPS_NO = :szCupsNo;
+		}	
+
+		HtLog(ERR_PARAM, "渠道(%s)交易日期(%s)开始计算", szCupsNo,szTransDate);
+		
+		iRet = nCalChannelFee(szTransDate, szSettleNum, szCupsNo, dTotalAmt);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "计算渠道手续费失败, err:(%d)\n", iRet);
+			EXEC SQL CLOSE Cur_stlm_date;
+			return RC_FAIL;
+		}
+
+	}
+
+	EXEC SQL CLOSE Cur_stlm_date;
+
+	return nCreateChnAct(pszSettleDate, pszSettleNum, pszCupsNo);
+}
+
+/************************************************************************************/
+/*   声明  ： int nCalChannelFee(char *pszSettleDate, char *pszSettleNum, 			*/
+/*				char *pszCupsNo, double dTotalAmt)									*/
+/*   功能  ： 清分处理流程															*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nCalChannelFee(char *pszSettleDate, char *pszSettleNum, char *pszCupsNo, double dTotalAmt)
+{
+	int			iRet, lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szSettleNum[5], szSettleDate[9], szCupsNo[5];
+	TStlmSucc	stSucc;
+	EXEC SQL END DECLARE SECTION;
+
+	HtLog(NML_PARAM, "开始计算渠道(%s)批次(%s)手续费", pszCupsNo, pszSettleNum);
+
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+
+	memcpy(szSettleDate, pszSettleDate, 8);
+	memcpy(szSettleNum, pszSettleNum, 4);
+	memcpy(szCupsNo, pszCupsNo, 4);
+	
+	EXEC SQL DECLARE Cur_stlm_succ CURSOR FOR 
+		SELECT * FROM TBL_STLM_SUCC WHERE TX_DATE = :szSettleDate
+		AND CUPS_NO = :szCupsNo ORDER BY TX_DATE, TX_TIME;
+
+	EXEC SQL OPEN Cur_stlm_succ;		
+	if(SQLCODE) 
+	{
+		HtLog(ERR_PARAM, "查询批次(%s)渠道(%s)清分流水出错, err:(%d)(%s)", 
+			szSettleNum, pszCupsNo, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+  
+	while(1)
+	{
+		memset(&stSucc, 0, sizeof(stSucc));
+		EXEC SQL FETCH Cur_stlm_succ INTO :stSucc;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "查询批次(%s)渠道(%s)清分流水出错, err:(%d)(%s)", 
+				szSettleNum, pszCupsNo, SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_stlm_succ;
+			return RC_FAIL;
+		}
+
+		vTrimStlmSucc(&stSucc);
+		if(RC_SUCC != nUpdateCupsAmt(&stSucc, pszSettleDate, dTotalAmt))
+		{
+			HtLog(ERR_PARAM, "清分商户清分明细失败!");
+			EXEC SQL CLOSE Cur_stlm_succ;
+			return RC_FAIL;
+		}
+
+		memcpy(stSucc.rec_upd_ts, sGetCurrentTime(), 14);	
+
+		EXEC SQL UPDATE TBL_STLM_SUCC SET 
+			CUP_FEE = :stSucc.cup_fee, 
+			REC_UPD_TS = :stSucc.rec_upd_ts
+		WHERE ID = :stSucc.id;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新对账成功表渠道金额失败, err:(%d)(%s)ID(%s)", 
+				SQLCODE, sDbsError(), stSucc.id);
+			EXEC SQL CLOSE Cur_stlm_succ;
+			return RC_FAIL;
+		}
+
+		if(++ lCount % 1000 == 0)
+			EXEC SQL COMMIT WORK;
+	}  
+	EXEC SQL CLOSE Cur_stlm_succ;
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "本批次(%s)清分总条数(%d)", pszSettleNum, lCount);
+
+
+	return RC_SUCC;
+
+	//return nCreateChnAct(pszSettleDate, pszSettleNum, pszCupsNo);
+}
+
+/************************************************************************************
+ ************************************************************************************/

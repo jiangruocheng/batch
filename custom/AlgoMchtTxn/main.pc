@@ -1,0 +1,237 @@
+/*****************************************************************
+ *  功能: 流水清分处理程序(商户资金清分)
+ *	Author：DeffPuzzL
+ *  Edit History:
+ ****************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_stlm_succ.h"
+#include "tbl_algo_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INCLUDE SQLCA;
+
+extern  int nDoneAlgoDtl(TStlmSucc *pstSucc, char *pszSettleDate, char *pszSettleNum);
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int main(int argc, char **argv )										*/
+/*   功能  ： 完成清分全流程														*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int main(int argc , char ** argv)
+{
+	int		iRet = 0;
+	long	lTrace = 0;
+	char	szSettleDate[9], szMcht[31], szSettleNum[5]; 
+	
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	sprintf(gsLogFile, "AlgoMchtTxn.log");
+   
+	vPrintVersion(argv[1]);
+	if(argc != 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szMcht, 0, sizeof(szMcht));
+	memcpy(szMcht, argv[4], sizeof(szMcht) - 1);
+	sTrimAll(szMcht);
+	lTrace = atol(szMcht);
+
+	snprintf(gsLogFile, sizeof(gsLogFile), "AlgoMchtTxn_%d.log", lTrace);
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleDate, argv[1], sizeof(szSettleDate) - 1);
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);  
+
+	HtLog(NML_PARAM, "日期(%s)(%s), 流水类型(%d)明细开始.", szSettleDate, szSettleNum, lTrace);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "数据库连接失败, err:(%d)(%s)\n", iRet, sDbsError());
+		return RC_FAIL;
+	}
+	
+	iRet = nAlgoMchtTxn(szSettleDate, szSettleNum, lTrace);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "对商户清分失败, err:(%d)\n", iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	} 
+   
+	/*断开数据库*/
+	vDbsDisconnect();
+	HtLog(NML_PARAM, "商户清分流程结束.\n");
+
+	return RC_SUCC;
+}
+
+
+/************************************************************************************/
+/*   声明  ： int nAlgoMchtTxn(char *pszSettleDate, char *pszSettleNum, long lLast)	*/
+/*   功能  ： 清分处理流程															*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nAlgoMchtTxn(char *pszSettleDate, char *pszSettleNum, long lLast)
+{
+	int			iRet, lCount = 0;
+	BOOL		bSucc = true;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szInit[2], szStlmTime[7], szSettleNum[5];
+	char		szDone[2], szSettleDate[9], szTime[15];
+	long		lTrace; 
+	TStlmSucc	stSucc;
+	EXEC SQL END DECLARE SECTION;
+
+	HtLog(NML_PARAM, "清分处理流程开始, 所属流水规则号(%d)", lLast);
+
+	memset(szInit, 0, sizeof(szInit));
+	memset(szDone, 0, sizeof(szDone));
+	memset(szTime, 0, sizeof(szTime));
+	memset(szStlmTime, 0, sizeof(szStlmTime));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+
+	memcpy(szSettleNum, pszSettleNum, sizeof(szSettleNum) - 1);
+	memcpy(szSettleDate, pszSettleDate, sizeof(szSettleDate) - 1);
+	memcpy(szStlmTime, IBP_SETTLE_TIME, 6);
+	szInit[0] = STLM_SUCC_FLG_INIT;
+	lTrace = lLast;
+	memcpy(szTime, sGetCurrentTime(), sizeof(szTime) - 1);
+	
+	if('0' == pszSettleNum[1])
+	{
+		EXEC SQL DECLARE Cur_stlm_succ_t0 CURSOR FOR 
+			SELECT * FROM TBL_STLM_SUCC WHERE RESULT_FLAG = :szInit AND 
+				(TX_DATE < :szSettleDate OR (TX_DATE = :szSettleDate AND TX_TIME <= :szStlmTime)) 
+			AND DISC_CYCLE = 0 AND SETTLEMODE IS NULL AND MOD(IBOX42, 20) = :lTrace 
+				ORDER BY IBOX42, TX_DATE, TX_TIME;
+	}
+	else
+	{
+		EXEC SQL DECLARE Cur_stlm_succ_tn CURSOR FOR 
+			SELECT * FROM TBL_STLM_SUCC WHERE RESULT_FLAG =:szInit
+			AND (TX_DATE < (SELECT MAX(TRANS_DATE) FROM TBL_STLM_DATE WHERE 
+				RESV1 = (SELECT MAX(RESV1) - (DISC_CYCLE - 1) FROM TBL_STLM_DATE 
+					WHERE STLM_DATE = :szSettleDate))
+			OR (TX_DATE = (SELECT MAX(TRANS_DATE) FROM TBL_STLM_DATE WHERE 
+				RESV1 = (SELECT MAX(RESV1) - (DISC_CYCLE - 1) FROM TBL_STLM_DATE 
+					WHERE STLM_DATE = :szSettleDate))
+			AND TX_TIME <= :szStlmTime)) AND DISC_CYCLE > 0 AND MOD(IBOX42,20) = :lTrace 
+		ORDER BY IBOX42, TX_DATE, TX_TIME;
+	}
+
+	if('0' == pszSettleNum[1])
+		EXEC SQL OPEN Cur_stlm_succ_t0;		
+	else
+		EXEC SQL OPEN Cur_stlm_succ_tn;		
+	if(SQLCODE) 
+	{
+		HtLog(ERR_PARAM, "查询流水规则(%d)下商户交易明细清分出错, err:(%d)(%s)", lTrace,
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+  
+	while(1)
+	{
+		memset(&stSucc, 0, sizeof(stSucc));
+		if('0' == pszSettleNum[1])
+			EXEC SQL FETCH Cur_stlm_succ_t0 INTO :stSucc;
+		else
+			EXEC SQL FETCH Cur_stlm_succ_tn INTO :stSucc;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			bSucc = false;
+			HtLog(ERR_PARAM, "查询流水规则(%d)下商户交易明细清分出错, err:(%d)(%s)", 
+				lTrace, SQLCODE, sDbsError());
+			break;
+		}
+
+		vTrimStlmSucc(&stSucc);
+		if(RC_SUCC != nDoneAlgoDtl(&stSucc, pszSettleDate, pszSettleNum))
+		{
+			bSucc = false;
+			HtLog(ERR_PARAM, "清分商户清分明细失败!");
+			break;
+		}
+
+		stSucc.result_flag[0] = STLM_SUCC_FLG_OK;	//	已清分状态
+
+		EXEC SQL UPDATE TBL_STLM_SUCC SET 
+			RESULT_FLAG = :stSucc.result_flag, REC_UPD_TS = :szTime
+		WHERE ID = :stSucc.id;
+		if(SQLCODE)
+		{
+			bSucc = false;
+			HtLog(ERR_PARAM, "更新对账成功表状态失败, err:(%d)(%s)ID(%s)", SQLCODE, 
+				sDbsError(), stSucc.id);
+			break;
+		}
+
+		if(++ lCount % 1000 == 0)
+			EXEC SQL COMMIT WORK;
+	}  
+	if('0' == pszSettleNum[1])
+		EXEC SQL CLOSE Cur_stlm_succ_t0;
+	else
+		EXEC SQL CLOSE Cur_stlm_succ_tn;
+	if(!bSucc)
+	{
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	szInit[0] = STLM_CUP_TO_DONE;
+	szDone[0] = STLM_CUP_SETTLE_SUCC;
+	//	填充差错处理日期字段
+	EXEC SQL UPDATE TBL_STLM_ERR SET 
+		RESULT_FLAG = :szDone,
+		NEXT_DATE = :szSettleDate,
+		 REC_UPD_TS = :szTime
+	WHERE RESULT_FLAG = :szInit AND MOD(IBOX42,20) = :lTrace AND 
+		ID IN (SELECT ID FROM TBL_ALGO_DTL WHERE 
+			ALGO_DATE = :szSettleDate AND SETTLE_NUM = :szSettleNum);
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新差错表状态失败, err:(%d)(%s)(%d)", SQLCODE, sDbsError(), 
+			lTrace);
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "本批次(%s)清分总条数(%d)", pszSettleNum, lCount);
+	return RC_SUCC;
+}
+
+/************************************************************************************
+	code end
+ ************************************************************************************/

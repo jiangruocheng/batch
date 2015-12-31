@@ -1,0 +1,626 @@
+/******************************************************************
+ *文 件 名: UnLoadTxn.c
+*功	能: 导出tbl_n_txn当日交易流水，生成流水文件
+*编程人员: DeffPuzzL
+*编程时间: 20150115
+******************************************************************/
+
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_n_txn.h"    
+#include "tbl_n_txn_ind.h"
+#include "tbl_order_inf.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int nLoadFromNTxn														*/
+/*   功能  ： 卸载指定日志的本地流水文件											*/
+/*   参数  ： pszYDay	--日期														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nLoadFromNTxn(char *pszYDay)
+{
+	int	 iRet = 0, iCount =0;
+	FILE	*fp = NULL, *fpOrder = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TNTxn		stTxn;
+	TNTxnInd    stTxnInd;
+	TOrderInf	stOrder;
+	char		szFlag[2], szCode[3], szChk[3];
+	char		szDate[9], szTime[7], szExport[2];
+	EXEC SQL END DECLARE SECTION;
+	char	szFile[512], szOrder[512];
+	
+	memset(szFile, 0, sizeof(szFile));
+	memset(szOrder, 0, sizeof(szOrder));
+	snprintf(szFile, sizeof(szFile), "%s/TBLNTXT%s.txt", getenv("POSP_FILE_PATH"), pszYDay);
+	snprintf(szOrder, sizeof(szOrder), "%s/ORDER%s.txt", getenv("POSP_FILE_PATH"), pszYDay);
+	HtLog(NML_PARAM, "YesterDay[%s], TN流水文件(%s), 渠道订单文件(%s)", pszYDay, szFile, szOrder);
+
+	if(NULL == (fp = fopen(szFile, "w")))
+	{
+		HtLog(ERR_PARAM, "打开文件(%s)失败, err:(%s)", szFile, strerror(errno));
+		return RC_FAIL;
+	}
+	
+	if(NULL == (fpOrder = fopen(szOrder, "w")))
+	{
+		fclose(fp);
+		HtLog(ERR_PARAM, "打开文件(%s)失败, err:(%s)", szOrder, strerror(errno));
+		return RC_FAIL;
+	}
+
+	memset(szDate, 0, sizeof(szDate));
+	memset(szCode, 0, sizeof(szCode));
+	memset(szChk, 0, sizeof(szChk));
+	memset(szExport, 0, sizeof(szExport));
+	memset(szFlag, 0, sizeof(szFlag));
+
+	memcpy(szDate, pszYDay, 8);
+	strcpy(szCode, "30");
+	strcpy(szChk, "50");
+	szFlag[0] = '0';
+	szExport[0] = '1';
+
+	/* 取当天所有交易流水  */
+	EXEC SQL DECLARE Cur_n_txn CURSOR FOR SELECT 
+	    id,
+        tx_date,
+        tx_time,
+        trace_no,
+        ibox_no,
+        order_no,
+        cups_no,
+        ac_no,
+        user_id,
+        disc_cycle,
+        export_flag,
+        ac_type,
+        ac_bank_no,
+        tx_amt,
+        fee_amt,
+        cups_fee,
+        re_tx_amt,
+        tx_code,
+        tx_name,
+        tx_sub_code,
+        brno,
+        longitude,
+        latitude,
+        sw_respcd,
+        ibox_respcd,
+        stat,
+        brf,
+        fill,
+        fd3,
+        fd7,
+        ibox11,
+        fd11,
+        fd12,
+        fd13,
+        fd15,
+        ibox18,
+        fd18,
+        fd19,
+        fd22,
+        fd23,
+        fd25,
+        fd28,
+        fd32,
+        fd33,
+        fd35,
+        fd36,
+        fd37,
+        fd38,
+        fd39,
+        ibox41,
+        fd41,
+        ibox42,
+        fd42,
+        ibox43,
+        fd43,
+        fd49,
+        fd55,
+        fd60,
+        fd61,
+        fd90_1,
+        fd90_2,
+        fd90_3,
+        fd90_4,
+        fd90_5,
+        fd100,
+        fd102,
+        fd103,
+        fdx,
+        fdxx,
+        fdxxx,
+        expand,
+        errstr,
+        resv1,
+        resv2,
+        resv3,
+        ibox_batch_no,
+        ibox60,
+        ibox61,
+        ibox62,
+        batch_no,
+        fd44,
+        fd62,
+        rsp_fd55,
+        inst_date,
+        updt_date,
+        ibox42_lsd,
+        ibox43_lsd,
+        servetype,
+        promtsid,
+        promtsmode,
+        promtsvalue,
+        settlemode,
+        chan_mod_id,
+        chan_name,
+        fd6,
+        fd10,
+        fd51,
+        is_dcc,
+        card_brand,
+        uni_order_no
+    FROM TBL_N_TXN WHERE TX_DATE <= :szDate 
+    AND SUBSTR(EXPORT_FLAG, 2, 1) = :szFlag 
+    AND TX_SUB_CODE NOT IN (:szCode, :szChk) 
+    ORDER BY TX_DATE, TX_TIME;
+
+	EXEC SQL OPEN Cur_n_txn;
+	if(SQLCODE)
+	{
+		fclose(fp);
+		fclose(fpOrder);
+		HtLog(ERR_PARAM, "定义表TBL_N_TXN错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stTxn, 0, sizeof(stTxn));
+		memset(&stTxnInd, 0, sizeof(stTxnInd));
+		EXEC SQL FETCH Cur_n_txn INTO :stTxn :stTxnInd;
+		if(SQLERR)
+		{
+			fclose(fp);
+			fclose(fpOrder);
+			HtLog(ERR_PARAM, "获取流水TBL_N_TXN数据失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_n_txn;
+			return RC_FAIL;
+		}
+		else if(DBS_NOTFOUND == SQLCODE)
+			break;
+
+		vTrimNTxn(&stTxn);
+		fprintf(fp, "%8s%10s%12s%24s%20s%4s%19s%16d%16d%16d%15s%16.2f%16.2f%16.2f%16.2f%20s"
+			"%20s%20s%20s%20s%8s%8s%1s%60s%60s%6s%10s%6s%6s%6s%4s%4s%4s%9s%12s%6s%6s%15s%15s"
+			"%25s%15s%200s%60s%3s%100s%11s%28s%28s%16d%32s%128s%16d%6s%4s%16d%4s%16.2f%128s%4s\n", 
+			stTxn.tx_date, stTxn.tx_time, stTxn.trace_no, stTxn.ibox_no, stTxn.order_no, stTxn.cups_no, 
+			stTxn.ac_no, stTxn.user_id, stTxn.disc_cycle, stTxn.ac_type, stTxn.ac_bank_no, 
+			stTxn.tx_amt, stTxn.fee_amt, stTxn.cups_fee, stTxn.re_tx_amt, stTxn.tx_code, 
+			stTxn.tx_sub_code, stTxn.brno, stTxn.longitude, stTxn.latitude, stTxn.sw_respcd, 
+			stTxn.ibox_respcd, stTxn.stat, stTxn.brf, stTxn.fill, stTxn.fd3, stTxn.fd7, 
+			stTxn.ibox11, stTxn.fd11, stTxn.fd12, stTxn.fd13, stTxn.fd15, stTxn.ibox18, 
+			stTxn.fd28, stTxn.fd37, stTxn.fd38, stTxn.fd39, stTxn.ibox41, stTxn.fd41, 
+			stTxn.ibox42, stTxn.fd42, stTxn.ibox43, stTxn.fd43, stTxn.fd49, stTxn.fd60, 
+			stTxn.fd100, stTxn.fd102, stTxn.fd103, stTxn.fdx, stTxn.fdxx, stTxn.fdxxx, 
+			stTxn.expand, stTxn.ibox_batch_no, stTxn.servetype, stTxn.promtsid, stTxn.promtsmode,	
+			stTxn.promtsvalue, stTxn.fd62, stTxn.settlemode);
+		iCount ++;
+	}
+	EXEC SQL CLOSE Cur_n_txn;
+	fclose(fp);
+ 	fclose(fpOrder);
+	HtLog(ERR_PARAM, "本次从业务流水表中导出个数(%d)", iCount);
+
+	HtLog(NML_PARAM, "对导出的流水更新标识!");
+	EXEC SQL UPDATE TBL_N_TXN SET 
+			EXPORT_FLAG = SUBSTR(EXPORT_FLAG, 1, 1) || :szExport
+		WHERE TX_DATE <= :szDate AND SUBSTR(EXPORT_FLAG, 2, 1) = :szFlag 
+			AND TX_SUB_CODE NOT IN (:szCode, :szChk);
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "更新交易流水表TBL_N_TXN导出标识失败, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	lDbsCommit();
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： nDumpMemMcht(char *pszDate, char *pszStlmNum, char *pszTime)			*/
+/*   功能  ： T+0数据导出															*/
+/*  返回值 ： RC_SUCC--  成功														*/
+/*			  RC_FAIL--  失败														*/
+/************************************************************************************/
+int		nDumpMemMcht(char *pszDate, char *pszStlmNum, char *pszTime)
+{
+	int	 iRet;
+	FILE	*fp = NULL;
+	char	szFile[512];
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szFlag[2], szCode[10], szChk[10], szID[50];
+	char	szDate[9], szTime[7], szStat[2], szIBox42[30], szChnl[5];
+	long	lDisc = 0;
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szDate, 0, sizeof(szDate));
+	memset(szTime, 0, sizeof(szTime));
+	memset(szCode, 0, sizeof(szCode));
+	memset(szChk, 0, sizeof(szChk));
+	memset(szStat, 0, sizeof(szStat));
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szChnl, 0, sizeof(szChnl));
+
+	memcpy(szDate, pszDate, 8);
+	memcpy(szTime, pszTime, 6);
+	strcpy(szCode, "31");
+	strcpy(szChk, "51");
+	strcpy(szChnl, "vway");
+	szFlag[0] = '0';
+	szStat[0] = '0';
+
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "%s/MCHT%s_%s.txt", getenv("POSP_FILE_PATH"), 
+		pszDate, pszStlmNum);
+
+	if(NULL == (fp = fopen(szFile, "w+")))
+	{
+		HtLog(ERR_PARAM, "打开文件[%s]失败, err:(%s)", szFile, strerror(errno));
+		return RC_FAIL;
+	}
+
+	//	获取本周期T+0带清算商户信息
+	EXEC SQL DECLARE Cur_n_txn_mcht CURSOR FOR SELECT NVL(ID, ' '), NVL(IBOX42, ' ') FROM TBL_N_TXN 
+		WHERE (TX_DATE < :szDate OR (TX_DATE = :szDate AND TX_TIME < :szTime)) AND 
+		SUBSTR(EXPORT_FLAG, 1, 1) = :szFlag AND (TX_SUB_CODE = :szCode OR TX_SUB_CODE = :szChk) 
+		AND STAT = :szStat AND DISC_CYCLE = :lDisc AND CUPS_NO <> :szChnl GROUP BY IBOX42, ID;
+
+	EXEC SQL OPEN Cur_n_txn_mcht;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表TBL_N_TXN错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&szID, 0, sizeof(szID));
+		memset(&szIBox42, 0, sizeof(szIBox42));
+		EXEC SQL FETCH Cur_n_txn_mcht INTO :szID, :szIBox42;
+		if(SQLERR)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "获取流水TBL_N_TXN数据失败, err:(%d)(%s)",SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_n_txn_mcht;
+			return RC_FAIL;
+		}
+		else if(DBS_NOTFOUND == SQLCODE)
+			break;
+	
+		sTrimAll(szIBox42);
+		if(0 >= strlen(szIBox42))
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "商户号为空(%s), 异常(%s)", szIBox42, szID);
+			return RC_FAIL;
+		}	
+
+		fprintf(fp, "%s\n", szIBox42);
+	}
+	EXEC SQL CLOSE Cur_n_txn_mcht;
+	fclose(fp);
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： nLoadToSucc(char *pszDate, char *pszStlmNum)							*/
+/*   功能  ： T+0数据导出														   */
+/*  返回值 ： RC_SUCC--  成功														*/
+/*			  RC_FAIL--  失败														*/
+/************************************************************************************/
+int		nLoadToSucc(char *pszDate, char *pszStlmNum)
+{
+	int	 iRet;
+	FILE	*fp = NULL;
+	char	szCmd[512], szFile[512];
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szExport[2], szFlag[2], szCode[3], szChk[3];
+	char	szDate[9], szTime[7], szStat[2], szChnl[5];
+	long	lDisc = 0;
+	TNTxn	stTxn;
+	TNTxnInd    stTxnInd;
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szDate, 0, sizeof(szDate));
+	memset(szTime, 0, sizeof(szTime));
+	memset(szChnl, 0, sizeof(szChnl));
+	memcpy(szDate, pszDate, 8);
+	snprintf(szTime, sizeof(szTime), "%s", sGetTimeAlgo(-5));
+	iRet = nDumpMemMcht(pszDate, pszStlmNum, szTime);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "导出T+0结算内存商户失败, (%d)", iRet);
+		return RC_FAIL;
+	}
+
+	//	开始导出T+0流水数据
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "%s/TBLNTXT%s_%s.txt", getenv("POSP_FILE_PATH"), 
+		pszDate, pszStlmNum);
+	HtLog(NML_PARAM, "本次批次(%s)流水文件[%s]", pszStlmNum, szFile);
+
+	memset(szCmd, 0, sizeof(szCmd));
+	snprintf(szCmd, sizeof(szCmd) - 1, "rm -f %s ", szFile);
+	HtLog(NML_PARAM, "szCmd=[%s]", szCmd);
+	system(szCmd);
+
+	memset(szCode, 0, sizeof(szCode));
+	memset(szChk, 0, sizeof(szChk));
+	memset(szStat, 0, sizeof(szStat));
+	memset(szExport, 0, sizeof(szExport));
+	memset(szFlag, 0, sizeof(szFlag));
+	strcpy(szCode, "31");
+	strcpy(szChk, "51");
+	strcpy(szChnl, "vway");
+	szFlag[0] = '0';
+	szExport[0] = '1';
+	szStat[0] = '0';
+
+	if(NULL == (fp = fopen(szFile, "w+")))
+	{
+		HtLog(ERR_PARAM, "open the file[%s] error!", szFile);
+		return RC_FAIL;
+	}
+	
+	HtLog(NML_PARAM, "本次导出日期(%s)在时间(%s)之前的(%s)交易流水", pszDate, szTime, pszStlmNum);
+	// 取当天所有交易流水
+	EXEC SQL DECLARE Cur_n_txn_t0 CURSOR FOR SELECT 
+	    id,
+        tx_date,
+        tx_time,
+        trace_no,
+        ibox_no,
+        order_no,
+        cups_no,
+        ac_no,
+        user_id,
+        disc_cycle,
+        export_flag,
+        ac_type,
+        ac_bank_no,
+        tx_amt,
+        fee_amt,
+        cups_fee,
+        re_tx_amt,
+        tx_code,
+        tx_name,
+        tx_sub_code,
+        brno,
+        longitude,
+        latitude,
+        sw_respcd,
+        ibox_respcd,
+        stat,
+        brf,
+        fill,
+        fd3,
+        fd7,
+        ibox11,
+        fd11,
+        fd12,
+        fd13,
+        fd15,
+        ibox18,
+        fd18,
+        fd19,
+        fd22,
+        fd23,
+        fd25,
+        fd28,
+        fd32,
+        fd33,
+        fd35,
+        fd36,
+        fd37,
+        fd38,
+        fd39,
+        ibox41,
+        fd41,
+        ibox42,
+        fd42,
+        ibox43,
+        fd43,
+        fd49,
+        fd55,
+        fd60,
+        fd61,
+        fd90_1,
+        fd90_2,
+        fd90_3,
+        fd90_4,
+        fd90_5,
+        fd100,
+        fd102,
+        fd103,
+        fdx,
+        fdxx,
+        fdxxx,
+        expand,
+        errstr,
+        resv1,
+        resv2,
+        resv3,
+        ibox_batch_no,
+        ibox60,
+        ibox61,
+        ibox62,
+        batch_no,
+        fd44,
+        fd62,
+        rsp_fd55,
+        inst_date,
+        updt_date,
+        ibox42_lsd,
+        ibox43_lsd,
+        servetype,
+        promtsid,
+        promtsmode,
+        promtsvalue,
+        settlemode,
+        chan_mod_id,
+        chan_name,
+        fd6,
+        fd10,
+        fd51,
+        is_dcc,
+        card_brand,
+        uni_order_no
+    FROM TBL_N_TXN 
+    WHERE (TX_DATE < :szDate OR (TX_DATE = :szDate AND TX_TIME < :szTime)) 
+    AND SUBSTR(EXPORT_FLAG, 1, 1) = :szFlag 
+    AND (TX_SUB_CODE = :szCode OR TX_SUB_CODE = :szChk) 
+    AND STAT = :szStat 
+    AND DISC_CYCLE = :lDisc 
+    AND CUPS_NO <> :szChnl 
+    ORDER BY TX_DATE, TX_TIME;
+
+	EXEC SQL OPEN Cur_n_txn_t0;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表TBL_N_TXN错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stTxn, 0, sizeof(stTxn));
+		memset(&stTxnInd, 0, sizeof(stTxnInd));
+		EXEC SQL FETCH Cur_n_txn_t0 INTO :stTxn :stTxnInd;
+		if(SQLERR)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "获取流水TBL_N_TXN数据失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_n_txn_t0;
+			return RC_FAIL;
+		}
+		else if(DBS_NOTFOUND == SQLCODE)
+			break;
+
+		vTrimNTxn(&stTxn);
+		fprintf(fp, "%8s%10s%12s%24s%20s%4s%19s%16d%16d%16d%15s%16.2f%16.2f%16.2f%16.2f%20s"
+			"%20s%20s%20s%20s%8s%8s%1s%60s%60s%6s%10s%6s%6s%6s%4s%4s%4s%9s%12s%6s%6s%15s%15s"
+			"%25s%15s%200s%60s%3s%100s%11s%28s%28s%16d%32s%128s%16d%4s%16d%4s%16.2f%4s\n", 
+			stTxn.tx_date, stTxn.tx_time, stTxn.trace_no, stTxn.ibox_no, stTxn.order_no, 
+			stTxn.cups_no, stTxn.ac_no, stTxn.user_id, stTxn.disc_cycle, stTxn.ac_type, 
+			stTxn.ac_bank_no, stTxn.tx_amt, stTxn.fee_amt, stTxn.cups_fee, stTxn.re_tx_amt, 
+			stTxn.tx_code, stTxn.tx_sub_code, stTxn.brno, stTxn.longitude, stTxn.latitude, 
+			stTxn.sw_respcd, stTxn.ibox_respcd, stTxn.stat, stTxn.brf, stTxn.fill, stTxn.fd3, 
+			stTxn.fd7, stTxn.ibox11, stTxn.fd11, stTxn.fd12, stTxn.fd13, stTxn.fd15, 
+			stTxn.ibox18, stTxn.fd28, stTxn.fd37, stTxn.fd38, stTxn.fd39, stTxn.ibox41, 
+			stTxn.fd41, stTxn.ibox42, stTxn.fd42, stTxn.ibox43, stTxn.fd43, stTxn.fd49, 
+			stTxn.fd60, stTxn.fd100, stTxn.fd102, stTxn.fd103, stTxn.fdx, stTxn.fdxx, 
+			stTxn.fdxxx, stTxn.expand, stTxn.servetype, stTxn.promtsid, stTxn.promtsmode,
+			stTxn.promtsvalue, stTxn.settlemode);
+	}
+	EXEC SQL CLOSE Cur_n_txn_t0;
+	fclose(fp);
+
+	HtLog(NML_PARAM, "对导出的流水更新标识!");
+	EXEC SQL UPDATE TBL_N_TXN SET EXPORT_FLAG =:szExport || SUBSTR(EXPORT_FLAG, 2, 1) 
+		WHERE (TX_DATE < :szDate OR (TX_DATE = :szDate AND TX_TIME < :szTime)) AND 
+		SUBSTR(EXPORT_FLAG, 1, 1) = :szFlag AND (TX_SUB_CODE = :szCode OR TX_SUB_CODE = :szChk) 
+		AND STAT = :szStat AND DISC_CYCLE = :lDisc AND CUPS_NO <> :szChnl;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新联机交易流水表导出标识失败, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	lDbsCommit();
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   函数名：					   本地流水卸载主函数							  	*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv)									*/
+/*   功能  ： 卸载POSP流水															*/	
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*		   ： argv (参数列表 -- 输出)											 	*/
+/*  返回值 ： RC_SUCC--  成功														*/
+/*			  RC_FAIL--  失败														*/
+/************************************************************************************/
+int main(int argc, char *argv[])
+{
+	int		iRet;
+	char	szDate[9];
+
+	memset(szDate, 0, sizeof(szDate));
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "UnLoadTxn.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	iRet = lDbsConnect(DBS_TXN);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%d)(%s)", SQLCODE, sDbsError());
+ 		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "执行从业务流水表中导出数据开始!");
+	if(!strncmp(argv[2], "TN00", 4))
+	{
+		HtLog(NML_PARAM, "T+N交易流水卸载");
+		memcpy(szDate, sGetChgDate(argv[1], -1), 8);
+		iRet = nLoadFromNTxn(szDate);
+	}
+	else
+	{
+		HtLog(NML_PARAM, "T+0交易流水卸载, SettleNum(%s)", argv[2]);
+		iRet = nLoadToSucc(argv[1], argv[2]);
+	}
+	if(iRet)	
+	{
+		HtLog(NML_PARAM, "装载失败, 清算批次(%s)", argv[2]);
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();
+	HtLog(NML_PARAM, "导出流水运行结束!");
+	return RC_SUCC;
+}

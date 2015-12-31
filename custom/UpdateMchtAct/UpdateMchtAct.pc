@@ -1,0 +1,574 @@
+/*****************************************************************
+*文 件 名: UpdateMchtAct.c
+*功	   能: 同步更新账户相关表
+******************************************************************/
+#include "DbsApi.h"
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"tbl_channel_trade.h"
+#include	"tbl_merchant_trade.h"
+#include	"tbl_merchant_settle_trade.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************
+	宏定义
+ ************************************************************************************/
+#define		TBL_CHANNEL_TRADE				1
+#define		TBL_MERCHANT_TRADE				2
+#define		TBL_MERCHANT_SETTLE_TRADE		3
+
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetTradeSeq(Benum em, long *plSeq)								*/
+/*   功能  ： 获取对应表序列														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGetTradeSeq(Benum em, long *plSeq)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lSeq = 0;
+	EXEC SQL END DECLARE SECTION;
+
+	if(TBL_CHANNEL_TRADE == em)
+	{
+		EXEC SQL SELECT SEQ_CHANNEL_TRADE.NEXTVAL INTO :lSeq FROM DUAL;
+	}
+	else if(TBL_MERCHANT_TRADE == em)
+	{
+		EXEC SQL SELECT SEQ_MERCHANT_TRADE.NEXTVAL INTO :lSeq FROM DUAL;
+	}
+	else if(TBL_MERCHANT_SETTLE_TRADE == em)
+	{
+		EXEC SQL SELECT SEQ_MERCHANT_SETTLE_TRADE.NEXTVAL INTO :lSeq FROM DUAL;
+	}
+	else
+		;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "获取(%d)序列失败, err:(%d)(%s)", em, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}	
+
+	*plSeq = lSeq;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetCupsAct(TChannelTrade *pstTrade, char *pszSettleDate, 		*/
+/*				char *pszCupsNo)													*/
+/*   功能  ： 更新商户账户数据														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGetCupsAct(TChannelTrade *pstTrade, char *pszSettleDate, char *pszCupsNo)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char			szStlmDate[9], szFlag[2];
+	TChannelTrade	stChnTrade;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(&stChnTrade, 0, sizeof(stChnTrade));
+
+	szFlag[0] = TRADE_TXN_SUCCESS;
+	memcpy(stChnTrade.channel_name, pszCupsNo, 4);
+	memcpy(stChnTrade.account_date, pszSettleDate, 8);
+	HtLog(NML_PARAM, "新增统计渠道(%s)日期(%s)账务", stChnTrade.channel_name,
+		stChnTrade.account_date);
+
+	szFlag[0] = TRADE_TXN_SUCCESS;
+	EXEC SQL SELECT NVL(SUM(TX_AMT), 0.00), NVL(SUM(CUP_FEE), 0.00), 
+		NVL(SUM(TX_AMT - CUP_FEE), 0.00) INTO :stChnTrade.normal_amount,
+		:stChnTrade.normal_fee, :stChnTrade.normal_settle_amount
+	FROM TBL_CUP_SUCC
+	WHERE STLM_DATE = :stChnTrade.account_date AND RESULT_FLAG = :szFlag 
+		AND CUPS_NO = :stChnTrade.channel_name;
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "统计(%s)渠道(%s)流水失败, err:(%d)(%s)", 
+			szStlmDate, stChnTrade.channel_name, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	else if(SQLNOTFOUND)
+		return DBS_NOTFOUND;
+	else
+		;
+
+	szFlag[0] = STLM_CUP_FLG_POSP;
+	EXEC SQL SELECT NVL(SUM(TX_AMT), 0.00), NVL(SUM(CUP_FEE), 0.00) 
+		INTO :stChnTrade.cash_short_amount, :stChnTrade.cash_short_fee 
+		FROM TBL_STLM_ERR 
+	WHERE STLM_DATE = :stChnTrade.account_date AND STLM_TYPE = :szFlag 
+		AND CUPS_NO = :stChnTrade.channel_name;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "更新通道清分入账交易流水表失败, err:(%d)(%s)", SQLCODE, 
+			sDbsError());
+		return RC_FAIL;
+	}
+
+	szFlag[0] = STLM_CUP_FLG_CUPS;
+	EXEC SQL SELECT NVL(SUM(TX_AMT), 0.00), NVL(SUM(CUP_FEE), 0.00) 
+		INTO :stChnTrade.cash_over_amount, :stChnTrade.cash_over_fee 
+		FROM TBL_STLM_ERR 
+	WHERE STLM_DATE = :stChnTrade.account_date AND STLM_TYPE = :szFlag 
+		AND CUPS_NO = :stChnTrade.channel_name;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "更新通道清分入账交易流水表失败, err:(%d)(%s)", SQLCODE, 
+			sDbsError());
+		return RC_FAIL;
+	}
+
+	if(RC_SUCC != nGetTradeSeq(TBL_CHANNEL_TRADE, &stChnTrade.id))
+	{
+		HtLog(ERR_PARAM, "获取表TBL_CHANNEL_TRADE序号失败!");
+		return RC_FAIL;
+	}
+
+	memcpy(stChnTrade.insert_time, sGetCurrentTime(), sizeof(stChnTrade.insert_time) - 1);
+	stChnTrade.status[0] = '0';
+	memcpy(pstTrade, &stChnTrade, sizeof(stChnTrade));	
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int lUpdateChnTrade(char *pszSettleDate, char *pszStlmNum)			*/
+/*   功能  ： 更新商户账户数据														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		lUpdateChnTrade(char *pszSettleDate, char *pszStlmNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long			lRet = 0, lRec = 0;
+	char			szCupsNo[5], szSettleDate[9], szFlag[2];
+	TChannelTrade	stChnTrade, stTrade;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memcpy(szSettleDate, pszSettleDate, sizeof(szSettleDate) - 1);
+
+	if(memcmp(pszStlmNum, "TC00", 4) && memcmp(pszStlmNum, "TN00", 4))
+		return RC_SUCC;
+
+	if(!memcmp(pszStlmNum, "TC00", 4))
+		szFlag[0] = CHANNEL_CLEAR_YES;
+	else if(!memcmp(pszStlmNum, "TN00", 4))
+		szFlag[0] = CHANNEL_CLEAR_NO;
+
+	EXEC SQL DECLARE Cur_chn_settle CURSOR FOR 
+		SELECT NVL(CUPS_NO, ' ') FROM TBL_CHN_SETTLE WHERE SETTLE_DATE = :szSettleDate 
+		AND CLEAR_FLAG = :szFlag GROUP BY CUPS_NO;
+
+	EXEC SQL OPEN Cur_chn_settle;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "统计渠道流水表失败, err:(%d)(%s)", SQLCODE, 
+			sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szCupsNo, 0, sizeof(szCupsNo));
+		EXEC SQL FETCH Cur_chn_settle INTO :szCupsNo;
+		if(SQLNOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "查询渠道表失败, err:(%d)(%s)",
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_chn_settle;
+			return RC_FAIL;
+		}	
+
+		sTrimAll(szCupsNo);
+		memset(&stTrade, 0, sizeof(stTrade));
+		lRet = nGetCupsAct(&stTrade, pszSettleDate, szCupsNo);
+		if(lRet <= RC_FAIL)
+		{
+			HtLog(ERR_PARAM, "统计日期(%s)渠道(%s)账务失败!", szSettleDate,
+				stChnTrade.channel_name);
+			EXEC SQL CLOSE Cur_chn_settle;
+			return RC_FAIL;
+		}
+		else if(lRet == DBS_NOTFOUND)
+			continue;
+		else
+			;
+
+		memset(&stChnTrade, 0, sizeof(stChnTrade));
+		EXEC SQL SELECT COUNT(*), NVL(SUM(NORMAL_AMOUNT), 0.00), 
+			NVL(SUM(NORMAL_FEE), 0.00), NVL(SUM(NORMAL_SETTLE_AMOUNT), 0.00), 
+			NVL(SUM(CASH_OVER_AMOUNT), 0.00), NVL(SUM(CASH_OVER_FEE), 0.00), 
+			NVL(SUM(CASH_SHORT_AMOUNT), 0.00), NVL(SUM(CASH_SHORT_FEE), 0.00)
+			INTO :lRec, :stChnTrade.normal_amount, :stChnTrade.normal_fee, 
+				:stChnTrade.normal_settle_amount, :stChnTrade.cash_over_amount, 
+				:stChnTrade.cash_over_fee, :stChnTrade.cash_short_amount, 
+				:stChnTrade.cash_short_fee
+			FROM TBL_CHANNEL_TRADE 
+		WHERE ACCOUNT_DATE = :szSettleDate AND CHANNEL_NAME = :szCupsNo;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "查询渠道(%s)表失败, err:(%d)(%s)", szCupsNo, 
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_chn_settle;
+			return RC_FAIL;
+		}	
+		
+		if(0 == lRec)
+			EXEC SQL INSERT INTO TBL_CHANNEL_TRADE VALUES(:stTrade);
+		else if(lRec > 0)
+		{
+			if(fabs(stChnTrade.normal_amount - stTrade.normal_amount) < 0.005 &&
+				fabs(stChnTrade.normal_fee - stTrade.normal_fee) < 0.005 &&
+				fabs(stChnTrade.normal_settle_amount - stTrade.normal_settle_amount) < 0.005 &&
+				fabs(stChnTrade.cash_over_amount - stTrade.cash_over_amount) < 0.005 &&
+				fabs(stChnTrade.cash_over_fee - stTrade.cash_over_fee) < 0.005 &&
+				fabs(stChnTrade.cash_short_amount - stTrade.cash_short_amount) < 0.005 &&
+				fabs(stChnTrade.cash_short_fee - stTrade.cash_short_fee) < 0.005)
+			{
+				HtLog(ERR_PARAM, "统计日期(%s)渠道(%s)账务一致, 无需处理!", szSettleDate, 
+					stTrade.channel_name);
+				continue;
+			}
+
+			EXEC SQL INSERT INTO TBL_CHANNEL_TRADE (ID, ACCOUNT_DATE, CHANNEL_NAME, 
+				NORMAL_AMOUNT, NORMAL_FEE, NORMAL_SETTLE_AMOUNT, CASH_OVER_AMOUNT, 
+				CASH_OVER_FEE, CASH_SHORT_AMOUNT, CASH_SHORT_FEE, INSERT_TIME, STATUS) 
+			VALUES (:stTrade.id, :stTrade.account_date, :stTrade.channel_name, 
+				:stTrade.normal_amount - :stChnTrade.normal_amount, 
+				:stTrade.normal_fee - :stChnTrade.normal_fee, 
+ 				:stTrade.normal_settle_amount - :stChnTrade.normal_settle_amount, 
+				:stTrade.cash_over_amount - :stChnTrade.cash_over_amount,
+ 				:stTrade.cash_over_fee - :stChnTrade.cash_over_fee,
+				:stTrade.cash_short_amount - :stChnTrade.cash_short_amount, 
+				:stTrade.cash_short_fee - :stChnTrade.cash_short_fee,
+				:stTrade.insert_time, '0');
+		}
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增渠道(%s)账务差异表失败, err:(%d)(%d)(%s)",
+				szCupsNo, lRec, SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_chn_settle;
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_chn_settle;
+
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetMchtTrade(char *pszMchtNo, char *pszSettleDate, 				*/
+/*				char *pszStlmNum)													*/
+/*   功能  ： 更新商户账户数据														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGetMchtTrade(char *pszMchtNo, char *pszSettleDate, char *pszStlmNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szFlag[2], szSettleNum[5], szTime[15];
+	char	szIbox42[26], szSettleDate[9];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szIbox42, 0, sizeof(szIbox42));
+	memset(szTime, 0, sizeof(szTime));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szTime, sGetCurrentTime(), sizeof(szTime) - 1);
+
+	szFlag[0] = STLM_SUCC_FLG_OK;
+	memcpy(szIbox42, pszMchtNo, sizeof(szIbox42) - 1);
+	memcpy(szSettleDate, pszSettleDate, sizeof(szSettleDate) - 1);
+	memcpy(szSettleNum, pszStlmNum, sizeof(szSettleNum) - 1);
+
+//	是否要删除流水?
+/*
+	EXEC SQL DELETE TBL_MERCHANT_SETTLE_TRADE WHERE SETTLE_DATE = :szSettleDate AND
+		SETTLE_TYPE = :szSettleNum;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "删除商户对账交易流水表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_SUCC;
+	}
+*/
+
+	EXEC SQL INSERT INTO TBL_MERCHANT_SETTLE_TRADE (ID, TRADE_NO, 
+		SETTLE_DATE, TRADE_TYPE, TRADE_DATE, MERCHANT_NO, TERM_NO,
+		CARD_NO, CURRENCY_TYPE, AMOUNT, MERCHANT_FEE, INSERT_TIME,
+		SETTLE_TYPE, STATUS)
+		SELECT SEQ_MERCHANT_SETTLE_TRADE.NEXTVAL, T.ID, :szSettleDate, 
+			NVL(T.TX_NAME, ' '), NVL(T.TX_DATE, ' '), NVL(T.IBOX42, ' '), 
+			NVL(T.IBOX41, ' '), NVL(T.AC_NO, ' '), NVL(N.FD49, ' '), NVL(T.TX_AMT, 0.00), 
+			NVL(T.FEE_AMT + T.MCHT_SERVE_FEE + T.SERV_FEE_KQDA - T.FREE_FEE, 0.00),
+			:szTime, :szSettleNum, '0'
+		FROM TBL_ALGO_DTL T, TBL_TXN_SUCC N
+		WHERE (T.SETTLE_MCHT, T.MCHT_TRACE_NO) IN (
+			SELECT L.IBOX42, L.TRACE_NO FROM TBL_MCHT_SETTLE_DTL L
+				WHERE L.SETTLE_DATE = :szSettleDate AND L.SETTLE_NUM = :szSettleNum
+					AND L.IBOX42 = :szIbox42)
+			AND T.ID = N.ID AND T.MCHT_FLAG = :szFlag AND T.ID NOT IN 
+				(SELECT RTRIM(D.TRADE_NO) FROM TBL_MERCHANT_SETTLE_TRADE D WHERE 
+					D.SETTLE_DATE = :szSettleDate AND D.SETTLE_TYPE = :szSettleNum);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增商户对账交易流水表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "新增TBL_MERCHANT_SETTLE_TRADE流水表记录(%d)", EFFECT_NUM);
+
+//	不考虑异常
+//	多的流水如何处理 ?
+
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int lUpdateMchtTrade(char *pszSettleDate, char *pszStlmNum)			*/
+/*   功能  ： 更新商户账户数据														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		lUpdateMchtTrade(char *pszSettleDate, char *pszStlmNum)
+{
+	long		lRet, lCount = 0, i = 0;
+	dbMchtBase	stBase, *pstBase = NULL;
+	RunTime		*pstRun = NULL;
+
+	if(!(pstRun = (RunTime *)pInitRunTime(TBL_MCHT_BASE)))
+	{
+		HtLog(ERR_PARAM, "初始化内存表(TBL_MCHT_BASE)失败, err:(%s)", sGetError());
+		return RC_FAIL;
+	}
+
+	memset(&stBase, 0, sizeof(stBase));
+	pstRun->lFind = CHK_SELECT;
+	pstRun->tblName = TBL_MCHT_BASE;
+	stBase.mcht_resv1 = lSetEXLong(5);		//	mcht_resv1=5的商户交易流水
+	pstRun->lSize = sizeof(stBase);
+	pstRun->pstVoid = &stBase;
+
+	lRet = lRunSelect(pstRun, (void **)&pstBase, (long *)&lCount);
+	if(RC_SUCC != lRet)
+	{
+		HtLog(ERR_PARAM, "查询内存表(TBL_MCHT_BASE)失败, err:(%s)", sGetError());
+		return RC_FAIL;
+	}
+
+	for(i = 0; i < lCount; i ++)
+	{
+		sTrimAll(pstBase[i].mcht_no);
+		HtLog(NML_PARAM, "商户(%s)处理(%d/%d)开始处理", pstBase[i].mcht_no,
+			i + 1, lCount);
+
+		if(RC_SUCC != nGetMchtTrade(pstBase[i].mcht_no, pszSettleDate, pszStlmNum))
+		{
+			HtLog(NML_PARAM, "商户(%s)处理失败!", pstBase[i].mcht_no);
+			IBPFree(pstBase);
+			return RC_FAIL;
+		}
+	}
+	IBPFree(pstBase);
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int lUpdateMerchant(char *pszSettleDate, char *pszStlmNum)			*/
+/*   功能  ： 更新商户账户数据														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		lUpdateMerchant(char *pszSettleDate, char *pszStlmNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szSettleNum[5], szSettleDate[9], szTime[15];
+	TMerchantTrade	stMTrade;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szTime, 0, sizeof(szTime));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	memcpy(szTime, sGetCurrentTime(), sizeof(szTime) - 1);
+	memcpy(szSettleNum, pszStlmNum, sizeof(szSettleNum) - 1);
+	memcpy(szSettleDate, pszSettleDate, sizeof(szSettleDate) - 1);
+
+//	是否要删除流水?
+/*
+	EXEC SQL DELETE TBL_MERCHANT_TRADE WHERE SETTLE_DATE = :szSettleDate AND
+		SETTLE_TYPE = :szSettleNum;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "删除商户对账交易流水表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_SUCC;
+	}
+*/
+
+	//	正常T+C/N存在多个批次
+	EXEC SQL INSERT INTO TBL_MERCHANT_TRADE (ID, SETTLE_TRADE_NO, 
+		ACCOUNT_DATE, MERCHANT_NO, AMOUNT, MERCHANT_FEE, CHANNEL_FEE, MERCHANT_SRV_CHARGE, 
+		ACTIVITY_DISCOUNT, INTERCEPTION_MONEY, INTERCEPTION_REN_MONEY, MERCHANT_SETTLE, 
+		INSERT_TIME, SETTLE_TYPE, STATUS)
+		SELECT SEQ_MERCHANT_TRADE.NEXTVAL, NVL(ID, ' '), NVL(SETTLE_DATE, ' '), 
+			NVL(IBOX42, ' '),  NVL(TX_AMT, 0.00), NVL(FEE_AMT + FREE_AMT, 0.00),
+			0.00, 0.00, NVL(FREE_AMT, 0.00), NVL(REPAIR_AMT, 0.00), 
+			NVL(UNREPAIR_AMT, 0.00), NVL(SETTLE_AMT - UPERR_AMT, 0.00), 
+			:szTime, :szSettleNum, '0'
+		FROM TBL_MCHT_SETTLE_DTL
+		WHERE SETTLE_DATE = :szSettleDate AND SETTLE_NUM = :szSettleNum
+			AND ID NOT IN (SELECT RTRIM(SETTLE_TRADE_NO) FROM TBL_MERCHANT_TRADE WHERE 
+					ACCOUNT_DATE = :szSettleDate AND SETTLE_TYPE = :szSettleNum);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增商户对账交易流水表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+	HtLog(NML_PARAM, "新增TBL_MERCHANT_TRADE流水表记录(%d)", EFFECT_NUM);
+	EXEC SQL UPDATE TBL_MERCHANT_TRADE M SET
+		(CHANNEL_FEE, MERCHANT_SRV_CHARGE) = (
+			SELECT SUM(NVL(A.CUP_FEE, 0.00)),
+				SUM(NVL(A.MCHT_SERVE_FEE, 0.00) + NVL(A.SERV_FEE_KQDA, 0.00))
+			FROM TBL_ALGO_DTL A, TBL_MCHT_SETTLE_DTL D
+			WHERE A.IBOX42 = M.MERCHANT_NO AND A.IBOX42 = D.IBOX42 AND 
+				A.MCHT_TRACE_NO = D.TRACE_NO AND D.SETTLE_NUM = :szSettleNum
+				AND D.SETTLE_DATE = :szSettleDate)
+	WHERE ACCOUNT_DATE = :szSettleDate AND SETTLE_TYPE = :szSettleNum;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新商户清分入账交易流水表失败, err:(%d)(%s)", SQLCODE, 
+			sDbsError());
+		EXEC SQL ROLLBACK WORK;
+		return RC_SUCC;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nUpdateMchtAct(char *pszStlmNum, char *pszSettleDate)				*/
+/*   功能  ： 更新商户账户数据														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nUpdateMchtAct(char *pszStlmNum, char *pszSettleDate)
+{
+
+	//	根据后续数据量，
+	//	步骤一：可以采用渠道编号多进程批量跑
+	//	步骤二：可以商户尾号多进程批量跑
+	//	步骤三：可以商户尾号多进程批量跑
+
+	//	步骤一：更新账务所需的3张表	TBL_CHANNEL_TRADE
+	if(RC_SUCC != lUpdateChnTrade(pszSettleDate, pszStlmNum))
+	{
+		HtLog(ERR_PARAM, "更新通道清分入账交易流水表失败!");
+		return RC_SUCC;
+	}
+
+	//	步骤二：商户对账交易流水表T_MERCHANT_SETTLE_TRADE
+	if(RC_SUCC != lUpdateMchtTrade(pszSettleDate, pszStlmNum))
+	{
+		HtLog(ERR_PARAM, "更新商户对账交易流水表失败!");
+		return RC_SUCC;
+	}
+
+	//	步骤三：商户清分入账交易流水表	TBL_MERCHANT_TRADE
+	if(RC_SUCC != lUpdateMerchant(pszSettleDate, pszStlmNum))
+	{
+		HtLog(ERR_PARAM, "更新商户清分入账交易流水表失败!");
+		return RC_SUCC;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   函数名：					   装载本地流水主函数								*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)											 	*/
+/*		   ： argv (参数列表 -- 输出)												*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		main(int argc, char **argv) 
+{
+	char	szDate[9], szSettleNum[5];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "UpdateMchtAct.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szDate, 0, sizeof(szDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szDate, argv[1], 8);
+	memcpy(szSettleNum, argv[2], 4);
+
+	HtLog(NML_PARAM, "开始更新商户账户周期(%s)批次(%s)流水数据!", 
+		szDate, szSettleNum);
+
+	if(RC_SUCC != lDbsConnect(DBS_BATCH))
+	{
+		HtLog(ERR_PARAM, "DbsConnect err:(%d)(%s)", sDbsError());
+		return RC_FAIL;
+	}
+
+	if(RC_SUCC != nUpdateMchtAct(szSettleNum, szDate))
+	{
+		HtLog(ERR_PARAM, "更新批次(%s)商户账户数据失败!", szSettleNum);
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();
+	HtLog(NML_PARAM, "更新商户账户数据完毕！");
+
+	return RC_SUCC;
+}

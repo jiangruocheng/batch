@@ -1,0 +1,228 @@
+/*****************************************************************************
+ *  批量模块 run a bat
+ *
+ *  Edit History:
+ *
+ *****************************************************************************/
+#include "Ibp.h"
+#include "DbsApi.h"
+#include "pos_stlm.h"
+#include "load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+typedef struct {
+	char sBatId[5];
+	char sStlmDate[8];
+	char sStlmNum[4];
+	char sArgc[2];
+	char sArgv[256];
+	char sRspCode[2];
+	char sRspDsp[256];
+}t_Console_Cmd_Def;
+
+int main(int argc , char **argv) 
+{
+	int  iRet = 0;
+
+	if(argc < 4)
+	{
+		fprintf(stderr, "Usage: %s YYYYMMDD STLM_NUM BAT_ID Other\n", argv[0]);
+		return RC_FAIL;
+	}
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		fprintf(stderr, "DbsConnect error [%d]\n", iRet);
+		return RC_FAIL;
+	}
+
+	iRet = RunStep(argc, argv);
+	if(iRet)
+	{
+		printf("runstep error: [%d]\n", iRet);
+ 		vDbsDisconnect();
+		exit(-2);
+	}
+
+	vDbsDisconnect();
+	printf("runstep succ.\n");
+
+	return RC_SUCC;
+}
+
+int RunStep(int argc, char **argv)
+{
+	int iRet;
+	int iInterval = 0, lTime = 0;
+	int iSfd;
+	int i = 0;
+	int iLen = 4;
+	char sLen[4 + 1];
+	char sIp[32+1];
+	unsigned int iPort;
+	t_Console_Cmd_Def tConsoleCmd;
+	t_Console_Cmd_Def tConsoleCmdRsp;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szBatId[6], szDate[9], szSettleNum[5], szState[2];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szBatId, 0, sizeof(szBatId));
+	memset(szDate, 0, sizeof(szDate));
+	memset(szState, 0, sizeof(szState));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	sprintf(gsLogFile, "%s.log", argv[0]);
+
+	memset(sIp, 0, sizeof(sIp));
+	memset(&tConsoleCmd, 0x00, sizeof(tConsoleCmd));
+	memset(&tConsoleCmdRsp, 0x00, sizeof(tConsoleCmdRsp));
+
+	iInterval = 2;
+	iPort = atoi(getenv("BAT_MAIN_LISTEN_PORT"));
+	strcpy(sIp, "127.0.0.1");
+
+	if (iPort == 0) {
+		printf("iPort[%d], env BAT_MAIN_LISTEN_PORT not set ?\n", iPort);
+		return -1;
+	}
+
+	memcpy(szDate, argv[1], sizeof(szDate) - 1);
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);
+	memcpy(szBatId, argv[3], sizeof(szBatId) - 1);
+	
+	memcpy(tConsoleCmd.sBatId, argv[3], sizeof(tConsoleCmd.sBatId));
+	memcpy(tConsoleCmd.sStlmDate, argv[1], sizeof(tConsoleCmd.sStlmDate));
+	memcpy(tConsoleCmd.sStlmNum, argv[2], sizeof(tConsoleCmd.sStlmNum));
+	
+	if ( argc == 5 )
+	{
+		memcpy(tConsoleCmd.sArgv, argv[4], strlen(argv[4]));
+		memcpy(tConsoleCmd.sArgc,"01", 2);
+	}
+
+	if ( argc == 6 )
+	{
+		memcpy(tConsoleCmd.sArgv, argv[4], strlen(argv[4]));
+		tConsoleCmd.sArgv[strlen(argv[4])] = ' ';
+		memcpy(tConsoleCmd.sArgv + strlen(argv[4]) + 1, argv[5], strlen(argv[5]));
+		memcpy(tConsoleCmd.sArgc,"02", 2);
+	}
+
+	printf("now run batid[%s], stlm_date[%s],settle_num[%s]...\n", argv[3], argv[1], argv[2]);
+
+	iRet = nCEstablishConnect(iPort, sIp, &iSfd);
+	if (iRet) {
+		printf("nCEstablishConnect %s, %d error, iRet=[%d]\n",
+			  sIp, iPort, iRet);
+		return -1;
+	}
+
+	memset(sLen, 0, sizeof(sLen));
+	snprintf(sLen, sizeof(sLen), "%04d", sizeof(t_Console_Cmd_Def));
+
+	iRet = nCSocketSnd(iSfd, sLen, &iLen);
+	if (iRet) {
+		printf("nCSocketSnd error: [%d]\n", iRet);
+		close(iSfd);
+		return -1;
+	}
+
+	iLen = sizeof(t_Console_Cmd_Def);
+		iRet = nCSocketSnd(iSfd, &tConsoleCmd, &iLen);
+	if (iRet) {
+		printf("nCSocketSnd error: [%d]\n", iRet);
+		close(iSfd);
+		return -1;
+	}
+
+	memset(sLen, 0, sizeof(sLen));
+	iLen = 4;
+	iRet = nCSocketRcv(iSfd, sLen, &iLen);
+	if(iRet)
+	{
+		printf("nCSocketRcv error: [%d]\n", iRet);
+		close(iSfd);
+		return -1;
+	}
+
+	iLen = atoi(sLen);
+	if(iLen != sizeof(t_Console_Cmd_Def))
+	{
+		fprintf(stdout, "iLen[%d] != sizeof(t_Console_Cmd_Def)[%d]\n", 
+			iLen, sizeof(t_Console_Cmd_Def));
+		close(iSfd);
+		return -1;
+	}
+
+	iRet = nCSocketRcv(iSfd, &tConsoleCmdRsp, &iLen);
+	if (iRet) {
+		printf("nCSocketRcv error: [%d]\n", iRet);
+		close(iSfd);
+		return -1;
+	}
+
+	//	不能过早关闭套接子，服务是通过子进程等待回收的方式，过早关闭，导致服务出现CLOSE_WAIT现象
+	close(iSfd);
+
+	printf("BatMain return: [%2.2s][%-256.256s]\n",
+		  tConsoleCmdRsp.sRspCode, tConsoleCmdRsp.sRspDsp);
+	if(memcmp(tConsoleCmdRsp.sRspCode, "00", 2))
+	{
+   		close(iSfd);
+		return RC_FAIL;
+	}
+
+	printf("BatMain assign task succ, now wait for task complete...\n");
+	if(!memcmp(argv[3], BAT_INIT_ID, 5))
+	{
+   		close(iSfd);
+		return RC_SUCC;
+	}
+
+	fprintf(stderr, "\n\t正在处理(%s)(%s)(%s)任务 ......", argv[1], argv[2], argv[3]);
+	while(1)
+	{
+		sleep(iInterval);
+		lTime += iInterval;
+		fprintf(stderr, "\b\b\b\b\b\b	  \b\b\b\b\b\b...");
+
+		EXEC SQL SELECT NVL(BAT_STATE, ' ') INTO :szState FROM TBL_BAT_MAIN_CTL_DTL WHERE
+			DATE_SETTLMT = :szDate AND SETTLE_NUM = :szSettleNum AND BAT_ID = :szBatId;
+ 		if(SQLCODE)
+		{
+			fprintf(stderr, "查询批量控制表失败, err:(%d)(%s)\n", SQLCODE, sDbsError());
+   			close(iSfd);
+   			return RC_FAIL;
+		}
+
+		if(BAT_RUN_STA_RUN == szState[0])
+		{
+			sleep(iInterval);
+			lTime += iInterval;
+			fprintf(stderr, "...	耗时:%4ds\b\b\b\b\b\b\b\b\b\b\b\b\b\b", lTime);
+			continue;
+		}
+		else if(BAT_RUN_PAT_SUC == szState[0])
+		{
+			fprintf(stderr, "\n\n部分子任务(%s)处理成功, 任务处理状态[%s], 耗时约:(%d)\n", argv[3], szState, lTime);
+   			close(iSfd);
+			return RC_SUCC;
+   		}
+		else if(BAT_RUN_STA_SUC == szState[0])
+		{
+			fprintf(stderr, "\n\n任务(%s)处理成功, 任务处理状态[%s], 耗时约:(%d)\n", argv[3], szState, lTime);
+   			close(iSfd);
+			return RC_SUCC;
+   		}
+		else
+		{
+			fprintf(stderr, "\n\n任务(%s)处理失败, 处理状态[%s], 耗时约:(%d)\n", argv[3], szState, lTime);
+   			close(iSfd);
+   			return RC_FAIL;
+		}
+	}
+
+	return RC_SUCC;
+}

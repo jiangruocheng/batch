@@ -1,0 +1,221 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取客户表TBL_SERVICE_CONFIG启动内存大小
+ ****************************************************************************************/
+long	lDefine_ServiceConfig(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100], szFlag[2];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+	szFlag[0] = '1';
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_SERVICE_CONFIG WHERE TASK_STATUS = :szFlag;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbSvceCfg), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbSvceCfg, id, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(service_code)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, service_code, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(service_code)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(service_version)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, service_version, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(service_version)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(fee_rate)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, fee_rate, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(fee_rate)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(prob_concess_rate)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, prob_concess_rate, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(prob_concess_rate)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(prob_days)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, prob_days, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(prob_days)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(plan_starttime)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, plan_starttime, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(plan_starttime)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(plan_endtime)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, plan_endtime, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(plan_endtime)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(task_status)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, task_status, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(task_status)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(profit_rate)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, profit_rate, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(profit_rate)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(profit_brno)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, profit_brno, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(profit_brno)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(profile_flag)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSvceCfg, profile_flag, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(profile_flag)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_SERVICE_CONFIG
+ ****************************************************************************************/
+long	lLoad_ServiceConfig(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lRet = 0, lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbSvceCfg	stCfg;
+	char		szNormal[10];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szNormal, 0, sizeof(szNormal));
+	szNormal[0] = '1';
+
+	EXEC SQL DECLARE Cur_service_config CURSOR FOR 
+		SELECT NVL(ID, 0), NVL(SERVICE_CODE, ' '), NVL(SERVICE_NAME, ' '), 
+			NVL(SERVICE_VERSION, ' '), NVL(FEE_RATE, ' '), NVL(PROB_CONCESS_RATE, ' '), 
+			NVL(PROB_DAYS, 0), NVL(PLAN_STARTTIME, ' '), NVL(PLAN_ENDTIME, ' '), 
+			NVL(TASK_STATUS, ' '), NVL(PROFIT_RATE, ' '), NVL(PROFIT_BRNO, ' '), 
+			NVL(PROFILE_FLAG, ' ') 
+		FROM TBL_SERVICE_CONFIG WHERE TASK_STATUS = :szNormal;
+
+	EXEC SQL OPEN Cur_service_config;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stCfg, 0, sizeof(stCfg));
+		EXEC SQL FETCH Cur_service_config INTO :stCfg.id, :stCfg.service_code, :stCfg.service_name, 
+			:stCfg.service_version, :stCfg.fee_rate, :stCfg.prob_concess_rate, :stCfg.prob_days, 
+			:stCfg.plan_starttime, :stCfg.plan_endtime, :stCfg.task_status, :stCfg.profit_rate,
+			:stCfg.profit_brno, :stCfg.profile_flag;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_service_config;
+ 			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+			break;
+
+		sTrimAll(stCfg.service_code);	
+		sTrimAll(stCfg.service_name);	
+		sTrimAll(stCfg.service_version);	
+		sTrimAll(stCfg.fee_rate);	
+		sTrimAll(stCfg.prob_concess_rate);	
+		sTrimAll(stCfg.plan_starttime);	
+		sTrimAll(stCfg.plan_endtime);	
+		sTrimAll(stCfg.task_status);	
+		sTrimAll(stCfg.profit_rate);	
+		sTrimAll(stCfg.profit_brno);	
+		sTrimAll(stCfg.profile_flag);	
+		stCfg.id = lSetEXLong(stCfg.id);
+		stCfg.prob_days = lSetEXLong(stCfg.prob_days);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, (void *)&stCfg.id, ++(pGetTblDef(t)->lTreeNode),
+			dbSvceCfg, id, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载服务费模型(%d)失败, 原因:%s", stCfg.id, sGetError());
+			EXEC SQL CLOSE Cur_service_config;
+ 			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != IBPInsertData(t, &stCfg, sizeof(stCfg)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t),
+				stCfg.service_code, sGetError());
+			EXEC SQL CLOSE Cur_service_config;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_service_config;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

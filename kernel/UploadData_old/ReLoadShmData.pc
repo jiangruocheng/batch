@@ -1,0 +1,45 @@
+#include	"load.h"
+#include	"pos_stlm.h"
+#include	"Ibp.h"
+#include	"DbsApi.h"
+
+/****************************************************************************************
+	主函数
+ ****************************************************************************************/
+int		main(int argc, char** argv)
+{
+	int		iRet = 0;
+	char	szStlmDate[15], szSettleNum[5];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	sprintf(gsLogFile, "ReLoadShmData.log");
+
+	//判断参数个数
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szStlmDate, argv[1], 8);
+	memcpy(szSettleNum, argv[2], 4);
+	
+	iRet = lInitTblShm();
+	if(RC_SUCC != iRet)
+		HtLog(NML_PARAM, "导入内存表中:(%d)(%s), 继续处理!", errno, strerror(errno));
+	else
+		HtLog(NML_PARAM, "清理共享内存ID(%d), Key(0X%08X)", lGetShmId(), yGetShmKey());
+	vDeleteShm();
+
+	HtLog(NML_PARAM, "将所需的全部表数据导入内存表中");
+   	iRet = lInitAllShmTbl(szSettleNum);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "加载内存数据失败, err:%s", sGetError());
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}

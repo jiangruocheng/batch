@@ -1,0 +1,778 @@
+/******************************************************************
+*文 件 名: GenStandTxn.pc
+*功	能: 
+*判断标识: 
+*编程人员: DeffPuzzL
+*编程时间: 20150619
+******************************************************************/
+#include	"DbsApi.h"
+#include	"Ibp.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "GenStandTxn.h"
+EXEC SQL END DECLARE SECTION;
+
+#define	FILE_INIT		1
+#define	FILE_DONE		0
+
+char	g_szLogName[512] = {0};
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+void	vTrimFileTxn(IFileTxn *pstExTxn)
+{
+	sTrimAll(pstExTxn->m_szSettleDate);
+	sTrimAll(pstExTxn->m_szTxName);
+	sTrimAll(pstExTxn->m_szTxDate);
+	sTrimAll(pstExTxn->m_szTxTime);
+	sTrimAll(pstExTxn->m_szBrno);
+	sTrimAll(pstExTxn->m_szIbox42);
+	sTrimAll(pstExTxn->m_szMchtNo);
+	sTrimAll(pstExTxn->m_szIbox41);
+	sTrimAll(pstExTxn->m_szAcNo);
+	sTrimAll(pstExTxn->m_szIbox11);
+	sTrimAll(pstExTxn->m_szFd39);
+	sTrimAll(pstExTxn->m_szMcc);
+	sTrimAll(pstExTxn->m_szFd49);
+	sTrimAll(pstExTxn->m_szFd37);
+	sTrimAll(pstExTxn->m_IboxBatchNo);
+	sTrimAll(pstExTxn->m_szOrderNo);
+}
+
+
+/************************************************************************************/
+/*   声明  ： void	vSetLogName()													*/
+/*   功能  ： 设置对账文件名称														*/
+/*   参数  ： 																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+/*
+void	vSetLogName(char *pszFmt, ...)
+{
+	va_list ap;
+
+	memset(g_szLogName, 0, sizeof(g_szLogName));
+	va_start(ap, pszFmt);
+	vsnprintf(g_szLogName, sizeof(g_szLogName), pszFmt, ap);
+	va_end(ap);
+}
+*/
+/************************************************************************************/
+/*   声明  ： char* sGetLogName()													*/
+/*   功能  ： 获取对账文件名称														*/
+/*   参数  ： 																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+/*
+char*   sGetLogName()
+{
+	return g_szLogName;
+}
+*/
+/************************************************************************************/
+/*   声明  ： char* sConverTime(char *pszDate, char *pszTime)						*/
+/*   功能  ： 生成商户对帐流水文件													*/
+/*   参数  ： pszDate	   --  日期													*/
+/*			  pszTime	   --  时间													*/
+/*  返回值 ： szTime																*/
+/************************************************************************************/
+char*   sConverTime(char *pszDate, char *pszTime)
+{
+	static  char	szTime[20];
+
+	memset(szTime, 0, sizeof(szTime));
+
+	memcpy(szTime, pszDate + 4, 2);
+	strcat(szTime, "/");
+	memcpy(szTime + 3, pszDate + 6, 2);
+	strcat(szTime, " ");
+
+	memcpy(szTime + 6, pszTime, 2);
+	strcat(szTime, ":");
+	memcpy(szTime + 9, pszTime + 2, 2);
+	strcat(szTime, ":");
+	memcpy(szTime + 12, pszTime + 4, 2);
+
+	return szTime;
+}
+
+/************************************************************************************/
+/*   声明  ： void vWriteFile(long *nMode, char *pszData)							*/
+/*   功能  ： 生成商户对帐流水文件													*/
+/*   参数  ： nMode				--初始化对账文件									*/
+/*			  pszData			--写入流水数据										*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+static void	vWriteFile(long nMode, char *pszData)
+{
+	FILE	*fp = NULL;
+	char	szCmd[512];
+
+	if(FILE_INIT == nMode)
+	{
+		memset(szCmd, 0, sizeof(szCmd));
+		snprintf(szCmd, sizeof(szCmd), "rm -rf %s", sGetLogName());
+		HtLog(NML_PARAM, "删除的文件:%s", sGetLogName());
+		system(szCmd);
+	}
+
+	if(NULL == (fp = fopen(sGetLogName(), "a+")))
+	{
+		HtLog(ERR_PARAM, "打开文件(%s)失败! err:(%d)(%s)", sGetLogName(), errno, 
+			strerror(errno));
+		return ; 
+	}
+
+	if(FILE_INIT == nMode)
+		fprintf(fp, "清算日期,交易类型,交易时间,机构号,商户编号,终端编号,交易金额,卡号,交易跟踪号,"
+			"应答码,商户类型,收单币种,收单交易金额,收单手续费,商户币种,商户交易金额,商户手续费\n");
+	else 
+		fprintf(fp, pszData);
+	fclose(fp);
+
+	return ;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGenMchtTxn(char *psStlmDate, char *pszMchtNo)					*/
+/*   功能  ： 生成商户对帐流水文件													*/
+/*   参数  ： psStlmDate		 --清算日期											*/
+/*			  pszMchtNo			 --商户号											*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+/*
+int	 nGenBrhTxn(char *pszTraceNo, char *psStlmDate, dbMchtBase *pstBase)
+{
+	FILE	*fp = NULL;
+	int		iRet = 0, lInit = 0;
+	char	szLine[1024], szMchtLog[512], szCmd[512];
+	EXEC SQL BEGIN DECLARE SECTION;
+	long		lCount = 0;
+	IFileTxn	stExTxn;
+	char		szMcht[26], szTraceNo[21];
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szMcht, 0, sizeof(szMcht));
+	memset(szTraceNo, 0, sizeof(szTraceNo));
+	memcpy(szTraceNo, pszTraceNo, sizeof(szTraceNo) - 1);
+	memcpy(szMcht, pstBase->mcht_no, sizeof(szMcht) - 1);
+
+	memset(szMchtLog, 0, sizeof(szMchtLog));
+	snprintf(szMchtLog, sizeof(szMchtLog), "%s/settle/STLM_%s_%s.txt", getenv("FILEDIR"), 
+		psStlmDate, pstBase->mcht_no);
+
+	if(NULL == (fp = fopen(szMchtLog, "w")))
+	{
+		HtLog(ERR_PARAM, "打开机构对账文件失败, err:(%s)", strerror(errno));
+		return RC_FAIL;
+	}
+	fprintf(fp, "清算日期,交易类型,交易时间,机构号,商户编号,终端编号,交易金额,卡号,交易跟踪号,"
+		"应答码,商户类型,收单币种,收单交易金额,收单手续费,商户币种,商户交易金额,商户手续费\n");
+
+
+	EXEC SQL DECLARE Cur_algo_dtl CURSOR FOR
+		SELECT NVL(A.ALGO_DATE, ' '), NVL(A.TX_DATE, ' '), NVL(A.TX_TIME, ' '), NVL(A.IBOX41, ' '),
+			NVL(A.AC_NO, ' '), NVL(A.TX_NAME, ' '),  NVL(A.BRNO, ' '), NVL(A.IBOX42, ' '),
+			NVL(SETTLE_MCHT, ' '), NVL(B.IBOX11, ' '), NVL(B.FD39, ' '), NVL(B.FD49, ' '),
+			NVL(B.FD37, ' '), NVL(A.TX_AMT, 0.00), NVL(A.FEE_AMT, 0.00),
+			NVL(A.MCHT_SERVE_FEE, 0.00) + NVL(A.SERV_FEE_KQDA, 0.00), NVL(A.FREE_FEE),
+			NVL(B.IBOX_BATCH_NO, ' '), NVL(B.ORDER_NO, ' ')
+		FROM TBL_ALGO_DTL A, TBL_TXN_SUCC B WHERE
+			A.MCHT_TRACE_NO = :szTraceNo AND SETTLE_MCHT = :szMcht AND A.ID = B.ID
+		ORDER BY A.TX_DATE, A.TX_TIME;
+
+	EXEC SQL OPEN Cur_algo_dtl;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询商户(%s)清分流水失败, err:(%d)(%s)", pstBase->mcht_no,
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stExTxn, 0, sizeof(stExTxn));
+		EXEC SQL FETCH Cur_algo_dtl INTO :stExTxn.m_szSettleDate, :stExTxn.m_szTxDate,
+			:stExTxn.m_szTxTime, :stExTxn.m_szIbox41, :stExTxn.m_szAcNo, :stExTxn.m_szTxName,
+			:stExTxn.m_szBrno, :stExTxn.m_szIbox42, :stExTxn.m_szMchtNo, :stExTxn.m_szIbox11,
+			:stExTxn.m_szFd39, :stExTxn.m_szFd49, :stExTxn.m_szFd37, :stExTxn.m_dTxAmt,
+			:stExTxn.m_dFeeAmt, :stExTxn.m_dOtherFee, :stExTxn.m_dFreeFee, :stExTxn.m_IboxBatchNo,
+			:stExTxn.m_szOrderNo;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "查询商户(%s)清分流水失败, err:(%d)(%s)", pstBase->mcht_no,
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_algo_dtl;
+			return RC_FAIL;
+		}
+
+		vTrimFileTxn(&stExTxn);
+		memset(szLine, 0, sizeof(szLine));
+		snprintf(szLine, sizeof(szLine), "%s,POS消费,%s,%s,%s,%s,%.2f,%s,%s,%s,%s,%s,%.2f,%.2f,"
+			"%s,%.2f,%.2f\n", stExTxn.m_szSettleDate, sConverTime(stExTxn.m_szTxDate, stExTxn.m_szTxTime), 
+			stExTxn.m_szBrno, stExTxn.m_szIbox42, stExTxn.m_szIbox11, stExTxn.m_dTxAmt, stExTxn.m_szAcNo, 
+			stExTxn.m_szIbox11, stExTxn.m_szFd39, pstBase->mcht_mcc, stExTxn.m_szFd49, stExTxn.m_dTxAmt, 
+			stExTxn.m_dFeeAmt + stExTxn.m_dOtherFee - stExTxn.m_dFreeFee, stExTxn.m_szFd49, 
+			stExTxn.m_dTxAmt, stExTxn.m_dFeeAmt + stExTxn.m_dOtherFee - stExTxn.m_dFreeFee);
+
+		fprintf(fp, szLine);
+		vWriteFile(FILE_DONE, szLine);
+	}
+	fclose(fp);
+
+	HtLog(NML_PARAM, "发送对账文件:%s", szMchtLog);
+	memset(szCmd, 0, sizeof(szCmd));
+	snprintf(szCmd, sizeof(szCmd), "sh SendActBill.sh %s", sGetRealFile(szMchtLog));
+	system(szCmd);
+
+	return RC_SUCC;
+}
+*/
+
+/************************************************************************************/
+/*   声明  ： int nGenBrhBill(char *pszSettleDate)									*/
+/*   功能  ： 生成商户对帐流水文件													*/
+/*   参数  ： psStlmDate			 --清算日期										*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+/*
+int   nGenBrhBill(char *pszSettleDate)
+{
+	int			iRet, lCount = 0, iInit = 0;
+	char		szBrh[21], szCmd[512];
+	dbMchtBase	stBase;
+	dbBrhInfo	stBrh;
+	struct tbl_settle_txn_c	stSettleTxn;
+	struct tbl_mcht_settle_dtl_c	stMchtDtl;
+
+	HtLog(NML_PARAM, "日期(%s), 对机构类卸载对账文件开始", pszSettleDate);
+	iRet = Tbl_settle_txn_Dec_Sel("settle_date = '%s' and settle_flag = '%c' order by brh", 
+		pszSettleDate, SETTLE_MCHT_BRH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "查询清算流水失败, err:(%d)(%s)", iRet, DbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stSettleTxn, 0, sizeof(stSettleTxn));
+		iRet = Tbl_settle_txn_Fet_Sel(&stSettleTxn);
+		if(iRet == DBS_NOTFOUND)
+		{
+			HtLog(NML_PARAM, "本周期(%s)对机构流水导出完成!", pszSettleDate);
+			Tbl_settle_txn_Clo_Sel();
+			break;
+		}
+		else if(iRet)
+		{
+			HtLog(ERR_PARAM, "查询清算流水失败, err:(%d)(%s)", iRet, DbsError());
+			Tbl_settle_txn_Clo_Sel();
+			return RC_FAIL;
+		}
+	
+		CommonAllTrim(stSettleTxn.brh);
+		CommonAllTrim(stSettleTxn.mcht_no);
+		CommonAllTrim(stSettleTxn.trace_no);
+		memset(&stBrh, 0, sizeof(stBrh));
+		iRet = lGetBrhInfo(&stBrh, stSettleTxn.brh);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "获取机构(%s)基本信息失败, err:(%d)(%s)", stSettleTxn.brh, 
+				iRet, sGetError());
+			Tbl_settle_txn_Clo_Sel();
+			return RC_FAIL;
+		}
+
+		if('1' != stBrh.brh_file_flag[0])
+		{
+			HtLog(ERR_PARAM, "机构(%s)无需导出对账文件，处理下一个机构", stBrh.brh_code);
+			continue;
+		}
+
+		if(0 == iInit)
+		{
+			iInit = 1;
+			memset(szBrh, 0, sizeof(szBrh));
+			strcpy(szBrh, stSettleTxn.brh);
+			vSetLogName("%s/settle/STLM_%s_%s.txt", getenv("FILEDIR"), pszSettleDate, szBrh);
+			vWriteFile(FILE_INIT, NULL);
+			lCount  = 0;
+		}
+
+		if(memcmp(szBrh, stSettleTxn.brh, sizeof(stSettleTxn.brh) - 1))
+		{
+			//	发送机构对账文件
+			HtLog(NML_PARAM, "发送机构对账文件:%s", sGetLogName());
+			memset(szCmd, 0, sizeof(szCmd));
+			snprintf(szCmd, sizeof(szCmd), "sh SendActBill.sh %s", sGetRealFile(sGetLogName()));
+			system(szCmd);
+
+			memset(szBrh, 0, sizeof(szBrh));
+			strcpy(szBrh, stSettleTxn.brh);
+			vSetLogName("%s/settle/STLM_%s_%s.txt", getenv("FILEDIR"), pszSettleDate, szBrh);
+			vWriteFile(FILE_INIT, NULL);
+			lCount  = 0;
+		}
+	
+		lCount ++;
+
+		iRet = Tbl_mcht_settle_dtl_Dec_Sel("settle_date = '%s' and brh = '%s' and trace_all = '%s'", 
+			pszSettleDate, stSettleTxn.brh, stSettleTxn.trace_no);
+		if(iRet)
+		{
+			Tbl_settle_txn_Clo_Sel();
+			HtLog(ERR_PARAM, "查询清算流水失败, err:(%d)(%s)", iRet, DbsError());
+			return RC_FAIL;
+		}
+
+		while(1)
+		{
+			memset(&stMchtDtl, 0, sizeof(stMchtDtl));
+			iRet = Tbl_mcht_settle_dtl_Fet_Sel(&stMchtDtl);
+			if(iRet == DBS_NOTFOUND)
+			{
+				HtLog(NML_PARAM, "本周期(%s)对机构流水导出完成!", pszSettleDate);
+				Tbl_mcht_settle_dtl_Clo_Sel();
+				break;
+			}
+			else if(iRet)
+			{
+				HtLog(ERR_PARAM, "查询清算流水失败, err:(%d)(%s)", iRet, DbsError());
+				Tbl_settle_txn_Clo_Sel();
+				Tbl_mcht_settle_dtl_Clo_Sel();
+				return RC_FAIL;
+			}
+
+			CommonAllTrim(stMchtDtl.ibox42);
+			memset(&stBase, 0, sizeof(stBase));
+			iRet = lGetMchtBase(&stBase, stMchtDtl.ibox42);
+			if(iRet)
+			{
+				HtLog(ERR_PARAM, "查询商户信息失败, err:(%d)(%s)", iRet, sGetError());
+				Tbl_settle_txn_Clo_Sel();
+				Tbl_mcht_settle_dtl_Clo_Sel();
+				return RC_FAIL;
+			}
+
+			lCount ++;
+			HtLog(NML_PARAM, "对机构(%s)和旗下商户(%s)生成清算明细", stBrh.brh_code, stBase.mcht_no);
+			CommonAllTrim(stMchtDtl.trace_no);
+			iRet = nGenBrhTxn(stMchtDtl.trace_no, pszSettleDate, &stBase);
+			if(iRet)
+			{
+				HtLog(ERR_PARAM, "对机构(%s)生成清算明细失败，err:(%d)", stBrh.brh_code, iRet);
+				Tbl_settle_txn_Clo_Sel();
+				Tbl_mcht_settle_dtl_Clo_Sel();
+				return RC_FAIL;
+			}
+		}
+	}
+	if(lCount > 1)
+	{
+		//	发送机构对账文件
+		HtLog(NML_PARAM, "发送机构对账文件:%s", sGetLogName());
+		memset(szCmd, 0, sizeof(szCmd));
+		snprintf(szCmd, sizeof(szCmd), "sh SendActBill.sh %s", sGetRealFile(sGetLogName()));
+		system(szCmd);
+	}
+
+	return RC_SUCC;
+}
+*/
+
+//----add
+/************************************************************************************/
+/*   声明  ： int nUnloadBill(dbMchtBase *pstBase, char *pszTraceNo, FILE *fp)		*/
+/*   功能  ： 生成商户对帐流水文件													*/
+/*   参数  ： pstBase			--	商户号											*/
+/*   	   ： pszTraceNo		--	清算日期										*/
+/*   	   ： fp				--	文件指针										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*		   	  RC_FAIL	--  失败													*/
+/************************************************************************************/
+static int nUnloadBill(const dbMchtBase *pstBase, const char *pszTraceNo, FILE *fp)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long		lCount = 0;
+	IFileTxn	stExTxn;
+	char		szMcht[26], szTraceNo[21];
+	char		szLine[1024] = { 0 };
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szMcht, 0, sizeof(szMcht));
+	memset(szTraceNo, 0, sizeof(szTraceNo));
+	memcpy(szTraceNo, pszTraceNo, sizeof(szTraceNo) - 1);
+	memcpy(szMcht, pstBase->mcht_no, sizeof(szMcht) - 1);
+
+	if(!fp)	return RC_FAIL;
+
+	/**查找清分明细**/
+	EXEC SQL DECLARE Cur_algo_dtl CURSOR FOR
+		SELECT NVL(A.ALGO_DATE, ' '), NVL(A.TX_DATE, ' '), NVL(A.TX_TIME, ' '), NVL(A.IBOX41, ' '),
+			NVL(A.AC_NO, ' '), NVL(A.TX_NAME, ' '),  NVL(A.BRNO, ' '), NVL(A.IBOX42, ' '),
+			NVL(SETTLE_MCHT, ' '), NVL(B.IBOX11, ' '), NVL(B.FD39, ' '), NVL(B.FD49, ' '),
+			NVL(B.FD37, ' '), NVL(A.TX_AMT, 0.00), NVL(A.FEE_AMT, 0.00),
+			NVL(A.MCHT_SERVE_FEE, 0.00) + NVL(A.SERV_FEE_KQDA, 0.00), NVL(A.FREE_FEE, 0.00),
+			NVL(B.IBOX_BATCH_NO, ' '), NVL(B.ORDER_NO, ' ')
+		FROM TBL_ALGO_DTL A, TBL_TXN_SUCC B WHERE
+			A.MCHT_TRACE_NO = :szTraceNo AND A.SETTLE_MCHT = :szMcht AND A.ID = B.ID
+		ORDER BY A.TX_DATE, A.TX_TIME;
+
+	EXEC SQL OPEN Cur_algo_dtl;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询商户(%s)清分流水失败, err:(%d)(%s)(%s)(%s)", pstBase->mcht_no,
+			SQLCODE, sDbsError(), szMcht, szTraceNo);
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stExTxn, 0, sizeof(stExTxn));
+		EXEC SQL FETCH Cur_algo_dtl INTO :stExTxn.m_szSettleDate, :stExTxn.m_szTxDate,
+			:stExTxn.m_szTxTime, :stExTxn.m_szIbox41, :stExTxn.m_szAcNo, :stExTxn.m_szTxName,
+			:stExTxn.m_szBrno, :stExTxn.m_szIbox42, :stExTxn.m_szMchtNo, :stExTxn.m_szIbox11,
+			:stExTxn.m_szFd39, :stExTxn.m_szFd49, :stExTxn.m_szFd37, :stExTxn.m_dTxAmt,
+			:stExTxn.m_dFeeAmt, :stExTxn.m_dOtherFee, :stExTxn.m_dFreeFee, :stExTxn.m_IboxBatchNo,
+			:stExTxn.m_szOrderNo;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "查询商户(%s)清分流水失败, err:(%d)(%s)", pstBase->mcht_no,
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_algo_dtl;
+ 			return RC_FAIL;
+		}
+
+		vTrimFileTxn(&stExTxn);
+		memset(szLine, 0, sizeof(szLine));
+
+		if(1 == pstBase->mcht_resv1)
+			snprintf(szLine, sizeof(szLine), "%s,POS消费,%s,%s,%s,%s,%.2f,%s,%s,%s,%s,%s,%.2f,%.2f,%s,%.2f,%.2f,%s,%s\n",
+				stExTxn.m_szSettleDate, sConverTime(stExTxn.m_szTxDate, stExTxn.m_szTxTime),
+				stExTxn.m_szBrno, stExTxn.m_szIbox42, stExTxn.m_szIbox41, stExTxn.m_dTxAmt, stExTxn.m_szAcNo,
+				stExTxn.m_szIbox11, stExTxn.m_szFd49, pstBase->mcht_mcc, stExTxn.m_szFd49, stExTxn.m_dTxAmt,
+				stExTxn.m_dFeeAmt + stExTxn.m_dOtherFee - stExTxn.m_dFreeFee, stExTxn.m_szFd49, stExTxn.m_dTxAmt,
+				stExTxn.m_dFeeAmt + stExTxn.m_dOtherFee - stExTxn.m_dFreeFee, stExTxn.m_szFd37, stExTxn.m_IboxBatchNo);
+		else if(2 == pstBase->mcht_resv1)
+			snprintf(szLine, sizeof(szLine), "%s,%s,POS消费,%s%s,%s,%s,%s,%s,%.2f,%.2f\n", stExTxn.m_szSettleDate, stExTxn.m_szOrderNo,
+				stExTxn.m_szTxDate, stExTxn.m_szTxTime, stExTxn.m_szMchtNo, stExTxn.m_szIbox11, sEncryAcNo(stExTxn.m_szAcNo),
+				stExTxn.m_szFd49, stExTxn.m_dTxAmt, stExTxn.m_dFeeAmt + stExTxn.m_dOtherFee - stExTxn.m_dFreeFee);
+
+		fprintf(fp, szLine);///写入单独商户的对账文件
+		vWriteFile(FILE_DONE, szLine); ///追加写入机构对账文件
+
+		lCount ++;
+	}
+ 	EXEC SQL CLOSE Cur_algo_dtl;
+	HtLog(NML_PARAM, "生成商户(%s)对账文件类型(%d)完毕, 明细笔数(%d)!", pstBase->mcht_no,
+		pstBase->mcht_resv1, lCount);
+
+	return RC_SUCC;
+}
+
+
+/************************************************************************************/
+/*   声明  ： int	nGetExportMcht(dbMchtBase *pstBase, char *pszSettleDate)		*/
+/*   功能  ： 查找需导出的商户														*/
+/*   参数  ： pstBase			 	--商户号										*/
+/*   	   ： pszSettleDate			--清算日期										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*		   	  RC_FAIL	--  失败													*/
+/************************************************************************************/
+static int nGetExportMcht(const dbMchtBase *pstBase, const char *pszSettleDate)
+{
+	long	iRet = 0, lFlag = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szTraceNo[21], szSettleDate[9], szMchtNo[26];
+	EXEC SQL END DECLARE SECTION;
+	char	szPath[512], szFile[512], szCmd[512];
+	FILE	*fp = NULL;
+
+	memset(szPath, 0, sizeof(szPath));
+	memset(szFile, 0, sizeof(szFile));
+	memset(szMchtNo, 0, sizeof(szMchtNo));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+
+	//STLM_20140603_商户号.txt
+	snprintf(szFile, sizeof(szFile), "STLM_%s_%s.txt", pszSettleDate, pstBase->mcht_no);
+	snprintf(szPath, sizeof(szPath), "%s/settle/%s", getenv("FILEDIR"), szFile);
+	if(NULL == (fp = fopen(szPath, "w")))
+	{
+		HtLog(ERR_PARAM, "开始对账文件(%s)失败, err:(%s)", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+
+	if(1 == pstBase->mcht_resv1)
+		fprintf(fp, "清算日期,交易类型,交易时间,机构号,商户编号,终端编号,交易金额,"
+			"卡号,交易跟踪号,应答码,商户类型,收单币种,收单交易金额,收单手续费,商户币种,"
+			"商户交易金额,商户手续费,系统跟踪号,批次号\n");
+	else if(2 == pstBase->mcht_resv1)
+   		fprintf(fp, "清算日期,交易流水号,交易类型,交易时间,商户编号,终端编号,卡号,"
+			"币种,交易金额,手续费\n");
+	else
+	{
+		fclose(fp);
+		HtLog(ERR_PARAM, "未知的生成对账文件格式类型(%d)!", pstBase->mcht_resv1);
+		return RC_FAIL;
+	}
+
+	memcpy(szMchtNo, pstBase->mcht_no, sizeof(szMchtNo) - 1);
+	memcpy(szSettleDate, pszSettleDate, sizeof(szSettleDate) - 1);
+
+	EXEC SQL DECLARE tbl_mcht_settle_dtl CURSOR FOR
+		SELECT TRACE_NO FROM TBL_MCHT_SETTLE_DTL WHERE IBOX42 = :szMchtNo AND
+		SETTLE_DATE = :szSettleDate;
+
+	EXEC SQL OPEN tbl_mcht_settle_dtl;
+	if(SQLCODE)
+	{
+		fclose(fp);
+		HtLog(ERR_PARAM, "查询周期(%s)清算流水失败，err:(%d)(%s)", pszSettleDate,
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szTraceNo, 0, sizeof(szTraceNo));
+		EXEC SQL FETCH tbl_mcht_settle_dtl INTO :szTraceNo;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			fclose(fp);
+		   	HtLog(ERR_PARAM, "查询周期(%s)清算流水失败，err:(%d)(%s)", pszSettleDate,
+	   			SQLCODE, sDbsError());
+			EXEC SQL CLOSE tbl_mcht_settle_dtl;
+			return RC_FAIL;
+		}
+
+		lFlag = 1;
+		sTrimAll(szTraceNo);
+
+		HtLog(NML_PARAM, "对商户(%s)导出流水(%s)(%s)账单.", pstBase->mcht_no, szTraceNo,
+			pszSettleDate);
+
+		if(RC_SUCC != nUnloadBill(pstBase, szTraceNo, fp))
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "生成商户(%s)流水失败!", pstBase->mcht_no);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE tbl_mcht_settle_dtl;
+	fclose(fp);
+
+	if(!lFlag)	//	本周期无记录
+		HtLog(NML_PARAM, "商户(%s)本周期(%s)无明细!", pstBase->mcht_no, pszSettleDate);
+
+	memset(szCmd, 0, sizeof(szCmd));
+	if(1 == pstBase->mcht_resv1)
+		snprintf(szCmd, sizeof(szCmd), "sh SendActBill.sh %s", szFile);
+	else if(2 == pstBase->mcht_resv1)
+		snprintf(szCmd, sizeof(szCmd), "sh SendFtpBill.sh %s", szFile);
+	else
+		;
+
+	HtLog(NML_PARAM, "发送对账文件:%s", szCmd);
+	system(szCmd);
+
+	return RC_SUCC;
+}
+
+
+/************************************************************************************/
+/*   声明  ： int nGetMchtFromBrh(const char* pszBrh)								*/
+/*   功能  ： 获取机构下的所有商户													*/
+/*   参数  ： pszBrh			 --机构号											*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+static int nGetMchtFromBrh(const char* pszSettleDate, const char* pszBrh)
+{
+	long		lRet, lCount = 0, i = 0;
+	dbMchtBase  stBase, *pstBase = NULL;
+	RunTime		*pstRun = NULL;
+
+	if(!(pstRun = (RunTime *)pInitRunTime(TBL_MCHT_BASE)))
+	{
+		HtLog(ERR_PARAM, "初始化内存表索引失败, err:(%s)", sGetError());
+		return RC_FAIL;
+	}
+
+	memset(&stBase, 0, sizeof(stBase));
+	pstRun->lFind = CHK_SELECT;
+	pstRun->tblName = TBL_MCHT_BASE;
+
+	stBase.mcht_resv1 = 1;
+	strcpy(stBase.mcht_brh, pszBrh);
+	pstRun->lSize = sizeof(stBase);
+	pstRun->pstVoid = &stBase;
+
+	lRet = lRunSelect(pstRun, (void **)&pstBase, (long *)&lCount);
+	if(RC_SUCC != lRet)
+	{
+		HtLog(ERR_PARAM, "查询表TBL_MCHT_BASE数据失败, err:(%d)(%s)", lRet, sGetError());
+		return RC_FAIL;
+	}
+
+	for(i = 0; i < lCount; i ++)
+	{
+		sTrimAll(pstBase[i].mcht_no);
+		HtLog(NML_PARAM, "机构(%s)-当前商户(%s)处理(%d/%d)", pszBrh, pstBase[i].mcht_no, 
+			i + 1, lCount);
+
+		lRet = nGetExportMcht(&pstBase[i], pszSettleDate);
+		if(lRet)
+		{
+			IBPFree(pstBase);
+			return RC_FAIL;
+		}
+	}
+	IBPFree(pstBase);
+	HtLog(NML_PARAM, "机构(%s)处理处理完毕!\n", pszBrh);
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGenBrhBill(char *pszSettleDate)									*/
+/*   功能  ： 按机构形式生成对账流水文件											*/
+/*   参数  ： psStlmDate			 --清算日期										*/
+/*  返回值 ： 0--  成功																*/
+/*			1--  失败																*/
+/************************************************************************************/
+static int nGenBrhAlgoBill(const char *pszSettleDate)
+{
+	long		lRet, lCount = 0, i = 0;
+	dbBrhInfo	stBrh, *pstBrh = NULL;
+	char		szCmd[255] = { 0 };
+	RunTime		*pstRun = NULL;
+
+	if(!(pstRun = (RunTime *)pInitRunTime(TBL_BRH_INFO)))
+	{
+		HtLog(ERR_PARAM, "初始化内存表索引失败, err:(%s)", sGetError());
+		return RC_FAIL;
+	}
+
+	memset(&stBrh, 0, sizeof(stBrh));
+	pstRun->lFind = CHK_SELECT;
+	pstRun->tblName = TBL_BRH_INFO;
+
+	stBrh.brh_file_flag[0] = '1';
+	pstRun->lSize = sizeof(stBrh);
+	pstRun->pstVoid = &stBrh;
+
+	///从tbl_brh_info中找出那些需要生成对账文件(brh_file_flag=1)的机构
+	HtLog(NML_PARAM, "日期(%s), 对机构卸载对账文件开始", pszSettleDate);
+	lRet = lRunSelect(pstRun, (void **)&pstBrh, (long *)&lCount);
+	if(RC_SUCC != lRet)
+	{
+		HtLog(ERR_PARAM, "查询表TBL_BRH_INFO数据失败, err:(%d)(%s)", lRet, sGetError());
+		return RC_FAIL;
+	}
+
+	for(i = 0; i < lCount; i ++)
+	{
+		sTrimAll(pstBrh[i].brh_code);
+		HtLog(NML_PARAM, "本期需导出机构个数(%d/%d), 当前机构号(%s)", i + 1, lCount, 
+			pstBrh[i].brh_code);
+
+		///机构下所有商户的流水，以追加的形式写入
+		vSetLogName("%s/settle/STLM_%s_%s.txt", getenv("FILEDIR"), pszSettleDate, 
+			pstBrh[i].brh_code);
+		vWriteFile(FILE_INIT, NULL);
+
+		///获取机构下的所有商户,逐商户处理
+		lRet = nGetMchtFromBrh(pszSettleDate, pstBrh[i].brh_code);
+		if(lRet)
+		{
+			IBPFree(pstBrh);
+			return RC_FAIL;
+		}
+
+		///机构下所有商户的流水处理完毕，推送对账文件
+		HtLog(NML_PARAM, "发送机构对账文件:%s", sGetLogName());
+		memset(szCmd, 0, sizeof(szCmd));
+		snprintf(szCmd, sizeof(szCmd), "sh SendActBill.sh %s", sGetRealFile(sGetLogName()));
+		system(szCmd);
+	}
+	IBPFree(pstBrh);
+	HtLog(NML_PARAM, "日期(%s)处理结束, 共导出(%d)个机构对账文件!\n", pszSettleDate, lCount);
+
+	return RC_SUCC;
+}
+
+
+/************************************************************************************/
+/*   函数名：					   结算主函数										*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*		   ： argv (参数列表 -- 输出)												*/
+/*			  argv[1] 	--清算日期(可选)											*/
+/*  返回值 ： 0			--成功														*/
+/*			 -1			--失败														*/
+/************************************************************************************/
+int main(int argc, char *argv[])
+{
+	int		iRet;
+	char	szSettleDate[9];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "GenStandTxn.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, "参数有误(%d):%s stlm_date settle_num bat_id", argc, argv[0]);
+		return -1;
+	}
+
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	strcpy(szSettleDate, argv[1]);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet) 
+	{
+		HtLog(ERR_PARAM, "dbsconnect error %d", iRet);
+		return RC_FAIL;
+	}
+
+	iRet = nGenBrhAlgoBill(szSettleDate);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "对机构生成对账文件失败, err:(%d)", iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();
+	
+	return RC_SUCC;
+}

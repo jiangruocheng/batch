@@ -1,0 +1,339 @@
+/*****************************************************************
+ *文 件 名: LoadAlpyFile.c
+ *功	能: 加载渠道流水文件
+******************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+#define FILE_NAME_LEN_MAX   512
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_txn_succ.h"
+#include "tbl_cup_succ.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   函数名：						装载渠道流水主函数								*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*  返回值 ： RC_SUCC	--	成功													*/
+/*			  RC_FAIL	--	失败													*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	int		iRet;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szStlmDate[9], szCupsNo[5];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "LoadAlpyFile.log");
+
+	if(5 > argc)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);	
+		return RC_FAIL;
+	}
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memcpy(szStlmDate, argv[1], 8);
+	strcpy(szCupsNo, "alpy");
+
+	iRet = lDbsConnect(DBS_BATCH);	
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "dbsconnect error:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+   
+	/*删除当天加载数据*/
+	EXEC SQL DELETE FROM TBL_CUP_SUCC WHERE STLM_DATE = :szStlmDate AND CUPS_NO = :szCupsNo;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "删除渠道(%s)流水失败, err:(%d)(%s)", szCupsNo, SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	/*加载一般交易流水文件*/
+	if(!memcmp("*", argv[4], 1))	//  非FileScan调启，可能人工或者页面发起
+	{
+		HtLog(NML_PARAM, "参数*, 未指明文件名, 程序自动FTP获取文件");
+		iRet = nGetCupsFile(szStlmDate);
+	}
+	else
+	{
+		HtLog(NML_PARAM, "指明装载文件名[%s]", argv[4]);
+		iRet = nLoadAlpyFile(szStlmDate, argv[4]);
+	}
+	if(iRet)
+	{
+		vDbsDisconnect(); 
+		HtLog(ERR_PARAM, "装载支付宝渠道对账文件失败!, iRet=%d", iRet);
+		return RC_FAIL;
+	}
+	vDbsDisconnect();		
+	return RC_SUCC;
+}	  
+
+/************************************************************************************/
+/*   声明  ： int nCheckCupsFee(TCupSucc *pstCupTxn, dbMchtCupsInf *pstCupsInf)		*/
+/*   功能  ： 核对渠道手续费														*/
+/*   参数  ： pstCupTxn			--渠道流水结构										*/
+/*		   ： pstCupsInf		--渠道商户费率结构									*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int	nCheckCupsFee(struct tbl_cup_succ_c *pstCupTxn)
+{
+/*
+	memset(&stCupsInfo, 0, sizeof(stCupsInfo));
+	iRet = Tbl_mcht_cups_inf_Sel(&stCupsInfo, "cups_no = '%s' and  mcht_cups_no = '%s' and term_cups_no = '%s'",
+		pstCupTxn->cups_no, pstCupTxn->fill, pstCupTxn->term_no);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "cups_no(%s)mcht_cups_no(%s)term_cups_no(%s)", pstCupTxn->cups_no,
+			pstCupTxn->fill, pstCupTxn->term_no);
+		HtLog(ERR_PARAM, "Tbl_mcht_cups_inf_Sel err:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+
+*/
+
+	return RC_FAIL;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetCupsFile														*/
+/*   功能  ： 获取渠道文件															*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int	nGetCupsFile(char *pszDate, char *pszOutFile)
+{
+	int		i = 0, iRet = 0;
+	char	szCmd[512], szYDay[9], szFile[1024];
+
+#if	1
+	HtLog(NML_PARAM, "未设定支付宝渠道FTP获取文件方式!");
+	return RC_FAIL;
+#else
+	memset(szYDay, 0, sizeof(szYDay));
+	strcpy(szYDay, sGetChgDate(pszDate, -1));
+
+	memset(szCmd, 0, sizeof(szCmd));
+	snprintf(szCmd, sizeof(szCmd), "sh %s/sbin/alpy_down.sh %s", getenv("HOME"), szYDay);
+	system(szCmd);
+	HtLog(NML_PARAM, "system cmd [%s]", szCmd);
+
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "%s__%s.txt", TRADE_FILE_MCHT, szYDay);
+	sTrimAll(szFile);
+	
+ 	iRet = nLoadAlpyFile(pszDate, szFile);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "nLoadCilkFile error %d", iRet);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+#endif
+}
+
+/************************************************************************************/
+/*   声明  ： int nLoadYsepFile(char *pszStlmDate, char *pszFile)					*/
+/*   功能  ： 从渠道给的文件中加载渠道流水表										*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*		   :  pszFile				--渠道文件名									*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int nLoadAlpyFile(char *pszDate, char *pszFile)
+{
+	long	lSeqNo = 0;
+	double  dRate;
+	int	 iRet = 0, iVal = 0, iLine = 0, iCount = 0, iTemp = 0;
+	FILE	*fp = NULL;
+	char	szPath[512];
+	char	szLine[RECORD_LEN_MAX + 1], szTemp[100], szDate[10], szDay[10];
+	EXEC SQL BEGIN DECLARE SECTION;
+	TCupSucc	stCups;
+	EXEC SQL END DECLARE SECTION;
+	
+	/* open file */
+	memset(szPath, 0, sizeof(szPath));
+	snprintf(szPath, sizeof(szPath), "%s/alpy/%s", getenv("FILEDIR"), pszFile);
+	sTrimAll(szPath);
+	iRet = access(szPath, R_OK);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "支付宝对账文件[%s]不存在, 处理完毕!", szPath);
+		return RC_FAIL;
+	}
+	
+	HtLog(NML_PARAM, "支付宝对账文件:%s", szPath);
+	if(NULL == (fp = fopen(szPath, "r")))
+	{
+		HtLog(ERR_PARAM, "fopen %s error.", szPath);
+		return RC_FAIL;
+	}
+  
+	/* get file record */
+	memset(szLine, 0, sizeof(szLine));
+	while(fgets(szLine, RECORD_LEN_MAX, fp))
+	{
+		sTrimCRLF(szLine);
+		iLine++;
+		if(0 == strlen(szLine) || '#' == szLine[0] || (szLine[0] < '0' || szLine[0] > '9' ))
+			continue;
+
+		memset(&stCups, 0, sizeof(struct tbl_cup_succ_c));
+		strcpy(stCups.fill, sGetValueByIdx(szLine, ",", 4));		  //   商户号
+		sTrimAll(stCups.fill);
+		
+		// 检查商户是否在本平台注册，对注册的处理，对未注册的不处理
+/*
+		iCount = sql_count("tbl_mcht_cups_inf", "mcht_cups_no = '%s'", stCups.fill);
+		if(0 >= iCount)
+		{ 
+			HtLog(NML_PARAM, "渠道商户[%s]在本平台未注册, 不处理!", stCups.fill);
+			continue;
+		}
+*/
+		/* 第三方KEY */
+		memset(szTemp, 0x00, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 3));	//商户订单号
+		sTrimAll(szTemp);
+		/*检查商户是否在本平台注册，对注册的处理，对未注册的不处理*/
+		if(memcmp(szTemp, "99", 2) || 20 != strlen(szTemp))
+		{
+			memset(szLine, 0, sizeof(szLine));
+			HtLog(NML_PARAM, "渠道商户(%s)在本平台未注册, 不予装载!", stCups.fill);
+			continue;
+		}
+
+		memcpy(stCups.cups_no, "alpy", 4);			   //银商或银行编号
+		/* 唯一键值   */
+		sprintf(stCups.cup_key, "%s%s", stCups.cups_no, szTemp);
+		sprintf(stCups.id, "%s%s", stCups.cups_no, szTemp);
+
+		/*装载日期*/
+		memcpy(stCups.stlm_date, pszDate, 8); 
+		/* 银商或银行编号 */					  
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 1));
+		sTrimAll(szTemp);
+		iTemp = atof(szTemp);
+		snprintf(stCups.sys_ref_no, sizeof(stCups.sys_ref_no), "%012d", iTemp);	  //系统检索号
+		snprintf(stCups.trace_no, sizeof(stCups.trace_no), "%012d", iTemp);	  //流水		
+
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 2));
+		memcpy(stCups.tx_date, szTemp, 4);
+		memcpy(stCups.tx_date + 4, szTemp + 5, 2);
+		memcpy(stCups.tx_date + 6, szTemp + 8, 2);
+
+		memcpy(stCups.tx_time, szTemp + 11, 2);
+		memcpy(stCups.tx_time + 2, szTemp + 14, 2);
+		memcpy(stCups.tx_time + 4, szTemp + 17, 2);
+
+		strcpy(stCups.tx_code, "支付宝消费");
+		stCups.result_flag[0] = TRADE_TXN_INIT;
+
+		strcpy(stCups.brf, sGetValueByIdx(szLine, ",", 7));		//   账号
+		sTrimAll(stCups.brf);
+
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 11));				//   交易金额
+		sTrimAll(szTemp);
+		stCups.tx_amt = atof(szTemp);
+
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 15));				//   服务费
+		sTrimAll(szTemp);
+		stCups.cup_fee = atof(szTemp);
+
+
+		strcpy(stCups.res, sGetValueByIdx(szLine, ",", 8));			//   商户名称
+		sTrimAll(stCups.res);
+
+/*
+		strcpy(stCups.brf, sGetValueByIdx(szLine, ",", 9));			//	支付宝交易号
+		sTrimAll(stCups.brf);
+*/
+
+		/* 时间   */	   
+		memcpy(stCups.rec_crt_ts, sGetCurrentTime(), sizeof(stCups.rec_crt_ts) - 1);
+
+		memset(szTemp, 0, strlen(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, ",", 14));			   //费率
+		sTrimAll(szTemp);
+		dRate = atof(szTemp);
+		
+		if(fabs(stCups.tx_amt * dRate - stCups.cup_fee) > 0.0051)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "error:(%f)!=(%f)", stCups.tx_amt * 0.006, stCups.cup_fee);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+		// 只对消费交易计算手续费
+/*
+		if(TRADE_TXN_INIT == stCups.result_flag[0])
+		{
+			iRet = nCheckCupsFee(&stCups);
+			if(iRet)
+			{
+				fclose(fp);
+				HtLog(ERR_PARAM, "核对手续费错误, error:(%d) Line(%d), mcht(%s)", iRet, iLine, stCups.res);
+				lDbsRollback();
+				return RC_FAIL;
+			}
+		}
+*/
+		iVal ++;	
+
+		EXEC SQL INSERT INTO TBL_CUP_SUCC VALUES(:stCups);
+		if(SQLCODE)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "新增渠道(%s)流水(%s)失败, err:(%d)(%s), Line(%d)", stCups.cups_no,
+				stCups.id, SQLCODE, sDbsError(), iLine);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		if(0 == iLine % 1000)
+			lDbsCommit();
+	  
+		memset(szLine, 0, sizeof(szLine));
+	}
+	lDbsCommit();  
+	fclose(fp);
+	HtLog(NML_PARAM, "装载支付宝对账文件完毕, 装载有效条数(%d)!", iVal);
+
+	return RC_SUCC;
+}

@@ -1,0 +1,184 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取客户表TBL_MCHT_ALGO启动内存大小
+ ****************************************************************************************/
+long	lDefine_MchtAlgo(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MCHT_ALGO WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbMchtAlgo), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(model_id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbMchtAlgo, model_id, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(model_id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(model_type)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtAlgo, model_type, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(model_type)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(cycle_type)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtAlgo, cycle_type, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(cycle_type)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(stlm_flag)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtAlgo, stlm_flag, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(stlm_flag)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(model_flag)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtAlgo, model_flag, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(model_flag)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(trans_type)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtAlgo, trans_type, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(trans_type)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(mcht_grp)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtAlgo, mcht_grp, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(mcht_grp)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(card_type)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtAlgo, card_type, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(card_type)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_MCHT_ALGO
+ ****************************************************************************************/
+long	lLoad_MchtAlgo(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMchtAlgo	stMAlgo;
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL DECLARE Cur_mcht_algo CURSOR FOR 
+		SELECT NVL(MODEL_ID, ' '), NVL(MODEL_TYPE, ' '), NVL(CYCLE_TYPE, ' '), 
+			NVL(STLM_FLAG, ' '), NVL(MODEL_FLAG, ' '), NVL(TRANS_TYPE, ' '),
+			NVL(MCHT_GRP, ' '), NVL(CARD_TYPE, 0) 
+		FROM TBL_MCHT_ALGO ORDER BY MODEL_ID;
+
+	EXEC SQL OPEN Cur_mcht_algo;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stMAlgo, 0, sizeof(stMAlgo));
+		EXEC SQL FETCH Cur_mcht_algo INTO :stMAlgo.model_id, :stMAlgo.model_type, 
+			:stMAlgo.cycle_type, :stMAlgo.stlm_flag, :stMAlgo.model_flag, 
+			:stMAlgo.trans_type, :stMAlgo.mcht_grp, :stMAlgo.card_type;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_algo;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载!(%d)<(%d)", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_mcht_algo;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		sTrimAll(stMAlgo.model_id);	
+		sTrimAll(stMAlgo.model_type);	
+		sTrimAll(stMAlgo.cycle_type);	
+		sTrimAll(stMAlgo.stlm_flag);	
+		sTrimAll(stMAlgo.model_flag);	
+		sTrimAll(stMAlgo.trans_type);	
+		sTrimAll(stMAlgo.mcht_grp);	
+		stMAlgo.card_type = lSetEXLong(stMAlgo.card_type);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stMAlgo.model_id, ++(pGetTblDef(t)->lTreeNode),
+			dbMchtAlgo, model_id, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载商户模型(%s)失败, 原因:%s", stMAlgo.model_id, sGetError());
+			EXEC SQL CLOSE Cur_mcht_algo;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != IBPInsertData(t, &stMAlgo, sizeof(dbMchtAlgo)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t), 
+				stMAlgo.model_id, sGetError());
+			EXEC SQL CLOSE Cur_mcht_algo;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_mcht_algo;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

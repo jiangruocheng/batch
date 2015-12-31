@@ -1,0 +1,197 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取客户表TBL_N_MCHT_MATCH启动内存大小
+ ****************************************************************************************/
+long	lDefine_NMchtMatch(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_N_MCHT_MATCH WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbNMchtMatch), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbNMchtMatch, id, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(cups_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, cups_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(cups_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(mcht_stat)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, mcht_stat, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(mcht_stat)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(export_stat)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, export_stat, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(export_stat)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(local_mcht_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, local_mcht_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(local_mcht_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(cups_mcht_sort_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, cups_mcht_sort_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(cups_mcht_sort_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(cups_mcht_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, cups_mcht_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(cups_mcht_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(export_date)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, export_date, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(export_date)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(mcht_grp)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, mcht_grp, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(mcht_grp)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(mcht_mcc)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbNMchtMatch, mcht_mcc, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(mcht_mcc)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_N_MCHT_MATCH
+ ****************************************************************************************/
+long	lLoad_NMchtMatch(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbNMchtMatch	stNMatch;
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL DECLARE Cur_n_mcht_match CURSOR FOR 
+		SELECT NVL(ID, 0), NVL(CUPS_NO, ' '), NVL(MCHT_STAT, ' '), NVL(EXPORT_STAT, ' '), 
+			NVL(LOCAL_MCHT_NO, ' '), NVL(CUPS_MCHT_SORT_NO, ' '), NVL(CUPS_MCHT_NO, ' '), 
+			NVL(REASON, ' '), NVL(RESV_0, 0), NVL(RESV_1, ' '), NVL(FEE_RATE, 0.00), 
+			NVL(FEE_VAL, 0.00), NVL(MCHT_NM, ' '), NVL(EXPORT_DATE, 0), NVL(MCHT_GRP, ' '), 
+			NVL(MCHT_MCC, ' '), NVL(MCHT_DISC_ID, ' ') 
+		FROM TBL_N_MCHT_MATCH ORDER BY CUPS_NO;
+
+	EXEC SQL OPEN Cur_n_mcht_match;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stNMatch, 0, sizeof(stNMatch));
+		EXEC SQL FETCH Cur_n_mcht_match INTO :stNMatch.id, :stNMatch.cups_no, :stNMatch.mcht_stat,
+			:stNMatch.export_stat, :stNMatch.local_mcht_no, :stNMatch.cups_mcht_sort_no, 
+			:stNMatch.cups_mcht_no, :stNMatch.reason, :stNMatch.resv_0, :stNMatch.resv_1, 
+			:stNMatch.fee_rate, :stNMatch.fee_val, :stNMatch.mcht_nm, :stNMatch.export_date, 
+			:stNMatch.mcht_grp, :stNMatch.mcht_mcc, :stNMatch.mcht_disc_id;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_n_mcht_match;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载(%d)<(%d)!", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_n_mcht_match;
+			return RC_FAIL;
+		}
+
+		sTrimAll(stNMatch.cups_no);
+		sTrimAll(stNMatch.mcht_stat);
+		sTrimAll(stNMatch.export_stat);
+		sTrimAll(stNMatch.local_mcht_no);
+		sTrimAll(stNMatch.cups_mcht_sort_no);
+		sTrimAll(stNMatch.cups_mcht_no);
+		sTrimAll(stNMatch.reason);
+		sTrimAll(stNMatch.resv_1);
+		sTrimAll(stNMatch.mcht_nm);
+		sTrimAll(stNMatch.export_date);
+		sTrimAll(stNMatch.mcht_grp);
+		sTrimAll(stNMatch.mcht_mcc);
+		sTrimAll(stNMatch.mcht_disc_id);		
+		stNMatch.id = lSetEXLong(stNMatch.id);
+		stNMatch.resv_0 = lSetEXLong(stNMatch.resv_0);
+
+		if(RC_SUCC != IBPInsertData(t, &stNMatch, sizeof(stNMatch)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t),
+				stNMatch.local_mcht_no, sGetError());
+			EXEC SQL CLOSE Cur_n_mcht_match;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+
+	EXEC SQL CLOSE Cur_n_mcht_match;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

@@ -1,0 +1,292 @@
+/*****************************************************************
+ *文 件 名: LoadHxnpFile.c
+ *功	能: 加载渠道流水文件
+******************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+#define FILE_NAME_LEN_MAX   512
+#define REPAIR_AMT_SUCC		'1'
+#define REPAIR_AMT_FAIL		'0'
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_financ_manage.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   函数名：					   装载渠道流水主函数								*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*		  	  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	int		iRet;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szStlmDate[9], szBuss[21];
+	EXEC SQL END DECLARE SECTION;
+	char	szFile[512];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "LoadHengFeng.log");
+
+	if(5 > argc)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szFile, 0, sizeof(szFile));
+	memset(szBuss, 0, sizeof(szBuss));
+
+	memcpy(szStlmDate, argv[1], 8);
+	strcpy(szBuss, "hengfeng");
+	memcpy(szFile, argv[4], sizeof(szFile) - 1);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "DbsConnect err:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+   
+	/*删除当天加载数据*/
+	EXEC SQL DELETE FROM TBL_FINANC_MANAGE WHERE LOAD_DATE = :szStlmDate AND 
+		BUSS_TYPE = :szBuss;
+	if(SQL_UD_ERR)	
+	{
+		HtLog(ERR_PARAM, "删除业务类型(%s)流水失败, err:(%d)(%s)", szBuss, 
+			SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	if(!memcmp("*", argv[4], 1))	//  非FileScan调启，可能人工或者页面发起
+	{
+		HtLog(NML_PARAM, "参数*, 未指明文件名, 程序自动FTP获取文件");
+		iRet = nGetCupsFile(szStlmDate, szBuss);
+	}
+	else
+	{
+		HtLog(NML_PARAM, "指明装载文件名[%s]", szFile);
+		iRet = nLoadHengFeng(szStlmDate, szBuss, szFile);
+	}
+	if(iRet)
+	{
+		vDbsDisconnect(); 
+		HtLog(ERR_PARAM, "装载翰鑫新平台对账文件失败 error:%d", iRet);
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();		
+	return RC_SUCC;
+}	  
+
+/************************************************************************************/
+/*   声明  ： int nGetCupsFile														*/
+/*   功能  ： 获取渠道文件															*/
+/*   参数  ： pszStlmDate 			--装载日期										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGetCupsFile(char *pszStlmDate, char *pszBuss)
+{
+	char	szCmd[512], szFile[512];	
+
+	memset(szCmd, 0, sizeof(szCmd));
+	snprintf(szCmd, sizeof(szCmd), "sh %s/sbin/hengfeng_down.sh %s", getenv("HOME"), 
+		pszStlmDate);
+	system(szCmd);
+
+//	HBSQ_HF_yyyyMMdd.txt
+	HtLog(NML_PARAM, "system cmd [%s]", szCmd);
+	
+	memset(szFile, 0, sizeof(szFile));
+	snprintf(szFile, sizeof(szFile), "HBSQ_HF_%s.txt", pszStlmDate);
+
+	return nLoadHengFeng(pszStlmDate, pszBuss, szFile); 
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetLastAmt(char *pszStlmDate, char *pszBuss)						*/
+/*   功能  ： 检查上期未截留完成的商户												*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*		   ： pszBuss				--业务类型										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGetLastAmt(char *pszStlmDate, char *pszBuss)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szFlag[2], szState[2];
+	char	szStlmDate[9], szBuss[21], szTime[15];
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szState, 0, sizeof(szState));
+	memset(szTime, 0, sizeof(szTime));
+	memset(szBuss, 0, sizeof(szBuss));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+
+	memcpy(szBuss, pszBuss, sizeof(szBuss) - 1);
+	memcpy(szStlmDate, pszStlmDate, sizeof(szStlmDate) - 1);
+	memcpy(szTime, sGetCurrentTime(), sizeof(szTime) - 1);
+
+	szFlag[0] = REPAIR_AMT_SUCC;
+
+	EXEC SQL UPDATE TBL_FINANC_MANAGE SET
+		DONE_DATE	= :szStlmDate,
+		REC_UPD_TS	= :szTime
+	WHERE BUSS_TYPE = :szBuss AND STATE = :szFlag
+		AND LOAD_AMT - REAL_AMT > 0.00;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新参与本周期(%s)截留明细失败, err:(%d)(%s)", szStlmDate,
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL UPDATE TBL_FINANC_MANAGE SET 
+		STATE = :szFlag
+	WHERE LOAD_DATE = :szStlmDate AND BUSS_TYPE = :szBuss AND APP_ID IN
+	   (SELECT APP_ID FROM TBL_FINANC_MANAGE M,
+			(SELECT SETTLE_MCHT,
+				SUM(NVL(TX_AMT, 0.00) - NVL(FEE_AMT, 0.00) - NVL(MCHT_SERVE_FEE, 0.00) -
+					NVL(SERV_FEE_KQDA, 0.00) + NVL(FREE_FEE, 0.00)) AS SETTLE_AMT
+				FROM TBL_ALGO_DTL WHERE ALGO_DATE = :szStlmDate
+					AND DISC_CYCLE > 0 GROUP BY SETTLE_MCHT) B
+		WHERE B.SETTLE_MCHT = M.APP_ID AND M.LOAD_DATE = :szStlmDate
+			AND BUSS_TYPE = :szBuss AND M.LOAD_AMT <= B.SETTLE_AMT);
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新(%s)恒丰(%s)截留流水失败, err:(%d)(%s)", szStlmDate, 
+			szBuss, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nLoadHengFeng(char *pszStlmDate, char *pszBuss, char *pszFile)	*/
+/*   功能  ： 从渠道给的文件中加载渠道流水表										*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*		   :  pszFile				--渠道文件名									*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nLoadHengFeng(char *pszStlmDate, char *pszBuss, char *pszFile)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TFinancManage	stFina;
+	EXEC SQL END DECLARE SECTION;
+	FILE		*fp = NULL;
+	char		szPath[FILE_NAME_LEN_MAX + 1], szTmp[100], szLine[RECORD_LEN_MAX + 1];
+	long		lLine = 0, lCount = 0, lRec = 0;
+	
+	memset(szPath, 0, sizeof(szPath));
+	snprintf(szPath, sizeof(szPath), "%s/hengfeng/%s", getenv("FILEDIR"), pszFile);
+	sTrimAll(szPath);
+	HtLog(NML_PARAM, "恒丰理财截留文件:%s", szPath);
+ 
+	if(RC_SUCC != access(szPath, R_OK))
+	{
+		HtLog(ERR_PARAM, "文件(%s)不存在，请核对, err:%s", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+
+	if(NULL == (fp = fopen(szPath, "r")))
+	{
+		HtLog(ERR_PARAM, "打开文件(%s)失败, err:(%s)", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+  
+//201509230030000289010001,008310195000262,10000
+	memset(szLine, 0, sizeof(szLine));
+	while(fgets(szLine, RECORD_LEN_MAX, fp))
+	{
+		++ lLine;
+		sTrimAll(szLine);
+		sTrimCRLF(szLine);
+		if(strlen(szLine) == 0)
+			continue;
+		if(1 == lLine)
+		{
+			lRec = atol(szLine);
+			continue;
+		}
+
+		lCount ++;
+		memset(&stFina, 0, sizeof(stFina));
+		stFina.export_state[0] = '1';
+		stFina.state[0] = REPAIR_AMT_FAIL;
+		memcpy(stFina.load_date, pszStlmDate, 8); 
+		memcpy(stFina.done_date, pszStlmDate, 8); 
+		memcpy(stFina.buss_type, pszBuss, sizeof(stFina.buss_type) - 1); 
+
+		strcpy(stFina.id, sGetValueByIdx(szLine, ",", 1));
+		sTrimAll(stFina.id);
+
+		strcpy(stFina.app_id, sGetValueByIdx(szLine, ",", 2));
+		sTrimAll(stFina.app_id);
+
+		memset(szTmp, 0, sizeof(szTmp));		
+		strcpy(szTmp, sGetValueByIdx(szLine, ",", 3));			//	截留金额
+		sTrimAll(szTmp);
+		stFina.load_amt = atof(szTmp) / 100.00;
+
+		memcpy(stFina.rec_crt_ts, sGetCurrentTime(), sizeof(stFina.rec_crt_ts) - 1);
+
+		EXEC SQL INSERT INTO TBL_FINANC_MANAGE VALUES(:stFina);
+		if(SQLCODE)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "新增业务(%s)流水(%s)失败, err:(%d)(%s), Line(%d)", stFina.buss_type, 
+				stFina.id, SQLCODE, sDbsError(), lLine);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		if(0 == lCount % 1000)
+			EXEC SQL COMMIT WORK;
+
+		memset(szLine, 0, sizeof(szLine));
+	}
+	fclose(fp);
+	
+	if(lRec != lCount)
+	{
+		HtLog(ERR_PARAM, "文件(%s)截留明细异常, 标注行(%d)!=(%d)有效行", szPath,
+			lRec, lCount);
+		lDbsRollback();
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "装载恒丰理财截留文件流水完成，装载日期(%s), 本地装载有效条数(%d)", pszStlmDate, lCount);
+	return nGetLastAmt(pszStlmDate, pszBuss);
+}

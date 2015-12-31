@@ -1,0 +1,242 @@
+/******************************************************************
+*文 件 名: GenMchtTxn.pc
+*功	   能: 对渠道生成流水文件
+*判断标识: szCupsNo
+*编程人员: DeffPuzzL
+*编程时间: 20150619
+******************************************************************/
+
+#include "DbsApi.h"
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"tbl_cup_succ.h"
+#include	"tbl_txn_succ.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： char*	sConverTime(char *pszDate, char *pszTime)						*/
+/*   功能  ： 生成商户对帐流水文件													*/
+/*   参数  ： pszDate		--	日期												*/
+/*			  pszTime		--	时间												*/
+/*  返回值 ： szTime																*/
+/************************************************************************************/
+char*	sConverTime(char *pszDate, char *pszTime)
+{
+	static	char	szTime[20];
+
+	memset(szTime, 0, sizeof(szTime));
+
+	memcpy(szTime, pszDate + 4, 2);
+  	strcat(szTime, "/");
+	memcpy(szTime + 3, pszDate + 6, 2);
+	strcat(szTime, " ");
+
+ 	memcpy(szTime + 6, pszTime, 2);
+	strcat(szTime, ":");
+	memcpy(szTime + 9, pszTime + 2, 2);
+	strcat(szTime, ":");
+  	memcpy(szTime + 12, pszTime + 4, 2);
+
+	return szTime;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGenChannelBill(char *pszSettleDate, char *pszSettleNum, 			*/
+/*					char *pszCupsNo)												*/
+/*   功能  ： 生成商户对帐流水文件													*/
+/*   参数  ： pszSettleDate			 --清算日期										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*		   	  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGenChannelBill(char *pszSettleDate, char *pszSettleNum, char *pszCupsNo)
+{
+	long	iRet = 0, lCount = 0;
+	dbMchtBase  stBase;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szCupsNo[5], szDate[9], szOK[2];
+	TCupSucc	stCup;
+	TTxnSucc	stTxn;
+	EXEC SQL END DECLARE SECTION;
+	char	szPath[512], szCmd[512];
+	FILE	*fp = NULL;
+
+	memset(szOK, 0, sizeof(szOK)); 
+	memset(szPath, 0, sizeof(szPath)); 
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memset(szDate, 0, sizeof(szDate));
+
+	szOK[0] = STLM_FLG_OK;	
+	memcpy(szCupsNo, pszCupsNo, sizeof(szCupsNo) - 1);
+	memcpy(szDate, pszSettleDate, sizeof(szDate) - 1);
+
+	//STLM_20140603_商户号.txt
+	snprintf(szPath, sizeof(szPath), "%s/settle/STLM_%s_%s.csv", getenv("FILEDIR"), 
+		pszSettleDate, pszCupsNo);
+
+	if(NULL == (fp = fopen(szPath, "w")))
+	{
+		HtLog(ERR_PARAM, "开始对账文件(%s)失败, err:(%s)", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+
+	fprintf(fp, "清算日期,交易类型,交易时间,机构号,商户编号,终端编号,交易金额,"
+		"卡号,交易跟踪号,应答码,商户类型,收单币种,收单交易金额,收单手续费,商户币种,"
+		"商户交易金额,商户手续费,系统跟踪号,批次号\n");
+
+	EXEC SQL DECLARE Cur_cup_succ CURSOR FOR 
+		SELECT * FROM TBL_CUP_SUCC WHERE STLM_DATE IN 
+			(SELECT TO_CHAR(TO_DATE(TRANS_DATE, 'YYYYMMDD') + 1, 'YYYYMMDD')
+				FROM TBL_STLM_DATE WHERE STLM_DATE = :szDate)
+		AND CUPS_NO = :szCupsNo AND RESULT_FLAG = :szOK
+		ORDER BY TX_DATE, TX_TIME;
+
+	EXEC SQL OPEN Cur_cup_succ;
+	if(SQLCODE)
+	{
+		fclose(fp);
+		HtLog(ERR_PARAM, "查询渠道(%s)清分流水失败, err:(%d)(%s)", pszCupsNo, SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stCup, 0, sizeof(stCup));
+		EXEC SQL FETCH Cur_cup_succ INTO :stCup;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "查询渠道(%s)清分流水失败, err:(%d)(%s)", szCupsNo, SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_cup_succ;
+ 			return RC_FAIL;
+		}
+
+		vTrimCupSucc(&stCup);
+
+		memset(&stTxn, 0, sizeof(stTxn));
+		EXEC SQL SELECT * INTO :stTxn FROM TBL_TXN_SUCC WHERE CUP_KEY = :stCup.cup_key;
+		if(SQLCODE)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "查询(%s)流水失败，err:(%d)(%s)", stCup.cup_key, SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_cup_succ;
+			return RC_FAIL;
+		}
+
+		vTrimTxnSucc(&stTxn);
+		memset(&stBase, 0, sizeof(stBase));
+		iRet = lGetMchtBase(&stBase, stTxn.ibox42);
+		if(iRet)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "获取商户(%s)基本信息失败, err:(%d)(%s)", stTxn.ibox42,
+				iRet, sGetError());
+			EXEC SQL CLOSE Cur_cup_succ;
+			return RC_FAIL;
+		}
+
+	   	fprintf(fp, "%s,POS消费,%s,\t%s,\t%s,\t%s,%.2f,%s,\t%s,\t%s,\t%s,%s,%.2f,%.2f,%s,%.2f,%.2f,\t%s,\t%s\n",
+			pszSettleDate, sConverTime(stTxn.tx_date, stTxn.tx_time), stTxn.brno, 
+			stTxn.ibox42, stTxn.ibox41, stTxn.tx_amt, sEncryAcNo(stTxn.ac_no), stTxn.ibox11, 
+			stTxn.fd39, stBase.mcht_mcc, stTxn.fd49, stCup.tx_amt, stCup.cup_fee, 
+			stTxn.fd49, stCup.tx_amt, stCup.cup_fee, stTxn.fd37, stTxn.ibox_batch_no);
+
+		lCount ++;
+	}
+ 	EXEC SQL CLOSE Cur_cup_succ;
+	fclose(fp);
+
+	HtLog(NML_PARAM, "对渠道(%s)生成对账文件完毕, 明细笔数(%d)!", pszCupsNo, lCount);
+
+	memset(szCmd, 0, sizeof(szCmd));
+	snprintf(szCmd, sizeof(szCmd), "SendChnBill.sh %s %s/%s >>%s/%s 2>&1", 
+		szPath, pszCupsNo, szDate, getenv("LOG_FILE_PATH"), gsLogFile);
+
+	HtLog(NML_PARAM, "发送对账文件:%s", szCmd);
+	if(RC_SUCC != system(szCmd))
+	{
+		HtLog(ERR_PARAM, "发送渠道对账文件(%s)失败, err:%s", szCmd, strerror(errno));
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   函数名：					   结算主函数										*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*		   ： argv (参数列表 -- 输出)												*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int main(int argc, char *argv[])
+{
+	int		iRet;
+	char	szSettleDate[9], szSettleNum[5], szCupsNo[5];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "GenChannelTxn.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	strcpy(szSettleDate, argv[1]);
+	strcpy(szSettleNum, argv[2]);
+	strcpy(szCupsNo, argv[4]);
+
+	if(4 != strlen(szCupsNo))
+	{
+		HtLog(NML_PARAM, "无效的渠道编号(%s)!", szCupsNo);
+		return RC_FAIL;
+	}
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet) 
+	{
+		HtLog(ERR_PARAM, "连接数据库失败，err:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	iRet = nGenChannelBill(szSettleDate, szSettleNum, szCupsNo);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "生成商户流水失败，err:(%d)\n", iRet);
+		vDbsDisconnect();
+		return iRet;
+	}
+
+	vDbsDisconnect();
+	HtLog(NML_PARAM, "本周期(%s)导出文件处理结束!\n", szSettleDate);
+	
+	return RC_SUCC;
+}

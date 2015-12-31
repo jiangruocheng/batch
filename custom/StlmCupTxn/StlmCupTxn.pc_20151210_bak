@@ -1,0 +1,1434 @@
+/************************************************************************************
+ *  功  能: 对账
+ *	Author:DeffPuzzL
+ *  Edit History:	2015/07/08
+ ************************************************************************************/
+#include	"Ibp.h"
+#include	"pos_stlm.h"
+#include	"DbsApi.h"
+#include	"load.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"tbl_txn_succ.h"
+#include	"tbl_cup_succ.h"
+#include	"tbl_stlm_err.h"
+#include	"tbl_stlm_succ.h"
+#include	"tbl_algo_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INCLUDE SQLCA;
+
+//extern	int	nAlgoDtlIns(TAlgoDtl *pstAlgoDtl, dbMchtAlgo *pdbMAlgo, dbMchtBase *pdbMBase);
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ：int main(int argc, char ** argv )										*/
+/*   功能  ：对账主逻辑																*/
+/*  返回值 ：RC_SUCC --  成功														*/
+/*		   	 RC_FAIL --  失败														*/
+/************************************************************************************/
+int		main(int argc, char **argv)
+{
+	long	lRet = 0, lCount = 0;
+	char	szStlmDate[9], szSettleNum[5];
+	char	szCupsNo[5];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "StlmCupTxn.log");
+
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	vPrintVersion(argv[1]);
+	if(5 != argc) 
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memcpy(szStlmDate, argv[1], 8);
+	memcpy(szSettleNum, argv[2], 4);
+	memcpy(szCupsNo, argv[4], 4);
+	
+	sprintf(gsLogFile, "StlmCupTxn_%s.log", szCupsNo);
+
+	if(RC_SUCC != lDbsConnect(DBS_BATCH))
+	{
+		HtLog(ERR_PARAM, "连接数据库失败, err:(%s)", sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "开始进行渠道对账, 对账参数: 渠道编号(%s)对账日期(%s)", 
+		szCupsNo, szStlmDate);
+
+	if(RC_SUCC != nStlmCupTxn(szStlmDate, szCupsNo, szSettleNum, &lCount))
+	{
+		HtLog(ERR_PARAM, "渠道(%s)对账失败!", szCupsNo);
+		vDbsDisconnect(); 
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();		
+	HtLog(NML_PARAM, "渠道(%s)本周期(%s)对账完毕, 对账笔数(%d)!", szCupsNo, 
+		szStlmDate, lCount);
+
+	return RC_SUCC;
+}	  
+
+/************************************************************************************/
+/*   声明  ： void	vSaveAlgoDtl(TAloDtl *pstAlgoDtl)								*/
+/*   功能  ： 对删除的流水进行备份													*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vSaveAlgoDtl(TAlgoDtl *pstAlgoDtl)
+{
+	FILE	*fp = NULL;
+
+	HtLog(NML_PARAM, "保存(%s)数据，文件(%s)", pstAlgoDtl->id, sGetLogName());
+	if(NULL == (fp = fopen(sGetLogName(), "a+")))
+	{
+		HtLog(ERR_PARAM, "打开文件(%s)失败, err:%s", sGetLogName(), strerror(errno));
+		return ;
+	}
+
+	fwrite(pstAlgoDtl, sizeof(TAlgoDtl), 1, fp);
+	fclose(fp);
+}
+
+/************************************************************************************/
+/*   声明  ： void	vGetRedunErr(TStlmErr *pstErr, TStlmSucc *pstSucc)				*/
+/*   功能  ： 填充表中的冗余字段													*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vGetRedunErr(TStlmErr *pstErr, TStlmSucc *pstSucc)
+{
+	dbMchtUser	stUser;
+	dbBrhInfo	stBrh;
+	dbOprInf	stOprIf;
+	long		lExpand = 0;
+
+	memset(&stBrh, 0, sizeof(stBrh));
+	memset(&stUser, 0, sizeof(stUser));
+	memset(&stOprIf, 0, sizeof(stOprIf));
+
+	//  无论是否获取成功，都不报错
+	if(pstSucc)
+	{
+		if(RC_SUCC == lGetOprInfo(&stOprIf, pstSucc->expand))
+			memcpy(pstSucc->expand_name, stOprIf.opr_name,  sizeof(pstSucc->expand_name) - 1);
+		else
+			HtLog(ERR_PARAM, "警告:获取商户(%s)用户(%d)数据失败, err:%s\n", pstSucc->ibox42,
+				pstSucc->expand, sGetError());
+
+		if(RC_SUCC == lGetBrhInfo(&stBrh, pstSucc->brno))
+			memcpy(pstSucc->trade_brh_name, stBrh.brh_name,  sizeof(pstSucc->trade_brh_name) - 1);
+		else
+			HtLog(ERR_PARAM, "警告:获取机构(%s)数据失败, err:%s\n", pstSucc->brno,
+				sGetError());
+	}
+
+	//  无论是否获取成功，都不报错
+	if(pstErr)
+	{
+		if(RC_SUCC == lGetBrhInfo(&stBrh, pstErr->brno))
+			memcpy(pstErr->brh_name, stBrh.brh_name, sizeof(pstErr->brh_name) - 1);
+		else
+			HtLog(ERR_PARAM, "警告:获取机构(%s)数据失败, err:%s\n", pstErr->brno,
+				sGetError());
+
+		if(RC_SUCC == lGetOprInfo(&stOprIf, pstErr->expand))
+			memcpy(pstErr->expand_name, stOprIf.opr_name, sizeof(pstErr->expand_name) - 1);
+		else
+			HtLog(ERR_PARAM, "警告:获取商户(%s)用户(%d)数据失败, err:%s\n", pstErr->ibox42,
+				pstErr->expand, sGetError());
+
+		//  无论是否获取成功，都不报错
+		if(RC_SUCC == lGetMchtUser(&stUser, pstErr->user_id))
+		{
+			memcpy(pstErr->user_name, stUser.user_name,  sizeof(pstErr->user_name) - 1);
+			memcpy(pstErr->user_phone, stUser.user_phone,  sizeof(pstErr->user_phone) - 1);
+			memcpy(pstErr->user_email, stUser.user_email,  sizeof(pstErr->user_email) - 1);
+		}
+		else
+			HtLog(ERR_PARAM, "警告:获取用户(%d)数据失败, err:%s\n", pstErr->user_id,
+				sGetError());
+	}
+}
+
+/************************************************************************************/
+/*   声明  ： void	vFillStlmErr(TStlmSucc *pstSucc, TTxnSucc  *pstTxn)				*/
+/*   功能  ： 用本地交易表填充对账差错表结构										*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vFillStlmErr(TStlmErr *pstErr, TTxnSucc  *pstTxn)
+{
+	memcpy(pstErr->id, pstTxn->id, sizeof(pstErr->id) - 1);
+	memcpy(pstErr->tx_date, pstTxn->tx_date, 8);
+	memcpy(pstErr->tx_time, pstTxn->tx_time, 8);
+	memcpy(pstErr->cups_no, pstTxn->cups_no, sizeof(pstErr->cups_no) - 1);
+	memcpy(pstErr->trace_no, pstTxn->trace_no, sizeof(pstErr->trace_no) - 1);
+	memcpy(pstErr->ac_no, pstTxn->ac_no, sizeof(pstErr->ac_no) - 1);
+//	memcpy(pstErr->ac_bank_no, pstTxn->ac_bank_no, sizeof(pstErr->ac_bank_no) - 1);
+//	memcpy(pstErr->tx_code, pstTxn->tx_code, sizeof(pstErr->tx_code) - 1);
+	memcpy(pstErr->tx_name, pstTxn->tx_code, sizeof(pstErr->tx_code) - 1);
+	memcpy(pstErr->tx_sub_code, pstTxn->tx_sub_code, sizeof(pstErr->tx_sub_code) - 1);
+	pstErr->ac_type = pstTxn->ac_type;
+	pstErr->disc_cycle = pstTxn->disc_cycle;
+	pstErr->user_id = pstTxn->user_id;
+	pstErr->expand = pstTxn->expand;
+	memcpy(pstErr->brno, pstTxn->brno, sizeof(pstErr->brno) - 1);
+	memcpy(pstErr->ibox_no, pstTxn->ibox_no, sizeof(pstErr->ibox_no) - 1);	
+	memcpy(pstErr->order_no, pstTxn->order_no, sizeof(pstErr->order_no) - 1);	
+	memcpy(pstErr->tx_code, pstTxn->tx_code, sizeof(pstErr->tx_code) - 1);	
+	memcpy(pstErr->longitude, pstTxn->longitude, sizeof(pstErr->longitude) - 1);
+	memcpy(pstErr->latitude, pstTxn->latitude, sizeof(pstErr->latitude) - 1);
+	memcpy(pstErr->ibox41, pstTxn->ibox41, sizeof(pstErr->ibox41) - 1);
+	memcpy(pstErr->ibox42, pstTxn->ibox42, sizeof(pstErr->ibox42) - 1);
+	memcpy(pstErr->ibox43, pstTxn->ibox43, sizeof(pstErr->ibox43) - 1);
+	memcpy(pstErr->fd41, pstTxn->fd41, sizeof(pstErr->fd41) - 1);
+	memcpy(pstErr->fd42, pstTxn->fd42, sizeof(pstErr->fd42) - 1);
+	memcpy(pstErr->fd43, pstTxn->fd43, sizeof(pstErr->fd43) - 1);
+	memcpy(pstErr->settlemode, pstTxn->settlemode, sizeof(pstErr->settlemode) - 1);
+	pstErr->fdx = pstTxn->fdx;
+	pstErr->local_amt = pstTxn->tx_amt;		//	本地金额(页面展示用)
+	memcpy(pstErr->fdxx, pstTxn->fdxx, sizeof(pstErr->fdxx) - 1);
+	memcpy(pstErr->fdxxx, pstTxn->fdxxx, sizeof(pstErr->fdxxx) - 1);
+}
+
+/************************************************************************************/
+/*   声明  ： void	vFillStlmSucc(TStlmSucc *pstSucc, TTxnSucc  *pstTxn)			*/
+/*   功能  ： 用本地交易表填充对账成功表结构										*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vFillStlmSucc(TStlmSucc *pstSucc, TTxnSucc	*pstTxn)
+{
+	memcpy(pstSucc->id, pstTxn->id, sizeof(pstSucc->id) - 1);
+	memcpy(pstSucc->tx_date, pstTxn->tx_date, sizeof(pstSucc->tx_date) - 1);
+	memcpy(pstSucc->tx_time, pstTxn->tx_time, sizeof(pstSucc->tx_time) - 1);
+	memcpy(pstSucc->trace_no, pstTxn->trace_no, sizeof(pstSucc->trace_no) - 1);
+	memcpy(pstSucc->ibox_no, pstTxn->ibox_no, sizeof(pstSucc->ibox_no) - 1);
+	memcpy(pstSucc->order_no, pstTxn->order_no, sizeof(pstSucc->order_no) - 1);
+	memcpy(pstSucc->cups_no, pstTxn->cups_no, sizeof(pstSucc->cups_no) - 1);
+	memcpy(pstSucc->ac_no, pstTxn->ac_no, sizeof(pstSucc->ac_no) - 1);
+//	memcpy(pstSucc->ac_bank_no, pstTxn->ac_bank_no, sizeof(pstSucc->ac_bank_no) - 1);
+	pstSucc->user_id = pstTxn->user_id;
+	pstSucc->disc_cycle = pstTxn->disc_cycle;
+	pstSucc->expand = pstTxn->expand;
+	pstSucc->ac_type = pstTxn->ac_type;
+	pstSucc->tx_amt = pstTxn->tx_amt; 
+	pstSucc->fee_amt = pstTxn->fee_amt;
+	memcpy(pstSucc->tx_code, pstTxn->tx_code, sizeof(pstSucc->tx_code) - 1);
+//	memcpy(pstSucc->tx_name, pstTxn->tx_name, sizeof(pstSucc->tx_name) - 1);
+	strcpy(pstSucc->tx_name, "POS消费");
+	memcpy(pstSucc->tx_sub_code, pstTxn->tx_sub_code, sizeof(pstSucc->tx_sub_code) - 1);
+	memcpy(pstSucc->brno, pstTxn->brno, sizeof(pstSucc->brno) - 1);
+	memcpy(pstSucc->longitude, pstTxn->longitude, sizeof(pstSucc->longitude) - 1);
+	memcpy(pstSucc->latitude, pstTxn->latitude, sizeof(pstSucc->latitude) - 1);
+	memcpy(pstSucc->sw_respcd, pstTxn->sw_respcd, sizeof(pstSucc->sw_respcd) - 1);
+	memcpy(pstSucc->ibox_respcd, pstTxn->ibox_respcd, sizeof(pstSucc->ibox_respcd) - 1);
+	memcpy(pstSucc->fd3, pstTxn->fd3, sizeof(pstSucc->fd3) - 1);
+	memcpy(pstSucc->fd7, pstTxn->fd7, sizeof(pstSucc->fd7) - 1);
+	memcpy(pstSucc->ibox11, pstTxn->ibox11, sizeof(pstSucc->ibox11) - 1);
+	memcpy(pstSucc->fd11, pstTxn->fd11, sizeof(pstSucc->fd11) - 1);
+	memcpy(pstSucc->fd12, pstTxn->fd12, sizeof(pstSucc->fd12) - 1);
+	memcpy(pstSucc->fd13, pstTxn->fd13, sizeof(pstSucc->fd13) - 1);
+	memcpy(pstSucc->fd15, pstTxn->fd15, sizeof(pstSucc->fd15) - 1);
+	memcpy(pstSucc->ibox18, pstTxn->ibox18, sizeof(pstSucc->ibox18) - 1);
+	memcpy(pstSucc->fd28, pstTxn->fd28, sizeof(pstSucc->fd28) - 1);
+	memcpy(pstSucc->fd37, pstTxn->fd37, sizeof(pstSucc->fd37) - 1);
+	memcpy(pstSucc->fd38, pstTxn->fd38, sizeof(pstSucc->fd38) - 1);
+	memcpy(pstSucc->fd39, pstTxn->fd39, sizeof(pstSucc->fd39) - 1);
+	memcpy(pstSucc->ibox41, pstTxn->ibox41, sizeof(pstSucc->ibox41) - 1);
+	memcpy(pstSucc->ibox42, pstTxn->ibox42, sizeof(pstSucc->ibox42) - 1);
+	memcpy(pstSucc->ibox43, pstTxn->ibox43, sizeof(pstSucc->ibox43) - 1);
+	memcpy(pstSucc->fd41, pstTxn->fd41, sizeof(pstSucc->fd41) - 1);
+	memcpy(pstSucc->fd42, pstTxn->fd42, sizeof(pstSucc->fd42) - 1);
+	memcpy(pstSucc->fd43, pstTxn->fd43, sizeof(pstSucc->fd43) - 1);
+	memcpy(pstSucc->fd49, pstTxn->fd49, sizeof(pstSucc->fd49) - 1);
+	memcpy(pstSucc->fd60, pstTxn->fd60, sizeof(pstSucc->fd60) - 1);
+	memcpy(pstSucc->fd100, pstTxn->fd100, sizeof(pstSucc->fd100) - 1);
+	memcpy(pstSucc->fd102, pstTxn->fd102, sizeof(pstSucc->fd102) - 1);
+	memcpy(pstSucc->fd103, pstTxn->fd103, sizeof(pstSucc->fd103) - 1);
+	memcpy(pstSucc->servetype, pstTxn->servetype, sizeof(pstSucc->servetype) - 1);
+	memcpy(pstSucc->promtsmode, pstTxn->promtsmode, sizeof(pstSucc->promtsmode) - 1);
+	memcpy(pstSucc->settlemode, pstTxn->settlemode, sizeof(pstSucc->settlemode) - 1);
+	pstSucc->promtsid = pstTxn->promtsid;
+	pstSucc->promtsvalue = pstTxn->promtsvalue;
+
+	pstSucc->fdx = pstTxn->fdx;
+	memcpy(pstSucc->fdxx, pstTxn->fdxx, sizeof(pstSucc->fdxx) - 1);
+	memcpy(pstSucc->rec_crt_ts, sGetCurrentTime(), 14);
+
+	sTrimRight(pstSucc->ibox42);
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetFeebyCups(TAlgoDtl *pstAlgoDtl, TStlmErr *pstErr) 			*/
+/*   功能  ： 计算手续费															*/
+/*  返回值 ：RC_SUCC	--	成功													*/
+/*			 RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGetFeebyCups(TAlgoDtl *pstAlgoDtl, TStlmErr *pstErr)
+{
+	dbMchtAlgo  dbMAlgo;
+	dbMchtBase  dbMBase;
+
+	memset(&dbMAlgo, 0, sizeof(dbMAlgo));
+	memset(&dbMBase, 0, sizeof(dbMBase));
+	if(RC_SUCC != lGetMchtBase(&dbMBase, pstAlgoDtl->settle_mcht))
+	{
+		HtLog(ERR_PARAM, "获取商户(%s)基本信息失败, err:(%d)(%s)",
+ 			pstAlgoDtl->settle_mcht, SQLCODE, sGetError());
+ 		return RC_FAIL;
+ 	}
+
+	if(RC_SUCC != lGetMchtAlgo(&dbMAlgo, dbMBase.mcht_disc_id))
+	{
+		HtLog(ERR_PARAM, "获取商户(%s)费率(%s)配置表TBL_MCHT_ALGO信息失败, err:(%s)",
+			dbMBase.mcht_no, dbMBase.mcht_disc_id, sGetError());
+		return RC_FAIL;
+	}
+/*
+	pstAlgoDtl->tx_amt = pstErr->cups_amt;
+	if(RC_SUCC != nAlgoDtlIns(pstAlgoDtl, &dbMAlgo, &dbMBase))
+	{
+		HtLog(ERR_PARAM, "初始化清分记录失败, err:(%s)", pstErr->id);
+		return RC_FAIL;
+	}
+
+	pstErr->fee_amt = pstAlgoDtl->fee_amt + pstAlgoDtl->mcht_serve_fee + 
+		pstAlgoDtl->serv_fee - pstAlgoDtl->free_fee;
+*/
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nSetLocalTxn(char *pszId, char chState)							*/
+/*   功能  ： 判断该笔流水是否已经清分												*/
+/*  返回值 ： RC_SUCC			--  成功											*/
+/*			  RC_NOTFOUND		--  找不到											*/
+/*			  RC_FAIL			--  失败											*/
+/************************************************************************************/
+int		nSetLocalTxn(char *pszId, char cState)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szFlag[2], szId[23], szTime[15];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szId, 0, sizeof(szId));
+	memset(szTime, 0, sizeof(szTime));
+
+	if(!strlen(pszId) || !pszId)
+		return RC_SUCC;
+
+	szFlag[0] = cState;
+	memcpy(szId, pszId, sizeof(szId) - 1);
+	memcpy(szTime, sGetCurrentTime(), sizeof(szTime) - 1);
+
+	EXEC SQL UPDATE TBL_TXN_SUCC 
+		SET RESULT_FLAG = :szFlag 
+	WHERE ID = :szId;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "设置本地流水(%s)失败, err:(%d)(%s)", szId, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int	nIsNAlgoTxn(char *pszId, BOOL *pBol)							*/
+/*   功能  ： 判断该笔流水是否已经清分												*/
+/*  返回值 ： RC_SUCC			--  成功											*/
+/*			  RC_NOTFOUND		--  找不到											*/
+/*			  RC_FAIL			--  失败											*/
+/************************************************************************************/
+int		nIsNAlgoTxn(char *pszId, TAlgoDtl *pstAlgoDtl, BOOL *pbAlgo, BOOL *pbCom)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szId[23];
+	TAlgoDtl	stAlgoDtl;
+	EXEC SQL END DECLARE SECTION;
+	BOOL	bAlgo = false, bCom = false;
+
+	memset(szId, 0, sizeof(szId));
+	memset(&stAlgoDtl, 0, sizeof(stAlgoDtl));
+
+	memcpy(szId, pszId, sizeof(szId) - 1);
+
+	EXEC SQL SELECT * INTO :stAlgoDtl FROM TBL_ALGO_DTL WHERE ID = :szId;
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "查询差错记录(%s)出错, err:(%d)(%s)", szId, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	else if(SQLOK)
+	{
+		bAlgo = true;
+		if(ALGO_MCHT_FLAG_SUCC == stAlgoDtl.mcht_flag[0])
+			bCom = true;
+	}
+
+	if(pbAlgo)	*pbAlgo = bAlgo;
+	if(pbCom)	*pbCom = bCom;
+	if(pstAlgoDtl)	memcpy(pstAlgoDtl, &stAlgoDtl, sizeof(stAlgoDtl));
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nMatchError(TStlmErr *pstError, char *pszId)						*/
+/*   功能  ： 以渠道流水和本地核对													*/
+/*  返回值 ： RC_SUCC			--  成功											*/
+/*			  RC_NOTFOUND		--  找不到											*/
+/*			  RC_FAIL			--  失败											*/
+/************************************************************************************/
+int		nMatchError(BOOL *pbFind, TStlmErr *pstError, char *pszId)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szId[23];
+	TStlmErr	stErr;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szId, 0, sizeof(szId));
+	memcpy(szId, pszId, sizeof(szId) - 1);
+
+	memset(&stErr, 0, sizeof(stErr));
+	EXEC SQL SELECT * INTO :stErr FROM TBL_STLM_ERR WHERE ID = :szId;
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "查询差错记录(%s)出错, err:(%d)(%s)", szId, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	else if(SQLNOTFOUND)
+	{
+		*pbFind = false;
+		return RC_SUCC;
+	}
+
+	*pbFind = true;
+	sTrimAll(stErr.id);
+	sTrimAll(stErr.err_type);
+	sTrimAll(stErr.stlm_type);
+	sTrimAll(stErr.result_flag);
+	memcpy(pstError, &stErr, sizeof(stErr));
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nDisposeTxn(TStlmErr *pstErr, TAlgoDtl *pstAlgoDtl, 				*/
+/*					BOOL bAlgo, BOOL bCmt)											*/
+/*   功能  ： 新增差错流水															*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nDisposeTxn(TStlmErr *pstErr, TAlgoDtl *pstAlgoDtl, BOOL bAlgo, BOOL bCmt)
+{
+	int		iRet = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szId[23], szErr[2], szSucc[2];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szId, 0, sizeof(szId));
+	memset(szSucc, 0, sizeof(szSucc));
+	memset(szErr, 0, sizeof(szErr));
+	if(!bAlgo) return RC_SUCC;
+
+	vTrimAlgoDtl(pstAlgoDtl);
+
+	//	存在清分记录
+	if(!bCmt)	//	还未汇总、删除流水
+	{
+		szErr[0]  = STLM_SUCC_FLG_ERR;
+		szSucc[0] = STLM_SUCC_FLG_OK;
+
+		//	流水备份
+		HtLog(ERR_PARAM, "清分明细|%s|未汇总，本次对账不平直接删除处理, "
+			"同时更新成功表清分标识(%s)", pstErr->id, szErr);
+		vSaveAlgoDtl(pstAlgoDtl);
+		memcpy(szId, pstErr->id, sizeof(szId) - 1);
+
+		//	删除清分流水
+		EXEC SQL DELETE FROM TBL_ALGO_DTL WHERE ID = :szId;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "还未汇总，删除清分流水(%s)失败, err:(%d)(%s)", 
+				szId, SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+
+		//	删除之后必须将tbl_stlm_succ状态修改为差错状态，否则该笔对平之后就无法进入清分
+		EXEC SQL UPDATE TBL_STLM_SUCC SET  
+			RESULT_FLAG = :szErr
+		WHERE ID = :szId AND RESULT_FLAG = :szSucc;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "还未汇总，删除清分流水(%s)失败, err:(%d)(%s)", 
+				szId, SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+	}
+	else		//	已经汇总、按照渠道金额计算手续费
+	{
+		return RC_SUCC;
+
+/*		按本地金额计算手续费
+		if(fabs(pstErr->cups_amt - pstAlgoDtl->tx_amt) < 0.005)
+		{
+			pstErr->fee_amt = pstAlgoDtl->fee_amt + pstAlgoDtl->mcht_serve_fee + 
+				pstAlgoDtl->serv_fee - pstAlgoDtl->free_fee;
+			return RC_SUCC;
+		}
+
+		iRet = nGetFeebyCups(pstAlgoDtl, pstErr);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "计算渠道金额(%.2f)流水(%s)的手续费错误, err:(%d)", 
+				pstErr->cups_amt, pstErr->id, iRet);
+			return RC_FAIL;
+		}
+*/
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nManageError(TStlmErr *pstErr, TStlmErr *pstCom)					*/
+/*   功能  ： 更新本地错误流水														*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nManageError(TStlmErr *pstErr, TStlmErr *pstCom)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TStlmErr	stErr;
+	EXEC SQL END DECLARE SECTION;
+
+	memcpy(&stErr, pstErr, sizeof(stErr));
+	memcpy(stErr.err_desc, pstCom->err_desc, sizeof(stErr.err_desc) - 1);
+	memcpy(stErr.stlm_date, pstCom->stlm_date, sizeof(stErr.stlm_date) - 1);
+	memcpy(stErr.rec_upd_ts, pstCom->rec_upd_ts, sizeof(stErr.rec_upd_ts) - 1);
+	stErr.stlm_type[0] = pstCom->stlm_type[0];
+	sTrimAll(stErr.result_flag);
+	sTrimAll(stErr.err_desc);
+
+	//	差错表标注该笔交易参与清分或者已经清分，需重新更新该记录待运营处理
+	if(STLM_CUP_TO_DONE == pstErr->result_flag[0] || 
+		STLM_CUP_SETTLE_SUCC == pstErr->result_flag[0])
+	{
+		HtLog(NML_PARAM, "ID[%s]该笔交易已经处理，重新纳入失败处理!", stErr.id);
+		stErr.result_flag[0] = pstCom->result_flag[0];
+	}
+	else if(STLM_CUP_NOT_DEAL == pstErr->result_flag[0])
+	{
+		HtLog(NML_PARAM, "ID[%s]该笔交易未处理，差错状态(%s)(%s)(%s)->(%s)", stErr.id, 
+			pstErr->result_flag, pstErr->err_type, pstErr->stlm_type, pstCom->stlm_type);
+		//	依据优先级规则，商户不正常与对账不平同时存在，修改标志为对账不平
+		if(ERR_CUP_MCHT_UNNORMAL == pstErr->err_type[0] && ERR_CUP_NOT_CHECK != stErr.stlm_type[0] 
+			&& STLM_FLG_OK_UNNORMAL != stErr.stlm_type[0])
+			stErr.err_type[0] = ERR_CUP_FLG_NOTMACHT;
+	}
+	else
+		HtLog(NML_PARAM, "ID[%s]该笔交易已经转入人工处理，更新必要字段!", stErr.id);
+
+	//	还未对账过
+	if(ERR_CUP_NOT_CHECK == pstErr->stlm_type[0])
+	{
+		EXEC SQL UPDATE TBL_STLM_ERR SET 
+			RESULT_FLAG = :stErr.result_flag,
+			STLM_DATE	= :stErr.stlm_date,
+			CUP_FEE		= :stErr.cup_fee,
+			TX_AMT		= :stErr.tx_amt,
+			CUPS_AMT	= :stErr.tx_amt,
+			ERR_TYPE	= :stErr.err_type,
+			STLM_TYPE	= :stErr.stlm_type,
+			ERR_DESC	= :stErr.err_desc,
+			REC_UPD_TS	= :stErr.rec_upd_ts
+		WHERE ID = :stErr.id;
+	}
+	else
+	{
+		EXEC SQL UPDATE TBL_STLM_ERR SET 
+			RESULT_FLAG = :stErr.result_flag,
+			CUP_FEE		= :stErr.cup_fee,
+			TX_AMT		= :stErr.tx_amt,
+			CUPS_AMT	= :stErr.tx_amt,
+			ERR_TYPE	= :stErr.err_type,
+			STLM_TYPE	= :stErr.stlm_type,
+			ERR_DESC	= :stErr.err_desc,
+			REC_UPD_TS	= :stErr.rec_upd_ts
+		WHERE ID = :stErr.id;
+	}
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "更新差错交易(%s)信息表失败, err:(%d)(%s)", 
+			stErr.id, SQLCODE, sDbsError());
+ 		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nUpdateError(TCupSucc *pstCups, TTxnSucc *pstTxn)					*/
+/*   功能  ： 以渠道流水和本地核对													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nUpdateError(TStlmErr *pstError, TTxnSucc *pstTxn)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szFlag[2], szDesc[100];
+	TStlmErr	stErr;
+	TAlgoDtl	stAlgoDtl;
+	EXEC SQL END DECLARE SECTION;
+	int			iRet = 0;
+	BOOL		bAlgo = false, bError = false, bCmt = false;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szDesc, 0, sizeof(szDesc));
+	memset(&stErr, 0, sizeof(stErr));
+	memset(&stAlgoDtl, 0, sizeof(stAlgoDtl));
+
+	HtLog(NML_PARAM, "\"流水对账不平\"逻辑处理->");
+
+	if(RC_SUCC != nMatchError(&bError, &stErr, pstTxn->id))
+	{
+		HtLog(ERR_PARAM, "查询差错记录(%s)出错!", pstTxn->id);
+		return RC_FAIL;
+	}
+
+	if(RC_SUCC != nIsNAlgoTxn(pstTxn->id, &stAlgoDtl, &bAlgo, &bCmt))
+	{
+		HtLog(ERR_PARAM, "检查流水(%s)是否清分失败出错!", pstTxn->id);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "查询流水业务状态:ID(%s)差错(%d)清分(%d)汇总(%d)流水", 
+		pstTxn->id, bError, bAlgo, bCmt);
+
+	strcpy(stErr.stlm_date, pstError->stlm_date);
+	if(!bError)
+	{
+		vFillStlmErr(&stErr, pstTxn);
+		stErr.tx_amt = pstError->cups_amt;
+		stErr.cups_amt = pstError->cups_amt;
+		stErr.cup_fee = pstError->cup_fee;
+		strcpy(stErr.stlm_date, pstError->stlm_date);
+		strcpy(stErr.result_flag, pstError->result_flag);
+		strcpy(stErr.rec_crt_ts, pstError->rec_crt_ts);
+		strcpy(stErr.stlm_type, pstError->stlm_type);
+		strcpy(stErr.settle_num, pstError->settle_num);
+		stErr.err_type[0] = ERR_CUP_FLG_NOTMACHT;	//	对账不平
+		memcpy(stErr.sys_ref_no, pstTxn->fd37, sizeof(stErr.sys_ref_no) - 1);
+		memcpy(stErr.err_desc, pstError->err_desc, sizeof(stErr.err_desc) - 1);
+
+		iRet = nDisposeTxn(&stErr, &stAlgoDtl, bAlgo, bCmt);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "处理错误流水失败, err:(%d)", iRet);
+			return RC_FAIL;
+		}
+
+		vGetRedunErr(&stErr, NULL);
+		EXEC SQL INSERT INTO TBL_STLM_ERR VALUES (:stErr);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增差错流水(%s)失败, err:(%d)(%s)", stErr.id, 
+				SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+	}
+	else	//	bError	历史有差错记录
+	{
+		stErr.cups_amt = pstError->tx_amt;
+		stErr.cup_fee  = pstError->cup_fee;
+		strcpy(pstError->rec_upd_ts, pstError->rec_crt_ts);
+
+		iRet = nDisposeTxn(&stErr, &stAlgoDtl, bAlgo, bCmt);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "处理错误流水失败, err:(%d)", iRet);
+			return RC_FAIL;
+		}
+
+		iRet = nManageError(&stErr, pstError);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "更新差错流水(%s)失败, err:(%d)", stErr.id, iRet);
+			return RC_FAIL;
+		}
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nUpdateSucc(TStlmErr *pstError, TTxnSucc *pstTxn)					*/
+/*   功能  ： 以渠道流水和本地核对													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nUpdateSucc(TStlmErr *pstError, TTxnSucc *pstTxn)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szFlag[2];
+	TStlmErr	stErr;
+	EXEC SQL END DECLARE SECTION;
+	BOOL		bAlgo = false, bError = false;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(&stErr, 0, sizeof(stErr));
+
+	if(RC_SUCC != nMatchError(&bError, &stErr, pstTxn->id))
+	{
+		HtLog(ERR_PARAM, "查询差错记录(%s)出错!", pstTxn->id);
+		return RC_FAIL;
+	}
+
+	//	对平且未发现差错记录, 直接返回成功
+	if(!bError)		return RC_SUCC;
+
+	stErr.local_amt = pstTxn->tx_amt;
+	stErr.tx_amt = pstError->tx_amt;
+	stErr.cups_amt = pstError->cups_amt;
+	stErr.cup_fee = pstError->cup_fee;	
+	strcpy(stErr.stlm_date, pstError->stlm_date);
+//	stErr.stlm_type[0] = pstError->stlm_type[0];
+	memcpy(stErr.rec_upd_ts, pstError->rec_crt_ts, sizeof(stErr.rec_upd_ts) - 1);
+	sTrimAll(stErr.stlm_date);
+	sTrimAll(stErr.rec_upd_ts);
+	sTrimAll(stErr.stlm_type);
+	sTrimAll(stErr.err_desc);
+
+	if(RC_SUCC != nIsNAlgoTxn(pstTxn->id, NULL, &bAlgo, NULL))
+	{
+		HtLog(ERR_PARAM, "检查流水(%s)是否清分失败出错!", pstTxn->id);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "流水(%s)已对平, 差错标记(%d)清分标示(%d)匹配流水(%s), "
+		"状态(0X%02X)对账日期(%s)", pstTxn->id, bError, bAlgo, stErr.id, stErr.stlm_type[0], 
+		stErr.stlm_date);
+
+	if(STLM_CUP_NOT_DEAL == stErr.result_flag[0])
+	{
+		if(!bAlgo)
+		{
+			if(ERR_CUP_FLG_NOTMACHT == stErr.err_type[0])
+			{
+				stErr.result_flag[0] = STLM_CUP_TO_DONE;
+				snprintf(stErr.err_desc, sizeof(stErr.err_desc) - 1, 
+					"流水已对平，自动参与清分");
+			}		
+		}
+		else
+			stErr.result_flag[0] = STLM_CUP_SETTLE_SUCC;
+	}
+
+	if(ERR_CUP_NOT_CHECK == stErr.stlm_type[0])		//	未对账
+	{
+		stErr.stlm_type[0] = pstError->stlm_type[0];
+
+		EXEC SQL UPDATE TBL_STLM_ERR SET 
+			RESULT_FLAG = :stErr.result_flag,  
+			STLM_DATE	= :stErr.stlm_date,
+			CUP_FEE		= :stErr.cup_fee,
+			TX_AMT		= :stErr.tx_amt,
+			CUPS_AMT	= :stErr.cups_amt,
+			LOCAL_AMT	= :stErr.local_amt,
+			STLM_TYPE	= :stErr.stlm_type,
+			ERR_DESC	= :stErr.err_desc,
+			REC_UPD_TS	= :stErr.rec_upd_ts
+		WHERE ID = :stErr.id;
+	}
+	else
+	{
+		stErr.stlm_type[0] = pstError->stlm_type[0];
+
+		EXEC SQL UPDATE TBL_STLM_ERR SET 
+			RESULT_FLAG = :stErr.result_flag,  
+			CUP_FEE		= :stErr.cup_fee,
+			TX_AMT		= :stErr.tx_amt,
+			CUPS_AMT	= :stErr.cups_amt,
+			LOCAL_AMT	= :stErr.local_amt,
+			STLM_TYPE	= :stErr.stlm_type,
+			ERR_DESC	= :stErr.err_desc,
+			REC_UPD_TS	= :stErr.rec_upd_ts
+		WHERE ID = :stErr.id;
+	}
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "更新本地对平流水(%s)失败, err:(%d)(%s)", stErr.id, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetLocalError(TCupsTxn *pstCups, TStlmErr *pstErr)			 	*/
+/*   功能  ： 渠道有本地无查找对应本地流水											*/
+/*  返回值 ： RC_SUCC   --  成功													*/
+/*			  RC_FAIL   --  失败													*/
+/************************************************************************************/
+int		nGetLocalError(TCupSucc *pstCups, TStlmErr *pstErr)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TTxnSucc	stTxn;
+	TStlmSucc	stSucc;
+	char		szMatch[20], szTemp[30];
+	long		lRec = 0;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stTxn, 0, sizeof(stTxn));
+	memset(&stSucc, 0, sizeof(stSucc));
+	memset(szMatch, 0, sizeof(szMatch));
+	memset(szTemp, 0, sizeof(szTemp));
+
+	memcpy(stSucc.tx_date, pstCups->tx_date, 8);
+	memcpy(stSucc.cups_no, pstCups->cups_no, sizeof(stSucc.cups_no)-1);
+	memcpy(stSucc.trace_no, pstCups->trace_no, sizeof(stSucc.trace_no) - 1);
+
+	if(!memcmp(pstCups->cups_no, "alpy", 4) || !memcmp(pstCups->cups_no, "wcht", 4))
+	{
+		strcpy(szMatch, "('31','51')");
+		snprintf(szTemp, sizeof(szTemp) - 1, "%s", pstCups->cup_key + 4);
+		HtLog(NML_PARAM, "渠道多帐:查询渠道(%s)交易日期(%s)订单号(%s)(%s)的本地流水", 
+			pstCups->cups_no, pstCups->tx_date, szTemp, pstCups->cups_no);
+
+		EXEC SQL SELECT * INTO :stTxn FROM TBL_TXN_SUCC WHERE TX_SUB_CODE IN ('31', '51')
+			AND ORDER_NO = :szTemp AND TX_DATE = :stSucc.tx_date AND 
+			CUPS_NO = :stSucc.cups_no;
+	}
+	else if(!memcmp(pstCups->cups_no, "cdif", 4))
+	{
+		strncpy(szMatch, pstCups->trace_no, sizeof(pstCups->trace_no) - 1);
+		strncpy(szTemp, pstCups->term_no, sizeof(pstCups->term_no) - 1);
+		HtLog(NML_PARAM, "渠道多帐:查询渠道(%s)交易日期(%s)fd11(%s)fd41(%s)的本地流水",
+			pstCups->cups_no, pstCups->tx_date, szMatch, szTemp);
+		
+		EXEC SQL SELECT * INTO :stTxn FROM TBL_TXN_SUCC WHERE TX_SUB_CODE IN ('31', '51')
+			AND TX_DATE = :stSucc.tx_date AND CUPS_NO = :stSucc.cups_no AND
+			FD11 = :szMatch AND FD41 = :szTemp;	
+	}
+	else
+	{
+		snprintf(szMatch, sizeof(szMatch) - 1, "%s", pstCups->trace_no + 6);
+		memcpy(szTemp, pstCups->tx_date + 4, 4);
+		HtLog(NML_PARAM, "渠道多帐:查询渠道(%s)交易日期(%s)流水(%s)的本地明细", 
+			pstCups->cups_no, pstCups->tx_date, pstCups->trace_no);
+
+		EXEC SQL SELECT * INTO :stTxn FROM TBL_TXN_SUCC WHERE FD11 = :szMatch 
+			AND (FD13 = :szTemp OR TX_DATE = :stSucc.tx_date) AND 
+			CUPS_NO = :stSucc.cups_no;
+	}
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "查询本地交易流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	else if(SQLNOTFOUND)
+	{
+		HtLog(ERR_PARAM, "查询结果:本地无此交易流水, 请核对!");
+//		pstCups->result_flag[0] = TRADE_NOT_MATCH;
+		pstCups->result_flag[0] = TRADE_TXN_INIT;
+		return RC_NOTFOUND;
+	}
+	else
+		;
+
+	vTrimTxnSucc(&stTxn);
+	vFillStlmErr(pstErr, &stTxn);
+	memcpy(pstErr->sys_ref_no, pstCups->sys_ref_no, sizeof(pstErr->sys_ref_no) - 1);
+
+	memcpy(stSucc.stlm_date, pstErr->stlm_date, 8);
+	stSucc.result_flag[0] = STLM_SUCC_FLG_ERR;
+	stSucc.cup_fee = pstErr->cup_fee;
+	vFillStlmSucc(&stSucc, &stTxn);
+
+	//	如果是重复对账 "渠道有本地无" 情况，STLM_SUCC肯定已经存在该笔记录
+	EXEC SQL SELECT COUNT(*) INTO :lRec FROM TBL_STLM_SUCC WHERE ID = :stSucc.id;
+	if(lRec)	return RC_SUCC;
+
+	//	对于渠道有本地无。 对账成功表也要同时记流水
+
+	vGetRedunErr(NULL, &stSucc);
+	EXEC SQL INSERT INTO TBL_STLM_SUCC VALUES (:stSucc);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增差错流水(%s)失败, err:(%d)(%s)", stSucc.id, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCheckTxnList(TCupSucc *pstCups, TTxnSucc *pstTxn, 				*/
+/*					char *pszStlmDate)												*/
+/*   功能  ： 以渠道流水和本地核对													*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nCheckTxnList(TCupSucc *pstCups, TTxnSucc *pstTxn, char *pszStlmDate, 
+			char *pszSettleNum)
+{
+	int			iRet = 0;
+	TStlmErr	stError;
+
+	memset(&stError, 0, sizeof(stError));
+	memcpy(stError.stlm_date, pszStlmDate, 8);
+	memcpy(stError.settle_num, pszSettleNum, 4);
+	stError.result_flag[0] = STLM_CUP_NOT_DEAL;
+	stError.stlm_type[0] = STLM_FLG_OK_UNNORMAL;
+//	stError.err_type[0] = ERR_CUP_MCHT_OK;
+	stError.tx_amt = pstCups->tx_amt;
+	stError.cups_amt = pstCups->tx_amt;
+	stError.cup_fee = pstCups->cup_fee;
+	memcpy(stError.rec_crt_ts, sGetCurrentTime(), sizeof(stError.rec_crt_ts) - 1);
+
+	pstCups->result_flag[0] = STLM_FLG_OK;
+	pstTxn->result_flag[0] = TRADE_TXN_SUCCESS;
+
+	sTrimAll(pstTxn->id);
+	sTrimAll(pstCups->ac_no);
+	sTrimAll(pstTxn->ac_no);
+
+	if(memcmp(pstCups->cups_no, "wcht", 4) && memcmp(pstCups->cups_no, "alpy", 4 ) && 
+		memcmp(pstCups->cups_no, "hkub", 4) && memcmp(pstCups->cups_no, "jzdk", 4) && 
+		memcmp(pstCups->cups_no, "cdif", 4))
+  	{
+		//	改为对前六后四******/
+		if(memcmp(pstCups->ac_no, pstTxn->ac_no, 6) != 0 || 
+			memcmp(pstCups->ac_no + strlen(pstCups->ac_no) - 4, 
+				pstTxn->ac_no + strlen(pstTxn->ac_no) - 4, 4) != 0)
+ 		{
+			HtLog(ERR_PARAM, "流水(%s)对账不平, 账号不匹配:(%s)(%s), error!", pstTxn->id,
+				pstCups->ac_no, pstTxn->ac_no);
+			pstCups->result_flag[0] = ERR_CUP_FLG_NOTMACHT;
+			pstTxn->result_flag[0] = TRADE_TXN_NOTMATCH;
+			stError.stlm_type[0] = STLM_CUP_FLG_ACCT;
+			snprintf(stError.err_desc, sizeof(stError.err_desc) - 1, 
+				"本地(%s)与渠道(%s)账号不一致", pstTxn->ac_no, pstCups->cups_no);
+		}
+  	}
+
+   	//	核对金额
+	if(fabs(pstCups->tx_amt - pstTxn->tx_amt) > 0.005)
+  	{
+		HtLog(ERR_PARAM, "流水(%s)对账不平，金额不一致:(%.2f)(%.2f), error!", pstTxn->id,
+			pstCups->tx_amt, pstTxn->tx_amt);
+		pstCups->result_flag[0] = ERR_CUP_FLG_NOTMACHT;
+		pstTxn->result_flag[0] = TRADE_TXN_NOTMATCH;
+		stError.stlm_type[0] = STLM_CUP_FLG_AMT;
+		snprintf(stError.err_desc, sizeof(stError.err_desc) - 1, 
+			"本地(%.2f)与渠道(%.2f)金额不一致", pstTxn->tx_amt, pstCups->tx_amt);
+  	}
+
+	if(ERR_CUP_FLG_NOTMACHT == pstCups->result_flag[0])	//	未对平
+		iRet = nUpdateError(&stError, pstTxn);
+	else												//	STLM_FLG_OK 对平
+		iRet = nUpdateSucc(&stError, pstTxn);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "处理对账流水(%s)失败, err:(%d)!", pstTxn->id, iRet);
+		return RC_FAIL;
+	}
+	return RC_SUCC;
+}
+/************************************************************************************/
+/*   声明  ： int nCupsErrorTxn(TCupSucc *pstCups, TTxnSucc *pstTxn, 				*/
+/*					char *pszStlmDate, char *pszSettleNum)							*/
+/*   功能  ： 渠道有本地无的情况													*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nCupsErrorTxn(TCupSucc *pstCups, TTxnSucc *pstTxn, char *pszStlmDate, 
+			char *pszSettleNum)
+{
+	int			iRet = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szFlag[2], szDesc[100];
+	TStlmErr	stErr, stCom;
+	long		lRec = 0;
+	EXEC SQL END DECLARE SECTION;
+	BOOL		bAlgo = false, bError = false;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szDesc, 0, sizeof(szDesc));
+	memset(&stErr, 0, sizeof(stErr));
+	memset(&stCom, 0, sizeof(stCom));
+
+	//	设置对账不平标识
+	pstCups->result_flag[0] = TRADE_TXN_NOTMATCH;
+//	pstTxn->result_flag[0] = TRADE_TXN_NOTMATCH;
+
+	HtLog(NML_PARAM, "\"渠道有本地无\"逻辑处理->");
+	//	根据渠道流水查找本地流水
+	iRet= nGetLocalError(pstCups, &stCom);
+	if(RC_FAIL == iRet) 
+	{
+		HtLog(ERR_PARAM, "根据渠道流水(%s)查询本地流水失败!", pstCups->id);
+		return RC_FAIL;
+	}
+	else if(RC_NOTFOUND == iRet)
+	{
+		HtLog(ERR_PARAM, "渠道流水(%s)异常，根据该笔流水无法查询本地流水, 本期无法处理!", 
+			pstCups->id);
+		return RC_SUCC;
+	}
+	else
+		;
+
+	//	考虑到重复对账或者风控的bug，这里查询一次差错流水
+	if(RC_SUCC != nMatchError(&bError, &stErr, stCom.id))
+	{
+		HtLog(ERR_PARAM, "查询差错记录(%s)出错!", stCom.id);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "查询流水业务状态:ID(%s)BOOL(%d)匹配流水(%s)", stCom.id, 
+		bError, stErr.id);
+
+	memcpy(stCom.stlm_date, pszStlmDate, 8);
+	memcpy(stCom.settle_num, pszSettleNum, 4);
+	stCom.result_flag[0] = STLM_CUP_NOT_DEAL;
+	stCom.err_type[0] = ERR_CUP_FLG_NOTMACHT;
+	stCom.stlm_type[0] = STLM_CUP_FLG_CUPS;
+
+	stCom.cups_amt = pstCups->tx_amt;
+	stCom.tx_amt = pstCups->tx_amt;
+	stCom.cup_fee = pstCups->cup_fee;
+	stErr.tx_amt = pstCups->tx_amt;
+	stErr.cup_fee = pstCups->cup_fee;
+	stErr.cups_amt = pstCups->tx_amt;
+ 	snprintf(stCom.err_desc, sizeof(stCom.err_desc) - 1, "渠道有本地无");
+ 	memcpy(stCom.rec_crt_ts, sGetCurrentTime(), sizeof(stCom.rec_crt_ts) - 1);
+
+	if(!bError)	//	不存在该笔流水
+	{
+		vGetRedunErr(&stCom, NULL);
+		EXEC SQL INSERT INTO TBL_STLM_ERR VALUES (:stCom);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增差错流水(%s)失败, err:(%d)(%s)", stCom.id, 
+				SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+	}	
+	else	//	存在
+	{
+ 		memcpy(stCom.rec_upd_ts, stCom.rec_crt_ts, sizeof(stCom.rec_upd_ts) - 1);
+
+		if(RC_SUCC != nManageError(&stErr, &stCom))
+		{
+			HtLog(ERR_PARAM, "更新差错流水(%s)失败!", stErr.id);
+			return RC_FAIL;
+		}
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCheckCupsTxn(TCupSucc *pstCups, char *pszStlmDate, 				*/
+/*					char *pstSettleNum)												*/
+/*   功能  ： 以渠道流水和本地核对													*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nCheckCupsTxn(TCupSucc *pstCups, char *pszStlmDate, char *pstSettleNum)
+{
+	int			iRet = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TTxnSucc	stTxn;
+	char		szKey[50];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szKey, 0, sizeof(szKey));
+	snprintf(szKey, sizeof(szKey), "%s", pstCups->cup_key);
+
+	memset(&stTxn, 0, sizeof(TTxnSucc));
+	EXEC SQL SELECT * INTO :stTxn FROM TBL_TXN_SUCC WHERE CUP_KEY = :szKey;
+	if(SQLERR)
+	{
+		HtLog(ERR_PARAM, "查找本地流水失败, err:(%d)(%s), cup_key(%s)", SQLCODE,
+			sDbsError(), pstCups->cup_key);
+  		return RC_FAIL;
+  	}
+	
+	vTrimTxnSucc(&stTxn);
+	if(SQLOK)
+		iRet = nCheckTxnList(pstCups, &stTxn, pszStlmDate, pstSettleNum);
+	else	//	SQLNOTFOUND
+		iRet = nCupsErrorTxn(pstCups, &stTxn, pszStlmDate, pstSettleNum);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "核对流水出错, err:key(%s)(%s)", pstCups->cup_key, stTxn.id);
+		return RC_FAIL;	
+	}
+
+	return nSetLocalTxn(stTxn.id, stTxn.result_flag[0]);
+}
+
+/************************************************************************************/
+/*   声明  ： int nLocalErrorTxn(TTxnSucc *pstTxn, char *pszStlmDate, 				*/
+/*				char *pstSettleNum)													*/
+/*   功能  ： 本地有渠道无的情况													*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nLocalErrorTxn(TTxnSucc *pstTxn, char *pszStlmDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szFlag[2], szDesc[100];
+	TStlmErr	stErr, stCom;
+	EXEC SQL END DECLARE SECTION;
+	TAlgoDtl	stAlgoDtl;
+	BOOL		bError = false, bAlgo = false, bCmt = false;
+
+	memset(&stErr, 0, sizeof(stErr));
+	memset(&stCom, 0, sizeof(stCom));
+	pstTxn->result_flag[0] = TRADE_TXN_NOTMATCH;
+
+	HtLog(NML_PARAM, "\"本地有渠道无\"逻辑处理->");
+
+	//  考虑到重复对账或者风控的bug，这里查询一次差错流水
+	if(RC_SUCC != nMatchError(&bError, &stErr, pstTxn->id))
+	{
+ 		HtLog(ERR_PARAM, "查询差错记录(%s)出错!", pstTxn->id);
+		return RC_FAIL;
+	}
+
+	memset(&stAlgoDtl, 0, sizeof(stAlgoDtl));
+	if(RC_SUCC != nIsNAlgoTxn(pstTxn->id, &stAlgoDtl, &bAlgo, &bCmt))
+	{
+		HtLog(ERR_PARAM, "检查流水(%s)是否清分失败出错!", pstTxn->id);
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "查询流水业务状态:ID(%s)BOOL(%d)匹配流水(%s), 清分标识(%d)(%d)(%02X)", 
+		pstTxn->id, bError, stErr.id, bAlgo, bCmt, stErr.stlm_type[0]);
+
+	memcpy(stCom.stlm_date, pszStlmDate, 8);
+	memcpy(stCom.settle_num, pszSettleNum, 4);
+	stCom.result_flag[0] = STLM_CUP_NOT_DEAL;
+	stCom.err_type[0] = ERR_CUP_FLG_NOTMACHT;
+	stCom.stlm_type[0] = STLM_CUP_FLG_POSP;
+
+	stCom.tx_amt = pstTxn->tx_amt;
+	stCom.local_amt = pstTxn->tx_amt;
+	stErr.tx_amt = pstTxn->tx_amt;
+	stErr.local_amt = pstTxn->tx_amt;
+ 	snprintf(stCom.err_desc, sizeof(stCom.err_desc) - 1, "本地有渠道无");
+	memcpy(stCom.rec_crt_ts, sGetCurrentTime(), sizeof(stCom.rec_crt_ts) - 1);
+	memcpy(stCom.sys_ref_no, pstTxn->fd37, sizeof(stCom.sys_ref_no) - 1);
+
+	if(!bError) //  不存在该笔流水
+	{
+		vFillStlmErr(&stCom, pstTxn);
+		stCom.result_flag[0] = STLM_CUP_NOT_DEAL;
+
+		if(RC_SUCC != nDisposeTxn(&stCom, &stAlgoDtl, bAlgo, bCmt))
+		{
+			HtLog(ERR_PARAM, "处理错误流水(%s)失败!", stErr.id);
+			return RC_FAIL;
+		}
+
+		vGetRedunErr(&stCom, NULL);
+		EXEC SQL INSERT INTO TBL_STLM_ERR VALUES (:stCom);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增差错流水(%s)失败, err:(%d)(%s)", stErr.id,
+				SQLCODE, sDbsError());
+			return RC_FAIL;
+		}
+	}
+	else	//  存在
+	{
+		memcpy(stCom.rec_upd_ts, stCom.rec_crt_ts, sizeof(stCom.rec_upd_ts) - 1);
+
+		if(RC_SUCC != nManageError(&stErr, &stCom))
+		{
+			HtLog(ERR_PARAM, "更新本地错误流水(%s)失败!", stErr.id);
+			return RC_FAIL;
+		}
+	}
+
+	return nSetLocalTxn(pstTxn->id, pstTxn->result_flag[0]);
+}
+
+/************************************************************************************/
+/*   声明  ： int nFromCupsTxn(char *pszStlmDate, char *pszCupsNo, char *pszSettleNum)*/
+/*   功能  ： 从渠道流水开始核对													*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nFromCupsTxn(char *pszStlmDate, char *pszCupsNo, char *pszSettleNum, long *plCount)
+{
+	long		lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szTime[15], szFlag[2];
+	char		szStlmDate[9], szCupsNo[5], szYDay[9];
+	TCupSucc	stCups;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szYDay, 0, sizeof(szYDay));
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memset(szTime, 0, sizeof(szTime));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+
+	memcpy(szStlmDate, pszStlmDate, 8);
+	memcpy(szCupsNo, pszCupsNo, 4);
+	memcpy(szTime, sGetCurrentTime(), sizeof(szTime) - 1);
+	memcpy(szYDay, sGetChgDate(pszStlmDate, -1), 8);;
+	szFlag[0] = TRADE_TXN_INIT;
+
+	//	获取渠道待对账的流水
+	EXEC SQL DECLARE Cur_cups_succ CURSOR FOR 
+		SELECT * FROM TBL_CUP_SUCC WHERE STLM_DATE <= :szStlmDate AND CUPS_NO = :szCupsNo 
+			AND RESULT_FLAG = :szFlag AND TX_DATE < :szStlmDate ORDER BY TX_DATE, TX_TIME;
+
+	EXEC SQL OPEN Cur_cups_succ;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询渠道流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stCups, 0, sizeof(stCups));
+		EXEC SQL FETCH Cur_cups_succ INTO :stCups;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "获取渠道流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+  			EXEC SQL CLOSE Cur_cups_succ;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		vTrimCupSucc(&stCups);
+		//sTrimAll(stCups.result_flag);
+		//sTrimAll(stCups.cup_key);
+		//sTrimAll(stCups.id);
+		//sTrimAll(stCups.tx_time);
+
+		//	mdf by jrc 
+		//	以防渠道流水垮天，和系统时间差异引起的不平, 将在下周期对账
+		if((0 < memcmp(stCups.tx_time, "235000", 6) && 0 == memcmp(stCups.tx_date, szYDay, 8)) 
+			|| 0 < memcmp(stCups.tx_date, szYDay, 8))
+			continue;
+		// mdf end
+
+		if(RC_SUCC != nCheckCupsTxn(&stCups, pszStlmDate, pszSettleNum))
+		{
+			HtLog(ERR_PARAM, "核对渠道流水错误, cup_key(%s)!", stCups.cup_key);
+  			EXEC SQL CLOSE Cur_cups_succ;
+  			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL; 
+		}
+	
+		EXEC SQL UPDATE TBL_CUP_SUCC SET
+			RESULT_FLAG = :stCups.result_flag,
+			REC_UPD_TS = :szTime
+		WHERE ID = :stCups.id;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新渠道流水失败, err:(%d)(%s), id(%s)", SQLCODE, 
+				sDbsError(), stCups.id);
+			return RC_FAIL;
+		}
+
+		if((++ lCount % 1000) == 0) 
+			EXEC SQL COMMIT WORK;
+	}
+	(*plCount) += lCount;
+
+	EXEC SQL CLOSE Cur_cups_succ;
+	EXEC SQL COMMIT WORK;
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nFromTxnSucc(char *pszStlmDate, char *pszCupsNo, char *pszSettleNum)*/
+/*   功能  ： 从渠道流水开始核对													*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nFromTxnSucc(char *pszStlmDate, char *pszCupsNo, char *pszSettleNum, long *plCount)
+{
+	long		lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szFlag[2], szStlmDate[9], szCupsNo[5];
+	char		szDayTime[7], szYDay[9];
+	TTxnSucc	stTxn;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szYDay, 0, sizeof(szYDay));
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memset(szDayTime, 0, sizeof(szDayTime));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+
+	memcpy(szStlmDate, pszStlmDate, 8);
+	memcpy(szCupsNo, pszCupsNo, 4);
+	memcpy(szYDay, sGetChgDate(pszStlmDate, -1), 8);
+//	考虑到渠道时间与本系统时间不一致，导致本地多帐的情况(删除清分数据)
+//	memcpy(szDayTime, sGetMinsOfs(IBP_SETTLE_TIME, -5), 6);
+	memcpy(szDayTime, IBP_SETTLE_TIME, 6);
+	szFlag[0] = TRADE_TXN_CHECK;
+
+	//	获取本地有渠道无流水
+	EXEC SQL DECLARE Cur_txn_succ CURSOR FOR SELECT * FROM TBL_TXN_SUCC 
+		WHERE ((TX_DATE = :szYDay AND TX_TIME <= :szDayTime) OR TX_DATE < :szYDay) 
+		AND CUPS_NO = :szCupsNo AND RESULT_FLAG = :szFlag ORDER BY TX_DATE, TX_TIME;
+
+	EXEC SQL OPEN Cur_txn_succ;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询本地待对账流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stTxn, 0, sizeof(stTxn));
+		EXEC SQL FETCH Cur_txn_succ INTO :stTxn;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "获取本地流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+  			EXEC SQL CLOSE Cur_txn_succ;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		vTrimTxnSucc(&stTxn);
+
+		if(RC_SUCC != nLocalErrorTxn(&stTxn, pszStlmDate, pszSettleNum))
+		{
+			HtLog(ERR_PARAM, "核对渠道流水错误, cup_key(%s)!", stTxn.cup_key);
+  			EXEC SQL CLOSE Cur_txn_succ;
+  			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL; 
+		}
+	
+		if((++ lCount % 1000) == 0) 
+			EXEC SQL COMMIT WORK;
+	}
+	(*plCount) += lCount;
+
+	EXEC SQL CLOSE Cur_txn_succ;
+	EXEC SQL COMMIT WORK;
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nUpdateChnState(char *pszStlmDate, char *pszCupsNo, char chState)	*/
+/*   功能  ： 更新对账表标示														*/
+/*   参数  ： 																		*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nUpdateChnState(char *pszStlmDate, char *pszCupsNo, char chState)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szId[23], szFlag[2];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szId, 0, sizeof(szId));
+	memset(szFlag, 0, sizeof(szFlag));
+	snprintf(szId, sizeof(szId), "%s%s", pszStlmDate, pszCupsNo);
+
+	szFlag[0] = chState;
+
+	EXEC SQL UPDATE TBL_CHN_SETTLE SET CHECK_STATE = :szFlag WHERE ID = :szId;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "修改渠道对账表失败, err:(%d)(%s)ID(%s)", SQLCODE, 
+			sDbsError(), szId);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int StlmCupTxn(char *pszStlmDate, char *pszCupsNo, char *pszSettleNum)*/
+/*   功能  ： 对账主调函数															*/
+/*   参数  ： 输入无																*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nStlmCupTxn(char *pszStlmDate, char *pszCupsNo, char *pszSettleNum, long *plCount)
+{	
+	int		iRet = 0;
+
+	vSetLogName("%s/TBL_ALGO_DTL.%s.DEL", getenv("POSP_FILE_PATH"), pszStlmDate);
+
+	if(RC_SUCC != nUpdateChnState(pszStlmDate, pszCupsNo, CHANNEL_CHECK_ING))
+	{
+		HtLog(ERR_PARAM, "修改渠道对账表失败, err:(%c)(%s)(%s)", CHANNEL_CHECK_ING, 
+			pszStlmDate, pszCupsNo);
+		return RC_FAIL;
+	}
+
+	iRet = nFromCupsTxn(pszStlmDate, pszCupsNo, pszSettleNum, plCount);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "从渠道开始核对流水错误, err:(%d)!", iRet);
+		nUpdateChnState(pszStlmDate, pszCupsNo, CHANNEL_CHECK_ERR);
+		return RC_FAIL;
+	}
+
+	iRet = nFromTxnSucc(pszStlmDate, pszCupsNo, pszSettleNum, plCount);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "从本地开始核对流水错误, err:(%d)!", iRet);
+		nUpdateChnState(pszStlmDate, pszCupsNo, CHANNEL_CHECK_ERR);
+		return RC_FAIL;
+	}
+
+	return nUpdateChnState(pszStlmDate, pszCupsNo, CHANNEL_CHECK_SUCC);
+}
+
+/************************************************************************************
+	code end
+ ************************************************************************************/

@@ -1,0 +1,154 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取客户表TBL_PRO_SPECIAL_MCHT启动内存大小
+ ****************************************************************************************/
+long	lDefine_ProSpecialMcht(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_PRO_SPECIAL_MCHT WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbSpeMcht), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbSpeMcht, id, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(mcht_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSpeMcht, mcht_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(mcht_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(service_code)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSpeMcht, service_code, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(service_code)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(pro_rate)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSpeMcht, pro_rate, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(pro_rate)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(pro_fix)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbSpeMcht, pro_fix, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(pro_fix)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_PRO_SPECIAL_MCHT
+ ****************************************************************************************/
+long	lLoad_ProSpecialMcht(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbSpeMcht	stSpe;
+	EXEC SQL END DECLARE SECTION;
+
+   	EXEC SQL DECLARE Cur_Special_mcht CURSOR FOR 
+		SELECT NVL(ID, 0), NVL(MCHT_NO, ' '), NVL(SERVICE_CODE, ' '), 
+			NVL(FLAG, ' '), NVL(PRO_RATE, ' '), NVL(PRO_FIX, ' ') 
+		FROM TBL_PRO_SPECIAL_MCHT WHERE 1 = 1;
+	
+	EXEC SQL OPEN Cur_Special_mcht;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stSpe, 0, sizeof(stSpe));
+		EXEC SQL FETCH Cur_Special_mcht INTO :stSpe.id, :stSpe.mcht_no, 
+			:stSpe.service_code, :stSpe.flag, :stSpe.pro_rate, :stSpe.pro_fix;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_Special_mcht;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+			break;
+
+		sTrimAll(stSpe.mcht_no);	
+		sTrimAll(stSpe.service_code);	
+		sTrimAll(stSpe.flag);
+		sTrimAll(stSpe.pro_rate);
+		sTrimAll(stSpe.pro_fix);
+		stSpe.id = lSetEXLong(stSpe.id);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, (void *)&stSpe.id, ++(pGetTblDef(t)->lTreeNode),
+			dbSpeMcht, id, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载服务费模型(%d)失败, 原因:%s", stSpe.id, sGetError());
+			EXEC SQL CLOSE Cur_Special_mcht;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != IBPInsertData(t, &stSpe, sizeof(stSpe)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%d)失败, 原因:%s", sGetTableName(t),
+				stSpe.id, sGetError());
+			EXEC SQL CLOSE Cur_Special_mcht;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_Special_mcht;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

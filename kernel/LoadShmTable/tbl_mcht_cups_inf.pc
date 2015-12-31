@@ -1,0 +1,140 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取客户表TBL_MCHT_CUPS_INF启动内存大小
+ ****************************************************************************************/
+long	lDefine_MchtCupsInf(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_MCHT_CUPS_INF WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbMchtCupsInf), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+   	HtLog(NML_PARAM, "初始化表(%s)索引(id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbMchtCupsInf, id, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(cups_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtCupsInf, cups_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(cups_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(mcht_cups_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtCupsInf, mcht_cups_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(mcht_cups_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(term_cups_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbMchtCupsInf, term_cups_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(term_cups_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	} 
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_MCHT_CUPS_INF
+ ****************************************************************************************/
+long	lLoad_MchtCupsInf(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbMchtCupsInf	stCupsIf;
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL DECLARE Cur_mcht_cups_inf CURSOR FOR 
+		SELECT NVL(ID, 0), NVL(CUPS_NO, ' '), NVL(CUPS_NM, ' '), NVL(MCHT_CUPS_NO, ' '), 
+			NVL(TERM_CUPS_NO, ' '), NVL(FEE_RATE, 0.00), NVL(FEE_VAL, 0.00), 
+			NVL(CUP_STAMP, ' ') 
+		FROM TBL_MCHT_CUPS_INF ORDER BY CUPS_NO;
+
+	EXEC SQL OPEN Cur_mcht_cups_inf;	
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stCupsIf, 0, sizeof(stCupsIf));
+		EXEC SQL FETCH Cur_mcht_cups_inf INTO :stCupsIf.id, :stCupsIf.cups_no, :stCupsIf.cups_nm, 
+			:stCupsIf.mcht_cups_no, :stCupsIf.term_cups_no, :stCupsIf.fee_rate, :stCupsIf.fee_val,
+			:stCupsIf.cup_stamp;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_cups_inf;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载(%d)<(%d)!", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_mcht_cups_inf;
+			return RC_FAIL;
+		}
+
+		sTrimAll(stCupsIf.cups_no);	
+		sTrimAll(stCupsIf.cups_nm);	
+		sTrimAll(stCupsIf.mcht_cups_no);	
+		sTrimAll(stCupsIf.term_cups_no);	
+		sTrimAll(stCupsIf.cup_stamp);	
+		stCupsIf.id = lSetEXLong(stCupsIf.id);
+
+		if(RC_SUCC != IBPInsertData(t, &stCupsIf, sizeof(stCupsIf)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t),
+				stCupsIf.mcht_cups_no, sGetError());
+			EXEC SQL CLOSE Cur_mcht_cups_inf;
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_mcht_cups_inf;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

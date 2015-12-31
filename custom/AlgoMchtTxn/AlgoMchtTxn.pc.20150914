@@ -1,0 +1,822 @@
+/*****************************************************************
+ *  功能: 流水清分处理程序(商户资金清分)
+ *	Author：DeffPuzzL
+ *  Edit History:
+ ****************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_stlm_succ.h"
+#include "tbl_algo_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INCLUDE SQLCA;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int main(int argc, char **argv )										*/
+/*   功能  ： 完成清分全流程														*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int main(int argc , char ** argv)
+{
+	int		iRet = 0;
+	long	lTrace = 0;
+	char	szSettleDate[9], szMcht[31], szSettleNum[5]; 
+	
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	sprintf(gsLogFile, "AlgoMchtTxn.log");
+   
+	vPrintVersion(argv[1]);
+	if(argc != 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szMcht, 0, sizeof(szMcht));
+	memcpy(szMcht, argv[4], sizeof(szMcht) - 1);
+	sTrimAll(szMcht);
+	lTrace = atol(szMcht);
+
+	snprintf(gsLogFile, sizeof(gsLogFile), "AlgoMchtTxn_%d.log", lTrace);
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleDate, argv[1], sizeof(szSettleDate) - 1);
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);  
+
+	HtLog(NML_PARAM, "日期(%s)(%s), 流水类型(%d)明细开始.", szSettleDate, szSettleNum, lTrace);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "数据库连接失败, err:(%d)(%s)\n", iRet, sDbsError());
+		return RC_FAIL;
+	}
+	
+	iRet = nAlgoMchtTxn(szSettleDate, szSettleNum, lTrace);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "对商户清分失败, err:(%d)\n", iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	} 
+   
+	/*断开数据库*/
+	vDbsDisconnect();
+	HtLog(NML_PARAM, "商户清分流程结束.\n");
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetMchtAlgo(char *pszMcht, char *pszStlNum, dbMchtAlgo *pstMAlgo,*/
+/*					char *pszOMcht, char *pszOBrhId)								*/
+/*   功能  ： 获取本地商户的费率、清算商户号、清算机构号							*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int nGetMchtAlgo(char *pszMcht, dbMchtAlgo *pdbMAlgo, dbMchtBase *pdbMBase, long fdx)
+{
+	int		 iRet = 0;
+	char		szMchtNo[40];
+   	dbMchtBase	dbMBase;		 
+
+   	memset(&dbMBase, 0, sizeof(dbMBase));
+	if(1 == fdx)	//	需要清算到总商户
+	{
+		memset(szMchtNo, 0, sizeof(szMchtNo));
+		snprintf(szMchtNo, sizeof(szMchtNo), "%s", sGetDbsEnv("MCHT_UP_NO"));
+		iRet = lGetMchtBase(&dbMBase, szMchtNo);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "获取商户fdx(1)基本信息失败, err:(%d)(%s), mcht(%s).", 
+				iRet, sGetError(), szMchtNo);
+			return RC_FAIL;
+		}
+	}	
+	else
+	{
+		iRet = lGetMchtBase(&dbMBase, pszMcht);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "获取商户基本信息失败, err:(%d)(%s), mcht(%s).", iRet, 
+				sGetError(), pszMcht);
+			return RC_FAIL;
+		}
+
+		sTrimAll(dbMBase.mcht_up_no); 
+		sTrimAll(dbMBase.mcht_stlm_brh); 
+		sTrimAll(dbMBase.mcht_disc_id);
+		if(dbMBase.mcht_kind[0] == 'C' && dbMBase.mcht_kind[1] > '1' && 
+			dbMBase.mcht_disc_this[0] != '1')
+		{
+			//  寻找上级集团商户
+			iRet = nGetMchtAlgo(dbMBase.mcht_up_no, pdbMAlgo, pdbMBase, fdx);
+			if(iRet)
+			{
+				HtLog(ERR_PARAM, "获取商户配置表信息失败, err:(%d).", iRet);
+				return RC_FAIL;
+			}
+
+			return RC_SUCC;
+		}
+	}
+
+	memcpy(pdbMBase, &dbMBase, sizeof(dbMchtBase));
+	iRet = lGetMchtAlgo(pdbMAlgo, dbMBase.mcht_disc_id);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "获取商户(%s)费率(%s)配置表TBL_MCHT_ALGO信息失败, (%d)(%s)(%s)",
+			pdbMBase->mcht_no, dbMBase.mcht_disc_id, iRet, sGetError(), dbMBase.mcht_disc_id);
+   		return RC_FAIL;
+	}
+
+  	if('1' == pdbMAlgo->model_flag[0])
+	{
+		HtLog(ERR_PARAM,  "商户(%s)费率(%s)配置未启用!", pdbMBase->mcht_no, pdbMAlgo->model_id);
+		return RC_FAIL;
+ 	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nAlgoDtlInit(TAlgoDtl *pstAlgoDtl, TStlmSucc *pstSucc)			*/
+/*   功能  ： 填充清分明细结构体												 	*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+void	vFillAlgoDtl(TAlgoDtl *pstAlgoDtl, TStlmSucc *pstSucc) 
+{
+	dbMchtBase	stBase;
+	dbBrhInfo	stBrh;
+
+	memset(&stBrh, 0, sizeof(stBrh));
+	memset(&stBase, 0, sizeof(stBase));
+
+	//  无论是否获取成功，都不报错
+	if(RC_SUCC == lGetMchtBase(&stBase, pstAlgoDtl->settle_mcht))
+		memcpy(pstAlgoDtl->settle_mcht_nm, stBase.mcht_nm, 
+			sizeof(pstAlgoDtl->settle_mcht_nm) - 1);
+	else
+		HtLog(ERR_PARAM, "警告:获取商户(%s)名称数据失败, err:%s\n", 
+			pstAlgoDtl->settle_mcht, sGetError());
+
+	//  无论是否获取成功，都不报错
+	if(RC_SUCC == lGetBrhInfo(&stBrh, pstAlgoDtl->settle_brh_id))
+		memcpy(pstAlgoDtl->settle_brh_name, stBrh.brh_name, 
+			sizeof(pstAlgoDtl->settle_brh_name) - 1);
+	else
+		HtLog(ERR_PARAM, "警告:获取商户(%s)名称数据失败, err:%s\n", 
+			pstAlgoDtl->settle_brh_id, sGetError());
+
+	pstAlgoDtl->ac_type = pstSucc->ac_type;
+	memcpy(pstAlgoDtl->id, pstSucc->id, sizeof(pstSucc->id) - 1);
+	memcpy(pstAlgoDtl->stlm_date, pstSucc->stlm_date, sizeof(pstAlgoDtl->stlm_date) - 1);
+	memcpy(pstAlgoDtl->tx_date, pstSucc->tx_date, sizeof(pstAlgoDtl->tx_date) - 1);
+	memcpy(pstAlgoDtl->tx_time, pstSucc->tx_time, sizeof(pstAlgoDtl->tx_time) - 1);
+	memcpy(pstAlgoDtl->trace_no, pstSucc->trace_no, sizeof(pstAlgoDtl->trace_no) - 1);
+	pstAlgoDtl->mcht_flag[0] = ALGO_MCHT_FLAG_INIT;
+	memcpy(pstAlgoDtl->brh_flag, " ", 1);
+	memcpy(pstAlgoDtl->ibox_no, pstSucc->ibox_no, sizeof(pstAlgoDtl->ibox_no) - 1);
+	memcpy(pstAlgoDtl->order_no, pstSucc->order_no, sizeof(pstAlgoDtl->order_no) - 1);
+	memcpy(pstAlgoDtl->cups_no, pstSucc->cups_no, sizeof(pstAlgoDtl->cups_no) - 1);
+	sTrimAll(pstAlgoDtl->cups_no);	
+
+	memcpy(pstAlgoDtl->ac_no, pstSucc->ac_no, sizeof(pstAlgoDtl->ac_no) - 1);
+	pstAlgoDtl->ac_type = pstSucc->ac_type;
+	memcpy(pstAlgoDtl->ac_bank_no, pstSucc->ac_bank_no, sizeof(pstAlgoDtl->ac_bank_no) - 1);
+	pstAlgoDtl->user_id = pstSucc->user_id;
+	memcpy(pstAlgoDtl->brno, pstSucc->brno, sizeof(pstAlgoDtl->brno) - 1);
+	memcpy(pstAlgoDtl->longitude, pstSucc->longitude, sizeof(pstAlgoDtl->longitude) - 1);
+	memcpy(pstAlgoDtl->latitude, pstSucc->latitude, sizeof(pstAlgoDtl->latitude) - 1);
+	pstAlgoDtl->disc_cycle = pstSucc->disc_cycle;
+	pstAlgoDtl->expand = pstSucc->expand;
+	pstAlgoDtl->tx_amt = pstSucc->tx_amt;
+	pstAlgoDtl->cup_fee = pstSucc->cup_fee;
+	pstAlgoDtl->promts_id = pstSucc->promtsid;													//活动方案ID
+	memcpy(pstAlgoDtl->promts_mode, pstSucc->promtsmode, sizeof(pstAlgoDtl->promts_mode) - 1);	//活动方式
+	pstAlgoDtl->free_amt = pstSucc->promtsvalue;												//优惠值
+	memcpy(pstAlgoDtl->servetype, pstSucc->servetype, sizeof(pstAlgoDtl->servetype) - 1);
+	memcpy(pstAlgoDtl->settlemode, pstSucc->settlemode, sizeof(pstAlgoDtl->settlemode) - 1);
+	memcpy(pstAlgoDtl->tx_code, pstSucc->tx_code, sizeof(pstAlgoDtl->tx_code) - 1);
+	memcpy(pstAlgoDtl->tx_name, pstSucc->tx_name, sizeof(pstAlgoDtl->tx_name) - 1);
+	memcpy(pstAlgoDtl->tx_sub_code, pstSucc->tx_sub_code, sizeof(pstAlgoDtl->tx_sub_code) - 1);
+	memcpy(pstAlgoDtl->ibox11, pstSucc->ibox11, sizeof(pstAlgoDtl->ibox11) - 1);
+	memcpy(pstAlgoDtl->ibox41, pstSucc->ibox41, sizeof(pstAlgoDtl->ibox41) - 1);
+	memcpy(pstAlgoDtl->ibox42, pstSucc->ibox42, sizeof(pstAlgoDtl->ibox42) - 1);
+	memcpy(pstAlgoDtl->ibox42_mcht_nm, pstSucc->ibox43, sizeof(pstAlgoDtl->ibox42_mcht_nm) - 1);
+	memcpy(pstAlgoDtl->trade_brh_name, pstSucc->trade_brh_name, sizeof(pstAlgoDtl->trade_brh_name) - 1);
+	memcpy(pstAlgoDtl->expand_name, pstSucc->expand_name, sizeof(pstAlgoDtl->expand_name) - 1);
+	pstAlgoDtl->fdx = pstSucc->fdx;
+	memcpy(pstAlgoDtl->fdxx, pstSucc->fdxx, sizeof(pstAlgoDtl->fdxx) - 1);
+	memcpy(pstAlgoDtl->fdxxx, pstSucc->fdxxx, sizeof(pstAlgoDtl->fdxxx) - 1);
+
+	memcpy(pstAlgoDtl->rec_crt_ts, sGetCurrentTime(), sizeof(pstAlgoDtl->rec_crt_ts) - 1); 
+} 
+
+/************************************************************************************/
+/*   声明  ： double dGetAlgoFee(dbDiscAlgo *pstAlgo, double dTxAmt)				*/
+/*   功能  ： 计算应收商户手续费													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+double	dGetAlgoFee(dbDiscAlgo *pstAlgo, double dTxAmt, long *plFeeType)
+{
+	double	  dFee = 0.00, dCalFee = 0.00;
+
+	if(pstAlgo->flag == DISC_ALGO_FIXED)		//	按笔(固定)收费
+	{
+		*plFeeType = 4;
+		dCalFee = pstAlgo->fee_value;
+	}
+	else if(pstAlgo->flag == DISC_ALGO_RATE)	//	按比收费
+	{
+		*plFeeType = 1;							//  1-扣率类
+		dFee = dTxAmt * pstAlgo->fee_value / 100;
+		if(pstAlgo->min_fee > 0)				//	取最小最大区间的费用
+			dFee = (pstAlgo->min_fee >= dFee) ? pstAlgo->min_fee : dFee;
+		if(pstAlgo->max_fee > 0)
+		{
+// 			*plFeeType = 2;				 //  2-封顶类
+// 			dFee = (pstAlgo->max_fee <= dFee) ? pstAlgo->max_fee : dFee;
+			if(pstAlgo->max_fee <= dFee)
+			{
+				*plFeeType = 3;				//	封顶类并达到封顶值
+				dFee = pstAlgo->max_fee;
+			}
+			else
+				*plFeeType = 2;				//	固定手续费
+		}
+		dCalFee = dFee;
+	}
+	else if(pstAlgo->flag > DISC_ALGO_FIXED)	//	其他方式未定
+	{
+		*plFeeType = 0;							//	其他方式未定，无费率处理
+		dCalFee = 0.00;
+	}
+
+	return dCalFee;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCalPromtsFee(dbDiscAlgo *stAlgo, TAlgoDtl *stAlgoDtl, 			*/
+/*				double dFeeAmt)														*/
+/*   功能  ： 计算减免商户手续费													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nCalPromtsFee(dbDiscAlgo *pstAlgo, TAlgoDtl *pstAlgoDtl, double dFeeAmt)
+{
+	long		lRet = 0;
+
+	if(ALGO_FREE_AMT == pstAlgoDtl->promts_mode[0])			//	对对应金额减免手续费
+		pstAlgoDtl->free_fee = dGetAlgoFee(pstAlgo, pstAlgoDtl->free_amt, (long *)&lRet);
+	else if(ALGO_FREE_RATE == pstAlgoDtl->promts_mode[0])	//	对手续费打折减免
+		pstAlgoDtl->free_fee = dFeeAmt * pstAlgoDtl->free_amt ;
+	else if(ALGO_FREE_NUM == pstAlgoDtl->promts_mode[0])	//	按笔规定减免
+		pstAlgoDtl->free_fee = dFeeAmt;
+	else if(pstAlgoDtl->free_amt > 0.00)
+	{
+		HtLog(ERR_PARAM, "未定义的优惠标识码(%c), ID(%s)", pstAlgoDtl->promts_mode[0], 
+			pstAlgoDtl->id);
+		return RC_FAIL;
+	}
+	else
+		return RC_SUCC;
+
+	//	防止计算的手续费金额 有所偏差, 导致结算金额比交易金额大的情况
+	pstAlgoDtl->free_fee = (pstAlgoDtl->free_fee > dFeeAmt) ? dFeeAmt : pstAlgoDtl->free_fee;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCalculateFee(char *pszDiscId, int lAcType, double dTxAmt, 		*/
+/*					double *pdFee, int *plFeeType)									*/
+/*   功能  ： 计算应收商户手续费													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int	nCalculateFee(char *pszDiscId, int lAcType, double dTxAmt, double *pdFee, 
+		long *plFeeType, dbDiscAlgo *pstOut)
+{
+	double		fee = 0.00;
+	int			iRet = 0, i = 0, iFind = 0, lCount = 0;
+	dbDiscAlgo	stAlgo, *pstAlgo = NULL;
+
+	iRet = lGetDiscAlgo(pszDiscId, lAcType, FIELD_MATCH, &pstAlgo, (long *)&lCount);
+	if(RC_SUCC != iRet)
+	{
+		HtLog(ERR_PARAM, "查询TBL_PUB_DISC_ALGO信息错误(%s), 原因:%s", pszDiscId, 
+			sGetError());
+		return RC_FAIL;
+	}
+
+	/**************算商户的手续费**************/
+	memset(&stAlgo, 0, sizeof(stAlgo));
+	iRet = lGetAlgoModel(pstAlgo, lCount, dTxAmt, &stAlgo);
+	if(iRet)
+	{
+		IBPFree(pstAlgo);
+		HtLog(ERR_PARAM, "从费率表中查询(%s)金额(%.2f)段费率出错, err:(%d)(%s)", 
+			pszDiscId, dTxAmt, iRet, sGetError());
+		return RC_FAIL;
+	}
+	IBPFree(pstAlgo);
+	
+	*pdFee = dGetAlgoFee(&stAlgo, dTxAmt, plFeeType);
+
+	if(pstOut)
+		memcpy(pstOut, &stAlgo, sizeof(dbDiscAlgo));
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int AlgoFeeAmtProc(dbMchtAlgo *pstMAlgo, TAlgoDtl *pstAlgoDtl, 		*/
+/*				dbDiscAlgo *pstAlgo)												*/
+/*   功能  ： 计算应收商户手续费													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nAlgoFeeAmtProc(dbMchtAlgo *pstMAlgo, TAlgoDtl *pstAlgoDtl, dbDiscAlgo *pstAlgo)
+{
+	long		iRet = 0, lActType = 0;
+	char		szBaseId[9];
+	dbDiscAlgo	stAlgo;
+
+	memset(&stAlgo, 0, sizeof(stAlgo));
+	/****************计算商户手续费******************/
+	iRet = nCalculateFee(pstMAlgo->model_id, pstAlgoDtl->ac_type, pstAlgoDtl->tx_amt, 
+		&pstAlgoDtl->fee_amt, &lActType, &stAlgo);
+	if(RC_SUCC != iRet)
+	{
+		HtLog(ERR_PARAM, "计算商户(%s)手续费错误(%s)交易卡号类型(%d)", pstAlgoDtl->ibox42, 
+			pstMAlgo->model_id, pstAlgoDtl->ac_type);
+		return RC_FAIL;
+	}
+
+	pstAlgoDtl->fee_type = lActType;
+	pstAlgoDtl->other_fee = pstAlgoDtl->fee_amt - pstAlgoDtl->cup_fee;
+
+	if(pstAlgo) 
+		memcpy(pstAlgo, &stAlgo, sizeof(dbDiscAlgo));
+
+	if('1' == pstMAlgo->stlm_flag[0])	//	商户基准费不是一一对应, 不算基准费
+		return RC_SUCC;	
+	
+	/****************计算基准手续费******************/
+	memset(szBaseId, 0, sizeof(szBaseId));
+	memcpy(szBaseId, pstMAlgo->model_id, sizeof(szBaseId) - 1);	
+	szBaseId[0] = 'B';
+	iRet = nCalculateFee(szBaseId, pstAlgoDtl->ac_type, pstAlgoDtl->tx_amt, &pstAlgoDtl->base_amt, 
+			&lActType, NULL);
+	if(RC_SUCC != iRet)
+	{
+		HtLog(ERR_PARAM, "计算基准手续费错误(%s)(%d)", szBaseId, pstAlgoDtl->ac_type);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nCalcServiceFee(char *pszModel, TAlgoDtl *pstAlgoDtl,				*/
+/*				  double *pdServFee, dbDiscAlgo *pstAlgo)							*/
+/*   参数  :  pszModel		--  服务配置代码										*/
+/*			  pstAlgoDtl	--  清分数据结构										*/
+/*			  pdServFee		--  服务费												*/
+/*			  pstAlgo		--  费率模型											*/
+/*   功能  ： 计算T+0和线上、支付服务费												*/
+/*  返回值 ： RC_SUCC	   --  成功													*/
+/*			  RC_FAIL	   --  失败													*/
+/************************************************************************************/
+int	 nCalcServiceFee(char *pszModel, TAlgoDtl *pstAlgoDtl, double *pdServFee,
+			dbDiscAlgo *pstAlgo)
+{
+	long		lRet = 0, lCount = 0;
+	dbDisc	  *pstDisc = NULL, stDisc;
+	dbDiscAlgo  stAlgo;
+
+	if(!pszModel || !strlen(pszModel))
+	{
+		HtLog(NML_PARAM, "警告:清分流水(%s)渠道(%s)为空!", pstAlgoDtl->id, pstAlgoDtl->cups_no);
+		return RC_SUCC;
+	}
+
+	lRet = lGetServiceDisc(pszModel, pstAlgoDtl->ac_type, FIELD_MATCH, &pstDisc, (long *)&lCount);
+	if(RC_SUCC != lRet)
+	{
+		HtLog(ERR_PARAM, "获取费率模型(%s)错误(%d), 原因:%s", pszModel, lRet, sGetError());
+		return RC_FAIL;
+	}
+
+	memset(&stDisc, 0, sizeof(stDisc));
+	lRet = lGetAlgoService(pstDisc, lCount, pstAlgoDtl->tx_amt, &stDisc);
+	if(lRet)
+	{
+		IBPFree(pstDisc);
+		HtLog(ERR_PARAM, "获取服务类费率模型(%s)(%d)失败, err:(%d)(%s)", pszModel, lCount,
+			lRet, sGetError());
+		return RC_FAIL;
+	}
+	IBPFree(pstDisc);
+
+	vEXchangeAlgo(&stDisc, &stAlgo);
+//  开始计算服务费
+	*pdServFee += dGetAlgoFee(&stAlgo, pstAlgoDtl->tx_amt, (long *)&lRet);
+
+	if(pstAlgo)
+		memcpy(pstAlgo, &stAlgo, sizeof(dbDiscAlgo));
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetServiceFee(TAlgoDtl *pstAlgoDtl, char *pszCode,				*/
+/*					dbMchtBase *pdbMBase) 											*/
+/*   功能  ： 计算T+0和线上、支付服务费												*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nGetServiceFee(TAlgoDtl *pstAlgoDtl, char *pszCode, dbMchtBase *pdbMBase,
+			double *pdServFee, dbDiscAlgo *pstAlgo)
+{
+	long		lRet = 0;
+	char		szId[20], szSvrCode[20];
+	dbProCfg	stPrCfg;
+	dbSpeMcht   stSpec;
+	char		szProFix[9], szProRate[9];
+
+	memset(&stSpec, 0, sizeof(stSpec));
+	memset(&stPrCfg, 0, sizeof(stPrCfg));
+	memset(szId, 0, sizeof(szId));
+	memset(szProFix, 0, sizeof(szProFix));
+	memset(szSvrCode, 0, sizeof(szSvrCode));
+	memset(szProRate, 0, sizeof(szProRate));
+
+	//  目前清分表就4位，但是费率表有10位，内存查找按照字段10位来匹配
+	snprintf(szSvrCode, sizeof(szSvrCode), "%s", pszCode);
+
+	lRet = lGetSpeMcht(&stSpec, pstAlgoDtl->settle_mcht, szSvrCode);
+	if(lRet <= RC_FAIL)
+	{
+		HtLog(ERR_PARAM, "查询特殊商户表失败，商户(%s)服务(%s), err:(%d)(%s)",
+			pstAlgoDtl->settle_mcht, szSvrCode, lRet, sGetError());
+		return RC_FAIL;
+	}
+	else if(RC_NOTFOUND == lRet)	//  非特殊商户
+	{
+		snprintf(szId, sizeof(szId), "%s%s", pstAlgoDtl->tx_date, szSvrCode);
+		if(RC_SUCC != lGetPorConfig(&stPrCfg, szId))
+		{
+			HtLog(ERR_PARAM, "获取服务(%s)(%s)服务配置表错误, 原因:%s", szId,
+				pstAlgoDtl->settle_mcht, sGetError());
+			return RC_FAIL;
+		}
+
+		memcpy(szProFix, stPrCfg.pro_fix, sizeof(szProFix) - 1);
+		memcpy(szProRate, stPrCfg.pro_rate, sizeof(szProRate) - 1);
+	}
+	else
+	{
+		HtLog(NML_PARAM, "获取特殊商户(%s)费率模型(%s)(%s)", pstAlgoDtl->settle_mcht,
+			stSpec.pro_fix, stSpec.pro_rate);
+		memcpy(szProFix, stSpec.pro_fix, sizeof(szProFix) - 1);
+		memcpy(szProRate, stSpec.pro_rate, sizeof(szProRate) - 1);
+	}
+
+//  对于减免、对于双重手续费无法做减免
+	if(RC_SUCC != nCalcServiceFee(szProFix, pstAlgoDtl, pdServFee, pstAlgo))
+	{
+		HtLog(ERR_PARAM, "计算流水(%s)服务(%s)手续费失败!", pstAlgoDtl->id, szProFix);
+		return RC_FAIL;
+	}
+
+	if(RC_SUCC != nCalcServiceFee(szProRate, pstAlgoDtl, pdServFee, pstAlgo))
+	{
+		HtLog(ERR_PARAM, "计算流水(%s)服务(%s)手续费失败!", pstAlgoDtl->id, szProRate);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nAlogDtlIns(TAlgoDtl *pstAlgoDtl, dbMchtAlgo *pdbMAlgo, 			*/
+/*				dbMchtBase *pdbMBase)												*/
+/*   功能  ： 计算手续费和先关费用													*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nAlgoDtlIns(TAlgoDtl *pstAlgoDtl, dbMchtAlgo *pdbMAlgo, dbMchtBase *pdbMBase)
+{
+	int			iRet = 0;
+	dbDiscAlgo	stAlgo;
+	
+	memset(&stAlgo, 0, sizeof(stAlgo));
+	//  T + 0 服务费
+	if(0 == pstAlgoDtl->disc_cycle)
+	{
+		strcpy(pstAlgoDtl->mcht_serve_type, "01");
+		//  计算T+0服务费
+		iRet = nGetServiceFee(pstAlgoDtl, FEE_REALTIME, pdbMBase, &pstAlgoDtl->mcht_serve_fee, NULL);
+		if(RC_SUCC != iRet)
+		{
+			HtLog(ERR_PARAM, "计算商户T+0实时服务费失败(%s)(%d)", FEE_REALTIME, pstAlgoDtl->ac_type);
+			return RC_FAIL;
+		}
+	}
+
+	if(!memcmp(pstAlgoDtl->servetype, FEE_SERVICE_KQDA, 4))
+	{
+		iRet = nGetServiceFee(pstAlgoDtl, pstAlgoDtl->servetype, pdbMBase, &pstAlgoDtl->serv_fee_kqda, NULL);
+		if(RC_SUCC != iRet)
+		{
+			HtLog(ERR_PARAM, "计算商户(%s)KQDA服务费失败(%s)(%d)", pstAlgoDtl->ibox42,
+				FEE_SERVICE_KQDA, pstAlgoDtl->ac_type);
+			return RC_FAIL;
+		}
+	}
+
+	//	线上支付(支付宝和微信)费率模型计算
+	if(!memcmp(pstAlgoDtl->cups_no, "alpy", 4) || !memcmp(pstAlgoDtl->cups_no, "wcht", 4))
+	{
+		strcpy(pstAlgoDtl->mcht_serve_type, "02");				//	02-线上支付服务费
+		pstAlgoDtl->fee_type = 0;									//	0-无商户费率
+		pstAlgoDtl->trans_type[0] = '2';							//	线上支付类
+		strcpy(pstAlgoDtl->mcht_grp, "00");	 					//  商户组，线上支付默认全部
+
+		//	计算mcht_serve_fee
+		if(!memcmp(pstAlgoDtl->order_no, "OO", 2) && !memcmp(pstAlgoDtl->cups_no, "wcht", 4))
+		{
+			iRet = nGetServiceFee(pstAlgoDtl, FEE_SERVICE_OO, pdbMBase, &pstAlgoDtl->fee_amt, &stAlgo);
+			if(RC_SUCC != iRet)
+			{
+				HtLog(ERR_PARAM, "计算商户(%s)O-O服务费失败(%s)(%d)",  pstAlgoDtl->settle_mcht, 
+					FEE_SERVICE_OO,  pstAlgoDtl->ac_type);
+				return RC_FAIL;
+			}
+		}
+		else
+		{
+			iRet = nGetServiceFee(pstAlgoDtl, pstAlgoDtl->cups_no, pdbMBase, &pstAlgoDtl->fee_amt, &stAlgo);
+			if(RC_SUCC != iRet)
+			{
+				HtLog(ERR_PARAM, "计算商户(%s)线上支付服务(%s)费失败(%d)", pstAlgoDtl->settle_mcht, 
+					pstAlgoDtl->cups_no, pstAlgoDtl->ac_type);
+				return RC_FAIL;
+			}
+		}
+	}
+	else
+	{
+		pstAlgoDtl->trans_type[0] = pdbMAlgo->trans_type[0];		//  交易种类
+		iRet = nAlgoFeeAmtProc(pdbMAlgo, pstAlgoDtl, &stAlgo);		//	计算T+N 手续费
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "计算商户手续费/基准费失败, err:(%d)id(%s)", iRet, pstAlgoDtl->id);
+			return RC_FAIL;
+		}
+	}
+
+	/*计算商户减免手续费*/
+	iRet = nCalPromtsFee(&stAlgo, pstAlgoDtl, pstAlgoDtl->fee_amt);
+	if(RC_SUCC != iRet)
+	{
+		HtLog(ERR_PARAM, "计算减免手续费错误(%s)(%d)", pstAlgoDtl->settle_mcht, pstAlgoDtl->ac_type);
+		return RC_FAIL;
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nDoneAlgoDtl(TStlmSucc *pstSucc, char *pszSettleDate, 			*/
+/*					char *pszSettleNum)												*/
+/*   功能  ： 清分处理流程															*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nDoneAlgoDtl(TStlmSucc *pstSucc, char *pszSettleDate, char *pszSettleNum)
+{
+	int			iRet;
+	dbMchtAlgo	dbMAlgo;	
+	dbMchtBase	dbMBase;
+	EXEC SQL BEGIN DECLARE SECTION;
+	TAlgoDtl	stAlgoDtl;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&dbMAlgo, 0, sizeof(dbMAlgo));
+	memset(&dbMBase, 0, sizeof(dbMBase));
+	iRet = nGetMchtAlgo(pstSucc->ibox42, &dbMAlgo, &dbMBase, pstSucc->fdx);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM,  "获取商户费率结果失败, err:(%d).", iRet);
+		return RC_FAIL;
+	}
+
+	memset(&stAlgoDtl, 0, sizeof(stAlgoDtl));
+	memcpy(stAlgoDtl.algo_date, pszSettleDate, 8);											//	清分日期
+	memcpy(stAlgoDtl.settle_num, pszSettleNum, sizeof(stAlgoDtl.settle_num) - 1);			//	清算周期
+	memcpy(stAlgoDtl.settle_mcht, dbMBase.mcht_no, sizeof(stAlgoDtl.settle_mcht) - 1);	//  清算商户号
+	memcpy(stAlgoDtl.settle_disc, dbMAlgo.model_id, sizeof(stAlgoDtl.settle_disc) - 1); 	//  手续费模型编号
+	memcpy(stAlgoDtl.settle_brh_id, dbMBase.mcht_stlm_brh, sizeof(stAlgoDtl.settle_brh_id) - 1);  //  清算代理号
+	memcpy(stAlgoDtl.mcht_mcc_grp, dbMBase.mcht_grp, sizeof(stAlgoDtl.mcht_mcc_grp) - 1);	//	商户MCC码组
+	memcpy(stAlgoDtl.mcht_grp, dbMAlgo.mcht_grp, sizeof(stAlgoDtl.mcht_grp) - 1);			//	商户组
+//	stAlgoDtl.mcht_type[0] = dbMBase.mcht_type[0]; 										//	商户类型 0-间联  1-直接
+	if('H' == dbMBase.mcht_disc_id[1])						//	间联
+		stAlgoDtl.mcht_type[0] = '0';						//	商户类型 0-间联  1-直接
+	else if('P' == dbMBase.mcht_disc_id[1])
+		stAlgoDtl.mcht_type[0] = '1';						//	商户类型 0-间联  1-直接
+	else
+	{
+		HtLog(ERR_PARAM, "未知商户费率类型(%s)", dbMBase.mcht_disc_id);
+		return RC_FAIL;
+	}
+
+	stAlgoDtl.card_type = dbMAlgo.card_type;		//	卡类型
+  	vFillAlgoDtl(&stAlgoDtl, pstSucc);
+
+	iRet = nAlgoDtlIns(&stAlgoDtl, &dbMAlgo, &dbMBase);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "初始化清分记录失败, err:(%d)id(%s)", iRet, pstSucc->id);
+		return RC_FAIL;
+	}
+
+	/*将明细数据导入明细表*/
+  	EXEC SQL INSERT INTO TBL_ALGO_DTL VALUES (:stAlgoDtl);
+	if(SQLERR)
+  	{
+		HtLog(ERR_PARAM, "记录插入明细数据失败:(%d)(%s), id(%s)", SQLCODE, 
+			sDbsError(), stAlgoDtl.id);
+		return RC_FAIL;
+ 	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nAlgoMchtTxn(char *pszSettleDate, char *pszSettleNum, long lLast)	*/
+/*   功能  ： 清分处理流程															*/
+/*  返回值 ： RC_SUCC		--	成功												*/ 
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int		nAlgoMchtTxn(char *pszSettleDate, char *pszSettleNum, long lLast)
+{
+	int			iRet, lCount = 0;
+	BOOL		bSucc = true;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szInit[2], szStlmTime[7], szSettleNum[5];
+	char		szDone[2], szSettleDate[9], szTime[15];
+	long		lTrace; 
+	TStlmSucc	stSucc;
+	EXEC SQL END DECLARE SECTION;
+
+	HtLog(NML_PARAM, "清分处理流程开始, 所属流水规则号(%d)", lLast);
+
+	memset(szInit, 0, sizeof(szInit));
+	memset(szDone, 0, sizeof(szDone));
+	memset(szTime, 0, sizeof(szTime));
+	memset(szStlmTime, 0, sizeof(szStlmTime));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+
+	memcpy(szSettleNum, pszSettleNum, sizeof(szSettleNum) - 1);
+	memcpy(szSettleDate, pszSettleDate, sizeof(szSettleDate) - 1);
+	memcpy(szStlmTime, IBP_SETTLE_TIME, 6);
+	szInit[0] = STLM_SUCC_FLG_INIT;
+	lTrace = lLast;
+	memcpy(szTime, sGetCurrentTime(), sizeof(szTime) - 1);
+	
+	if('0' == pszSettleNum[1])
+	{
+		EXEC SQL DECLARE Cur_stlm_succ_t0 CURSOR FOR 
+			SELECT * FROM TBL_STLM_SUCC WHERE RESULT_FLAG = :szInit AND 
+				(TX_DATE < :szSettleDate OR (TX_DATE = :szSettleDate AND TX_TIME <= :szStlmTime)) 
+			AND DISC_CYCLE = 0 AND MOD(IBOX42, 20) = :lTrace ORDER BY IBOX42, TX_DATE, TX_TIME;
+	}
+	else
+	{
+		EXEC SQL DECLARE Cur_stlm_succ_tn CURSOR FOR 
+			SELECT * FROM TBL_STLM_SUCC WHERE RESULT_FLAG =:szInit
+			AND (TX_DATE < (SELECT MAX(TRANS_DATE) FROM TBL_STLM_DATE WHERE 
+				RESV1 = (SELECT MAX(RESV1) - (DISC_CYCLE - 1) FROM TBL_STLM_DATE 
+					WHERE STLM_DATE = :szSettleDate))
+			OR (TX_DATE = (SELECT MAX(TRANS_DATE) FROM TBL_STLM_DATE WHERE 
+				RESV1 = (SELECT MAX(RESV1) - (DISC_CYCLE - 1) FROM TBL_STLM_DATE 
+					WHERE STLM_DATE = :szSettleDate))
+			AND TX_TIME <= :szStlmTime)) AND DISC_CYCLE > 0 AND MOD(IBOX42,20) = :lTrace 
+		ORDER BY IBOX42, TX_DATE, TX_TIME;
+	}
+
+	if('0' == pszSettleNum[1])
+		EXEC SQL OPEN Cur_stlm_succ_t0;		
+	else
+		EXEC SQL OPEN Cur_stlm_succ_tn;		
+	if(SQLCODE) 
+	{
+		HtLog(ERR_PARAM, "查询流水规则(%d)下商户交易明细清分出错, err:(%d)(%s)", lTrace,
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+  
+	while(1)
+	{
+		memset(&stSucc, 0, sizeof(stSucc));
+		if('0' == pszSettleNum[1])
+			EXEC SQL FETCH Cur_stlm_succ_t0 INTO :stSucc;
+		else
+			EXEC SQL FETCH Cur_stlm_succ_tn INTO :stSucc;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{
+			bSucc = false;
+			HtLog(ERR_PARAM, "查询流水规则(%d)下商户交易明细清分出错, err:(%d)(%s)", 
+				lTrace, SQLCODE, sDbsError());
+			break;
+		}
+
+		vTrimStlmSucc(&stSucc);
+		if(RC_SUCC != nDoneAlgoDtl(&stSucc, pszSettleDate, pszSettleNum))
+		{
+			bSucc = false;
+			HtLog(ERR_PARAM, "清分商户清分明细失败!");
+			break;
+		}
+
+		stSucc.result_flag[0] = STLM_SUCC_FLG_OK;	//	已清分状态
+
+		EXEC SQL UPDATE TBL_STLM_SUCC SET 
+			RESULT_FLAG = :stSucc.result_flag, REC_UPD_TS = :szTime
+		WHERE ID = :stSucc.id;
+		if(SQLERR)
+		{
+			bSucc = false;
+			HtLog(ERR_PARAM, "更新对账成功表状态失败, err:(%d)(%s)ID(%s)", SQLCODE, 
+				sDbsError(), stSucc.id);
+			break;
+		}
+
+		if(++ lCount % 1000 == 0)
+			EXEC SQL COMMIT WORK;
+	}  
+	if('0' == pszSettleNum[1])
+		EXEC SQL CLOSE Cur_stlm_succ_t0;
+	else
+		EXEC SQL CLOSE Cur_stlm_succ_tn;
+	if(!bSucc)
+	{
+		EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	szInit[0] = STLM_CUP_TO_DONE;
+	szDone[0] = STLM_CUP_SETTLE_SUCC;
+	//	填充差错处理日期字段
+	EXEC SQL UPDATE TBL_STLM_ERR SET 
+		RESULT_FLAG = :szDone,
+		NEXT_DATE = :szSettleDate,
+		 REC_UPD_TS = :szTime
+	WHERE RESULT_FLAG = :szInit AND MOD(IBOX42,20) = :lTrace AND 
+		ID IN (SELECT ID FROM TBL_ALGO_DTL WHERE 
+			ALGO_DATE = :szSettleDate AND SETTLE_NUM = :szSettleNum);
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "更新差错表状态失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "本批次(%s)清分总条数(%d)", pszSettleNum, lCount);
+	return RC_SUCC;
+}
+
+/************************************************************************************
+	code end
+ ************************************************************************************/

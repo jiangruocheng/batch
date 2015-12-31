@@ -1,0 +1,39 @@
+PROCINCLUDE=include=$(ORACLE_HOME)/precomp/public include=$(SWHOME)/include include=$(HOME)/include include=$(HOME)/incl_c
+APPINCLUDE= -I../incl -I$(ORACLE_HOME)/precomp/public -I$(HOME)/include -I$(HOME)/incl_c -I./
+SYS_INCLUDE='sys_include=(/usr/include)'
+ORALIBDIR= -L$(ORACLE_HOME)/lib
+APPLIBDIR= -L$(BATHOME)/lib 
+DBSDIR= $(BATHOME)/dbsvr
+BINDIR= $(DBSDIR)/bin
+LIBDIR= $(BATHOME)/lib
+USERID=scott/tiger
+PROC=proc
+CC=cc
+ORALIB= -lpthread -lclntsh -lc `cat $(ORACLE_HOME)/lib/sysliblist`
+CFLAGS= -fPIC -g -DLINUX -D__DEBUG__ -DNOWHAT=1 -D_THREAD_SAFE
+
+
+OBJFILE = CalcCupsFee.o
+TARGET= libCupFee.so
+
+all: $(TARGET)  clean
+$(TARGET): $(OBJFILE)
+	$(CC) -g -shared -o $@ $< -L$(HOME)/lib -lBatCom -lShmTbl
+	mv $@ $(HOME)/lib
+
+.SUFFIXES: .pc .c .o
+
+.pc.o:
+	$(PROC) $(PROCINCLUDE) dbms=v7 unsafe_null=yes lines=yes parse=none iname=$*.pc
+	$(CC) -g $(CFLAGS) -w $(APPINCLUDE) -c $*.c
+	@rm -f $*.c
+	@rm -f $*.lis
+
+.c.o:
+	$(CC)  $(CFLAGS) -w $(APPINCLUDE) -c $*.c
+
+fall:
+	@touch *c
+	@make all
+clean:
+	rm -f *.o 

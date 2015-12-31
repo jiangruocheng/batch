@@ -1,0 +1,584 @@
+/*****************************************************************
+ *
+ *  功能: (代理服务费清分)流水清分处理程序
+ *
+ *  Edit History:
+ *          2013/1/25  --created by ZY
+ ****************************************************************/
+#include "HtLog.h"
+#include "pos_stlm.h"
+#include "DbsDef.h"
+//#include "tbl_brh_acct_c.h"
+#include "tbl_algo_dtl_c.h"
+#include "tbl_disc_algo_c.h"
+#include "tbl_disc_info_c.h"
+//#include "tbl_brh_info_c.h"
+#include	"load.h"
+
+#define MAX_DISC_NUM 400
+#define MAX_ALGO_NUM 30
+
+typedef struct
+{
+	int flag;
+        int card_type;
+	double fee_value;
+	double min_amt;
+	double max_amt;
+	double min_fee;
+	double max_fee;
+}T_Algo;
+typedef struct
+{
+	int fee_type;
+	double fixed_fee;
+	char disc_cd[9];
+	char disc_nm[41];
+	int disc_num;
+	T_Algo stAlgo[MAX_ALGO_NUM];
+}T_Disc;
+
+T_Disc gstDisc[MAX_DISC_NUM] = {0};
+
+/************************************************************************************/
+/*   函数名：                       清算主函数                                      */
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )                                   */
+/*   功能  ： 完成清算全流程                                                        */
+/*   参数  ： argc (参数个数 -- 输入)                                               */
+/*         ： argv (参数列表 -- 输出)                                               */
+/*            argv[1] --  清分日期(必输)                                            */
+/*            argv[2] --  BatID(必输)                                               */
+/*            argv[3] --  代理号(可选)                                              */ 
+/*  返回值 ： 0--  成功                                                             */ 
+/*            1--  失败                                                             */
+/************************************************************************************/
+int main(int argc , char **argv)
+{
+    int iRet;
+    char aSettlDate[8+1]; /*清算日期*/
+    
+    memset(gsLogFile, 0, sizeof(gsLogFile));
+    strcpy(gsLogFile, "AlgoBrhTxn.log");
+   
+    HtLog(NML_PARAM, "机构清分流程 begin.");
+    /*判断参数个数*/
+    if(argc < 5)
+    {
+        HtLog(ERR_PARAM, "参数个数有误argc[%d]", argc);
+        return RC_FAIL;
+    }
+
+    if(strlen(argv[1]) != 8)
+    {
+        HtLog(ERR_PARAM, "清算日期长度有误LEN[%d]VAL[%s]", strlen(argv[1]), argv[1]);
+        return RC_FAIL;
+    }
+
+    /*连接数据库*/
+    iRet = DbsConnect();
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "数据库连接失败sqlcode(%d)(%s)", iRet, DbsError());
+        return RC_FAIL;
+    }
+
+    memset(aSettlDate, 0, sizeof(aSettlDate));
+    memcpy(aSettlDate, argv[1], sizeof(aSettlDate) - 1);
+
+    HtLog(NML_PARAM, "stlm date[%s]", aSettlDate);
+
+    /*静态数据加载*/ 
+    iRet = AlgoBrhTxnInit(aSettlDate);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "清算预处理失败, iRet(%d)", iRet);
+        DbsDisconnect();
+        return RC_FAIL;
+    }
+
+    /*清分处理主函数*/
+    iRet = AlgoBrhTxn(aSettlDate);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "AlgoBrhTxn error:iRet(%d)stlm_date[%s]", iRet, aSettlDate);
+        DbsDisconnect();
+        return RC_FAIL;
+    } 
+   
+    /*断开数据库*/
+    DbsDisconnect();
+    HtLog(NML_PARAM, "机构清分流程 end.");
+    return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   函数名：                       清算预处理                                      */
+/************************************************************************************/
+/*   声明  ： int AlgoBrhTxnInit()                                                    */
+/*   功能  ： 加载清算静态参数主线结构                                              */
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */ 
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int AlgoBrhTxnInit(char *psDate)
+{
+    int    iRet;
+    int    i = 0;
+    int    j;
+    struct tbl_disc_algo_c      tAlgo;
+    struct tbl_disc_info_c      tDisc;
+ 
+    HtLog(NML_PARAM, "清算静态参数加载 begin ");   
+
+    /*** 加载手续费配置信息 ***/
+    iRet = Tbl_disc_info_Dec_Sel("disc_type = 'brh' order by disc_id");
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "tbl_disc_info error:(%d)(%s)", iRet, DbsError());
+        return RC_FAIL;
+    } 
+
+    while(1)
+    {
+		memset(&tDisc, 0x00, sizeof(struct tbl_disc_info_c));
+		iRet = Tbl_disc_info_Fet_Sel(&tDisc);
+        if(iRet != 0 && iRet != DBS_NOTFOUND) 
+		{
+            HtLog(ERR_PARAM, "Tbl_disc_info error:(%d)(%s)", iRet, DbsError());
+	    	Tbl_disc_info_Clo_Sel();
+            return RC_FAIL;
+        } 
+		else if(iRet == DBS_NOTFOUND)
+		{
+	    	HtLog(NML_PARAM, "FETCH FINSHED.");
+	    	Tbl_disc_info_Clo_Sel();
+           	break;
+		}
+
+		if(MAX_DISC_NUM <= i)
+		{
+	    	HtLog(ERR_PARAM, "费率模型定义超限！%d <= %d", MAX_DISC_NUM, i);
+	    	Tbl_disc_info_Clo_Sel();
+	    	return RC_FAIL;
+		}
+
+		CommonAllTrim(tDisc.disc_id);
+		CommonAllTrim(tDisc.disc_nm);
+//        gstDisc[i].fee_type = 0;
+//        gstDisc[i].fixed_fee = 0.00;
+		memcpy(gstDisc[i].disc_cd, tDisc.disc_id, strlen(tDisc.disc_id));
+		memcpy(gstDisc[i].disc_nm, tDisc.disc_nm, strlen(tDisc.disc_nm));
+		j = 0;
+        HtLog(NML_PARAM, "LOAD DISC_CD[%s][%s]", gstDisc[i].disc_cd, gstDisc[i].disc_nm);
+		iRet = Tbl_disc_algo_Dec_Sel("disc_id = '%s' order by upper_amount ", tDisc.disc_id); 
+        if(iRet) 
+		{
+            HtLog(ERR_PARAM, "Tbl_disc_algo [%s][%s] error:(%d)(%s)", tDisc.disc_id, tDisc.disc_nm, iRet, DbsError());
+	    	Tbl_disc_info_Clo_Sel();
+            return RC_FAIL;
+        } 
+
+		while(1)
+		{
+			memset(&tAlgo, 0x00, sizeof(struct tbl_disc_algo_c));
+	    	iRet = Tbl_disc_algo_Fet_Sel(&tAlgo); 
+            if(iRet != 0 && iRet != DBS_NOTFOUND) 
+            {
+                HtLog(ERR_PARAM, "Tbl_disc_algo [%s][%s] error:(%d)(%s)", tDisc.disc_id, tDisc.disc_nm, iRet, DbsError());
+	        	Tbl_disc_algo_Clo_Sel();
+	        	Tbl_disc_info_Clo_Sel();
+                return RC_FAIL;
+            } 
+            else if(iRet == DBS_NOTFOUND)
+            {
+	        	HtLog(NML_PARAM, "FETCH FINSHED.");
+	        	Tbl_disc_algo_Clo_Sel();
+                break;
+            }
+
+			if(MAX_ALGO_NUM <= j)
+			{
+		    	HtLog(ERR_PARAM, "分段费率模型定义超限！%d <= %d", MAX_ALGO_NUM, j);
+	        	Tbl_disc_algo_Clo_Sel();
+	        	Tbl_disc_info_Clo_Sel();
+	    		return RC_FAIL;
+			}
+
+	    	gstDisc[i].stAlgo[j].flag = tAlgo.flag;
+            gstDisc[i].stAlgo[j].card_type = tAlgo.card_type;
+	    	gstDisc[i].stAlgo[j].fee_value = tAlgo.fee_value;
+	    	gstDisc[i].stAlgo[j].min_amt = tAlgo.floor_amount;
+	    	gstDisc[i].stAlgo[j].max_amt = tAlgo.upper_amount;
+	    	gstDisc[i].stAlgo[j].min_fee = tAlgo.min_fee;
+	    	gstDisc[i].stAlgo[j].max_fee = tAlgo.max_fee;
+            HtLog(NML_PARAM, "LOAD DISC_CD[%s][%s][%d][%f][%f][%f][%f][%f]", gstDisc[i].disc_cd, gstDisc[i].disc_nm, 
+			gstDisc[i].stAlgo[j].flag, gstDisc[i].stAlgo[j].fee_value, gstDisc[i].stAlgo[j].min_amt, 
+                gstDisc[i].stAlgo[j].max_amt, gstDisc[i].stAlgo[j].min_fee, gstDisc[i].stAlgo[j].max_fee);
+	    	j++;
+		}
+		gstDisc[i].disc_num = j;
+		i++;
+    }
+
+    HtLog(NML_PARAM, "清算静态参数加载 end "); 
+    return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int GetDiscAlgo(T_Disc *pstDisc, struct tbl_brh_info_c *pstBrhAcct)   */
+/*   功能  ： 加载清算静态参数主线结构                                              */
+/*   参数  ： 输入无                                                                */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */ 
+/*           -1--  失败                                                             */
+/************************************************************************************/
+//int GetDiscAlgo(T_Disc *pstDisc, struct tbl_brh_info_c *pstBrhAcct)
+int GetDiscAlgo(T_Disc *pstDisc, dbBrhInfo *pstBrh)
+{
+    int iRet = 0;
+    int i;
+
+/*    if ( pstBrhAcct->fee_type[0] != '0' )
+    {
+        pstDisc->fee_type = atoi(pstBrhAcct->fee_type);
+        pstDisc->fixed_fee = atof(pstBrhAcct->fee_fixed);
+    }
+    */
+    CommonAllTrim(pstBrh->brh_disc_id);
+    for(i=0; i < MAX_DISC_NUM; i++) 
+    {
+        HtLog(NML_PARAM, "DISC_CD[%s][%s]", gstDisc[i].disc_cd, pstBrh->brh_disc_id);
+        if(!memcmp(gstDisc[i].disc_cd, pstBrh->brh_disc_id, strlen(pstBrh->brh_disc_id)))
+            break;
+    }
+
+    if(i > MAX_DISC_NUM)
+    {
+        HtLog(ERR_PARAM, "DISC_CD not found [%s]", pstBrh->brh_disc_id);
+        return RC_FAIL;
+    }
+    memcpy(pstDisc, &gstDisc[i], sizeof(T_Disc));
+
+    return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int GetMccBaseFee(char *psMchtNo, double *pdMccBaseFee)               */
+/*   功能  ： 加载清算静态参数主线结构                                              */
+/*   参数  ： pszSettleDisc     --商户费率id                                        */
+/*         ： pdBrhBaseFee      --基准费率                                          */
+/*         ： dAmt              --交易金额                                          */
+/*  返回值 ： 0--  成功                                                             */ 
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int nGetBrhBaseFee(char *pszSettleDisc, double *pdBrhFee, double dAmt, int *piBaseFlag)
+{
+    int     iRet = 0;
+    char    szSaleDisc[9];
+    double  fBaseFee = 0.00;
+    struct  tbl_disc_algo_c      stDisc;
+
+    memset(&szSaleDisc, 0, sizeof(szSaleDisc));
+    snprintf(szSaleDisc, sizeof(szSaleDisc), "sale%s", pszSettleDisc + 4);
+    HtLog(NML_PARAM, "查找商户基准销售费率[%s]", szSaleDisc);
+    // add 20140505 对只有一条的记录取默认操作
+    iRet = sql_count("tbl_disc_algo", "disc_id = '%s'", szSaleDisc);
+    if(0 == iRet)
+    {
+        HtLog(ERR_PARAM, "Sel Finished, 没有找到[%s]对应的费率!", szSaleDisc);
+        return RC_FAIL;
+    }
+    else if(1 == iRet)
+    {
+        memset(&stDisc, 0, sizeof(stDisc));
+        iRet = Tbl_disc_algo_Sel(&stDisc, "disc_id = '%s'", szSaleDisc);
+        if(iRet)
+        {
+            HtLog(ERR_PARAM,  "Tbl_disc_algo_Sel error:(%d)(%s)", iRet, DbsError());
+            return RC_FAIL;
+        }
+
+        *pdBrhFee = stDisc.fee_value;
+        *piBaseFlag = stDisc.flag;
+        
+        HtLog(NML_PARAM, "商户基准销售费率[%s]仅一条，默认处理:[%.2f]Flag[%d]", szSaleDisc, *pdBrhFee, *piBaseFlag); 
+        return RC_SUCC; 
+    }
+
+    iRet = Tbl_disc_algo_Dec_Sel("disc_id = '%s' order by upper_amount", szSaleDisc);
+    if(iRet)
+    {
+        HtLog(ERR_PARAM, "Tbl_disc_algo_Dec_Sel error:(%d)(%s)", iRet, DbsError());
+        return RC_FAIL;
+    }
+
+    while(1)
+    {
+        memset(&stDisc, 0, sizeof(stDisc));
+        iRet = Tbl_disc_algo_Fet_Sel(&stDisc);
+        if(iRet == DBS_NOTFOUND)
+        {
+            HtLog(ERR_PARAM, "Sel Finished, 没有找到[%s]金额:[%.2f]对应的费率!", szSaleDisc, dAmt);
+            Tbl_disc_algo_Clo_Sel();
+            return RC_FAIL;
+        }
+        else if(iRet)
+        {
+            HtLog(ERR_PARAM, "Tbl_disc_algo error:(%d)(%s)", iRet, DbsError());
+            Tbl_disc_algo_Clo_Sel();
+            return RC_FAIL;
+        }
+        
+        /* 找到对应的费率模型 */
+        if(dAmt <= stDisc.upper_amount) 
+        {
+            *pdBrhFee = stDisc.fee_value;
+            *piBaseFlag = stDisc.flag;
+            HtLog(NML_PARAM,  "find %s fee_value[%.2f]", szSaleDisc, stDisc.fee_value);
+            Tbl_disc_algo_Clo_Sel();
+            break; 
+        }
+    }
+
+    HtLog(NML_PARAM, "商户基准销售费率[%.2f]Flag[%d]", *pdBrhFee, *piBaseFlag); 
+
+    return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int AlgoBrhFeeProc                                                    */
+/*   功能  ： 计算代理商应收费用                                                    */
+/*   参数  ： pstDisc           --费率模型结构                                      */
+/*         :  pstAlgoDtl        --清分表结构体                                      */
+/*         :  pdBrhBaseFee      --Brh基准费率                                       */
+/*         :  pTotalAmt         --机构总金额                                        */
+/*  返回值 ： 0--  成功                                                             */
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int AlgoBrhFeeProc(T_Disc *pstDisc, struct tbl_algo_dtl_c *pstAlgoDtl)
+{
+    int i = 0, iFind = 0;
+    double fee;
+    T_Algo tAlgo;
+
+    memset(&tAlgo, 0x00, sizeof(T_Algo));
+    if(pstDisc->disc_num >1)
+    {
+		for(i=0; i<=MAX_ALGO_NUM; i++)
+        {
+			if(pstAlgoDtl->tx_amt <= pstDisc->stAlgo[i].max_amt)
+			{
+				iFind = 1;
+				memcpy(&tAlgo, &pstDisc->stAlgo[i], sizeof(T_Algo));
+				break;
+			}
+        }
+    }
+    else
+	{
+		iFind = 1;
+        memcpy(&tAlgo, &pstDisc->stAlgo[0], sizeof(T_Algo));
+	}
+	if(0 == iFind)
+	{
+		HtLog(ERR_PARAM, "费率模型个数(%d)金额(%.2f),未找到该段费率，请检查费率模型配置是否错误",
+			pstDisc->disc_num, pstAlgoDtl->tx_amt);
+		return RC_FAIL;
+    }
+
+    HtLog(NML_PARAM, "min_fee[%.2f],max_fee[%.2f],floor_amount[%.2f],upper_amount[%.2f],flag[%d]",
+        tAlgo.min_fee, tAlgo.max_fee, tAlgo.min_amt, tAlgo.max_amt, tAlgo.flag);
+
+    if(tAlgo.flag == DISC_ALGO_FIXED)  /*** 按笔(固定)收费**/
+        pstAlgoDtl->brh_fee = tAlgo.fee_value;
+    else if(tAlgo.flag == DISC_ALGO_RATE)   /*** 按比收费**/
+    {   
+        fee = (pstAlgoDtl->fee_amt - pstAlgoDtl->base_amt) * tAlgo.fee_value / 100;
+        if(tAlgo.min_fee > 0)           //  取最小最大区间的费用
+            fee = (tAlgo.min_fee >= fee)?tAlgo.min_fee:fee;
+        if(tAlgo.max_fee > 0)
+            fee = (tAlgo.max_fee <= fee)?tAlgo.max_fee:fee;
+        pstAlgoDtl->brh_fee = fee;
+    }    
+    else  if(tAlgo.flag > DISC_ALGO_FIXED)    //      固定收费
+        pstAlgoDtl->brh_fee = 0.00;
+
+    pstAlgoDtl->other_fee = pstAlgoDtl->fee_amt - pstAlgoDtl->cup_fee - pstAlgoDtl->brh_fee;
+    return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   函数名：                      清分                                             */
+/************************************************************************************/
+/*   声明  ： int AlgoBrhTxn()                                                     */
+/*   功能  ： 清分处理流程                                                          */
+/*         ： SettlmtDate--输入                                                     */
+/*         ： 输出无                                                                */
+/*  返回值 ： 0--  成功                                                             */ 
+/*           -1--  失败                                                             */
+/************************************************************************************/
+int AlgoBrhTxn(char * psSettlDate)
+{
+    int                      iRet;                /*返回值*/
+    int                      year,mon, iBaseFlag = 0;
+    long                     lRecordNo;           /*记录号*/
+    double                   dTotalAmt = 0.00, dBrhBaseFee = 0.00;
+    char                     sYear[5] = {0}, sMon[3] = {0}, sBefMon[7] = {0};
+    char                     sPreDate[8+1];       /*清算日期的前一天*/
+    char                     sMchtNo[26] = {0}, szSettleDisc[9];
+    char                     sSettleBrhId[11] = {0};
+    struct tbl_algo_dtl_c    tAlgo;
+    T_Disc                   tDisc;
+//	struct tbl_brh_info_c    tBrhAcct;
+    dbBrhInfo	stBrh;
+    RunTime		*pstRun = (RunTime *)pInitRunTime();
+
+    HtLog(gsLogFile, HT_LOG_MODE_NORMAL, __FILE__, __LINE__,
+          "清分处理流程 begin.");
+    
+    /** 计算上个月月份**/
+    memcpy(sYear, psSettlDate, 4);
+    memcpy(sMon, psSettlDate + 4, 2);
+    year = atoi(sYear);
+    mon = atoi(sMon);
+    if (mon == 1)
+    {
+        year -= 1;
+        mon = 12;
+    }
+    else
+        mon -= 1;
+    sprintf(sBefMon, "%04d%02d", year, mon);
+    HtLog(NML_PARAM, "上个月是[%s]", sBefMon);
+    
+//	设置查询条件
+    pstRun->lFind = CHK_SELECT;
+    pstRun->tblName = TBL_BRH_INFO;
+ 	memset(&stBrh, 0, sizeof(stBrh));
+	stBrh.brh_stlm_flag[0] = BRH_STLM_YES;
+	pstRun->lSize = sizeof(stBrh);
+	pstRun->pstVoid = &stBrh;
+
+    DbsBegin();
+//	iRet = Tbl_brh_info_Dec_Sel("brh_sta = '0' and brh_stlm_flag = '%c' order by brh_code ", BRH_STLM_YES);
+	iRet = lTableDeclare(pstRun);
+    if(iRet) 
+    {
+        HtLog(ERR_PARAM, "Tbl_brh_info error:(%d)(%s)", iRet, DbsError());
+        return RC_FAIL;
+    }
+  
+    while(1) 
+    {
+        dTotalAmt = 0.00;
+//		iRet = Tbl_brh_info_Fet_Sel(&tBrhAcct);
+		memset(&stBrh, 0, sizeof(stBrh));
+        iRet = lTableFetch(TBL_BRH_INFO, &stBrh, sizeof(stBrh));
+        if(iRet == DBS_NOTFOUND)
+        {
+            HtLog(NML_PARAM, "Tbl_brh_acct_Fet_Sel Finshed.");
+            break;
+        }
+        else if(iRet) 
+        {
+            HtLog(ERR_PARAM, "Tbl_brh_acct_Fet_Sel error:(%d)(%s)", iRet, DbsError());
+			vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+            DbsRollback();
+            return RC_FAIL;
+        }
+
+        CommonAllTrim(stBrh.brh_code);
+        HtLog(NML_PARAM, "获取到的代理信息，Brh_Id:[%s];", stBrh.brh_code);
+
+        /** 统计上个月本代理商户的交易量**/
+        iRet = sql_sum_double("tbl_algo_dtl", "tx_amt", &dTotalAmt, "settle_brh_id = '%s' and substr(tx_date,1,6) = '%s' ", stBrh.brh_code, sBefMon);
+        if(iRet) 
+        {
+            HtLog(ERR_PARAM, "sql_sum_double error:(%d)(%s)", iRet, DbsError());
+			vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+            return RC_FAIL;
+        }
+        HtLog(NML_PARAM, "获取到的代理下交易量，Brh_Id:[%s][%.2lf];", stBrh.brh_code, dTotalAmt);
+
+		iRet = GetDiscAlgo(&tDisc, &stBrh);
+		if(iRet)
+        {
+            HtLog(ERR_PARAM, "GetBrhAlgo error: iRet(%d)", iRet);
+			vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+            DbsRollback();
+            return RC_FAIL;
+        }
+
+        iRet = Tbl_algo_dtl_Dec_Sel("settle_brh_id = '%s' and substr(tx_date,1,6) = '%s' order by settle_mcht", stBrh.brh_code, sBefMon);
+        if(iRet) 
+        {
+            HtLog(ERR_PARAM, "Tbl_algo_dtl_Dec_Sel error:(%d)(%s)", iRet, DbsError());
+			vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+            DbsRollback();
+            return RC_FAIL;
+        }
+
+        lRecordNo = 0;
+        dBrhBaseFee = 0.00;
+        memset(sMchtNo, 0x00, sizeof(sMchtNo));
+        while(1)
+        {
+            memset(&tAlgo, 0x00, sizeof(struct tbl_algo_dtl_c));
+            iRet = Tbl_algo_dtl_Fet_Sel(&tAlgo);
+            if(iRet == DBS_NOTFOUND)
+            {
+                HtLog(NML_PARAM, "Tbl_algo_dtl_Fet_Sel Finshed");
+                Tbl_algo_dtl_Clo_Sel();
+                DbsCommit();
+                break;
+            }
+            else if(iRet) 
+            {
+                HtLog(ERR_PARAM, "Tbl_algo_dtl_Fet_Sel error:(%d)(%s)", iRet, DbsError());
+                Tbl_algo_dtl_Clo_Sel();
+				vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+                DbsRollback();
+                return RC_FAIL;
+            }
+            CommonAllTrim(tAlgo.settle_mcht);
+
+            /*清分交易代理费用计算*/
+            // mdf 20140408
+            iRet = AlgoBrhFeeProc(&tDisc, &tAlgo);
+            if(iRet) 
+            {
+                HtLog(ERR_PARAM, "记录清分交易代理服务费计算失败:[%d]. tx_date[%s], trace_no[%s].", iRet, tAlgo.tx_date, tAlgo.trace_no);
+                Tbl_algo_dtl_Clo_Sel();
+				vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+                DbsRollback();
+                return RC_FAIL;
+            }
+
+            HtLog(NML_PARAM, "详细信息Brh_Id:[%s],Mcht_no:[%s],Term_No:[%s],Tx_amt:[%.2lf],Fee_amt:[%.2lf],Cup_fee:[%.2lf],Other_fee:[%.2lf],"
+				"Brh_fee[%.2lf],Base_fee[%.2lf],TotalAmt:[%.2lf];", stBrh.brh_code, tAlgo.settle_mcht, tAlgo.ibox41, tAlgo.tx_amt, tAlgo.fee_amt, 
+				tAlgo.cup_fee, tAlgo.other_fee, tAlgo.brh_fee, dBrhBaseFee, dTotalAmt);
+
+            /*将明细数据修改*/
+            CommonGetCurrentTime(tAlgo.rec_upd_ts);
+            /* 更新Algo表机构的单笔金额*/
+            iRet = sql_execute("update tbl_algo_dtl set brh_fee = %.2lf, other_fee = %.2lf, brh_flag = '%c', rec_upd_ts = '%s' where rowid = '%s' ", 
+                        tAlgo.brh_fee, tAlgo.other_fee, ALGO_BRH_FLAG_INIT, tAlgo.rec_upd_ts, tAlgo.rowid);
+            if(iRet)
+            {
+                HtLog(ERR_PARAM, "修改明细数据失败:(%d)(%s), tx_date[%s], trace_no[%s].", iRet, DbsError(), tAlgo.tx_date, tAlgo.trace_no);
+                Tbl_algo_dtl_Clo_Sel();
+				vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+                DbsRollback();
+                return RC_FAIL;
+            }  
+            lRecordNo++;        
+        }
+    }
+	vTableClose(TBL_BRH_INFO, SHM_DISCONNECT);
+	DbsCommit();
+    HtLog(NML_PARAM, "清分处理 end.");
+                                                       
+    return RC_SUCC;
+}

@@ -1,0 +1,1127 @@
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "Ibp.h"
+#include "load.h"
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_brh_settle_dtl.h"
+#include "tbl_algo_dtl.h"
+#include "tbl_settle_err.h"
+#include "tbl_settle_txn.h"
+#include "tbl_stlm_repair_dtl.h"
+#include "tbl_stlm_repair_sum.h"
+EXEC SQL END DECLARE SECTION;
+int	 g_nBrhNum = 0;
+EXEC SQL INCLUDE SQLCA;
+/************************************************************************************/
+/*   函数名：					   结算主函数										*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*		 ： argv (参数列表 -- 输出)													*/
+/*			argv[1] --  清算日期(可选)												*/ 
+/*  返回值 ： 0--  成功																*/ 
+/*		   -1--  失败																*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	int		iRet;
+	char	szSettlmtDate[9], szSettleNum[5], szBrhId[31];
+   
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+
+	/*判断参数个数*/
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, "参数个数有误argc[%d].exec: %s stlm_date stlm_num bat_id", argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szSettlmtDate, 0, sizeof(szSettlmtDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szBrhId, 0, sizeof(szBrhId));
+	memcpy(szSettlmtDate, argv[1], sizeof(szSettlmtDate) - 1);
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);
+	memcpy(szBrhId, argv[4], sizeof(szBrhId) - 1);
+	snprintf(gsLogFile, sizeof(gsLogFile), "GenBrhInfile_%s.log", szBrhId);
+	HtLog(NML_PARAM, "机构入账信息生成开始...");
+	HtLog(NML_PARAM, "清算日期(%s) 清算批序号(%s), 机构号(%s)", szSettlmtDate, szSettleNum, szBrhId);
+	
+	/*连接数据库*/
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "数据库连接失败sqlcode(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+	
+	iRet = GenBrhInfile(szSettlmtDate, szSettleNum, szBrhId);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "生成机构清算明细失败, err:(%d)", iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+   
+	/*断开数据库*/
+	vDbsDisconnect();
+		   
+	return RC_SUCC;
+}
+/************************************************************************************/
+/*   声明  ： int nnGetRepairSeq(int	*plOut)									 	*/
+/*   功能  ： 获取流水序号														  	*/
+/*   参数  ： 输入无																*/
+/*		 ： 输出无																	*/
+/*  返回值 ： 0--  成功															 	*/
+/*		   -1--  失败															 	*/
+/************************************************************************************/
+int nGetRepairSeq(int *plOut)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lSeq = 0;
+	EXEC SQL END DECLARE SECTION;
+	EXEC SQL SELECT TBL_STLM_REPAIR_DTL_SEQ.NEXTVAL INTO :lSeq FROM dual;
+	if(0 != sqlca.sqlcode)
+	{
+		HtLog(ERR_PARAM, "获取序列数据失败, err:(%s)",  sDbsError());
+		return RC_FAIL;
+	}
+	*plOut = lSeq;
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetRepairAmt(tbl_brh_settle_dtl_c *pstBrhDtl)					*/
+/*   功能  ： 获取代理商的需要补帐的金额											*/
+/*   参数  ： 输入无																*/
+/*		 ： 输出无																	*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+int nGetRepairAmt(struct tbl_brh_settle_dtl_c *pstBrhDtl, char *pszSettleDate)
+{
+	int	iRet = 0,iRet_sum = 0,iMaxID=0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct tbl_brh_settle_dtl_c	stBrhDtl;
+	struct tbl_stlm_repair_dtl_c stRepair;
+	struct tbl_stlm_repair_sum_c stRepair_sum;
+	double amt = 0.0f, dRAmt = 0.00;
+	char cType;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stBrhDtl, 0, sizeof(stBrhDtl));
+	memcpy(&stBrhDtl, pstBrhDtl, sizeof(stBrhDtl));
+	cType = REPAIR_FLG_BRH;
+	EXEC SQL UPDATE TBL_STLM_REPAIR_DTL SET ID = ID WHERE APP_ID = :stBrhDtl.settle_brh_id 
+		AND APP_TYPE = :cType AND OPR_TYPE = '9';
+	if(SQL_UD_ERR) 
+	{	
+		HtLog(ERR_PARAM, "锁表tbl_stlm_repair_dtl记录失败，iRet(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}	
+
+	//  先处理解冻的金额
+	//  repair_type set '1'
+	EXEC SQL DECLARE Cur_Tbl_stlm_repair_dtl CURSOR FOR
+		SELECT * FROM TBL_STLM_REPAIR_DTL WHERE APP_ID = :stBrhDtl.settle_brh_id 
+		AND APP_TYPE = :cType AND OPR_TYPE = '9' ORDER BY APP_ID,REC_CRT_TS;
+	EXEC SQL OPEN Cur_Tbl_stlm_repair_dtl;
+	if(0 != sqlca.sqlcode)
+	{	
+		HtLog(ERR_PARAM, "查询代理商调帐代理商流水失败, err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}	
+
+	while(1)
+	{	
+		memset(&stRepair, 0, sizeof(stRepair));
+		EXEC SQL FETCH Cur_Tbl_stlm_repair_dtl INTO :stRepair;
+		if(sqlca.sqlcode == DBS_NOTFOUND)
+		{	
+			EXEC SQL CLOSE Cur_Tbl_stlm_repair_dtl;
+			break;
+		}
+		else if(0 != sqlca.sqlcode)
+		{
+			HtLog(ERR_PARAM, "查询代理商(%s)信息失败, err:(%d)(%s)", pstBrhDtl->settle_brh_id, sqlca.sqlcode, sDbsError());
+			EXEC SQL CLOSE Cur_Tbl_stlm_repair_dtl;
+			return RC_FAIL;
+		}
+
+		if(stRepair.opr_amt < 0.00)
+		{
+			HtLog(NML_PARAM, "调帐金额(%.2f)设置错误, 处理下一条调帐信息", stRepair.opr_amt);
+			continue;
+		}
+
+		memset(&stRepair_sum, 0, sizeof(stRepair_sum));
+		EXEC SQL DECLARE Cur_Tbl_stlm_repair_sum CURSOR FOR
+			SELECT A.* FROM TBL_STLM_REPAIR_SUM WHERE APP_ID = :stRepair.app_id AND APP_TYPE = :cType;
+		EXEC SQL OPEN Cur_Tbl_stlm_repair_sum;
+		if(sqlca.sqlcode)
+		{
+			HtLog(NML_PARAM, "查询代理商调帐汇总表失败【1】，err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+			continue;
+		}
+		else if(sqlca.sqlcode == DBS_NOTFOUND)
+		{
+			HtLog(NML_PARAM, "从没截留过，不能做解冻(%s), 处理下一条调帐信息", stRepair.app_id);
+			continue;
+		}
+		EXEC SQL FETCH Cur_Tbl_stlm_repair_sum INTO :stRepair_sum;
+		EXEC SQL CLOSE Cur_Tbl_stlm_repair_sum;
+		if(stRepair_sum.unrepair_amt>0)
+		{
+			HtLog(NML_PARAM, "截留没有完成，不能做解冻(%s), 处理下一条调帐信息", stRepair.app_id);
+			continue;
+		}
+
+		memcpy(stRepair.rec_crt_ts, sGetCurrentTime(), sizeof(stRepair.rec_crt_ts) - 1);
+		memcpy(stRepair_sum.rec_crt_ts, sGetCurrentTime(), sizeof(stRepair_sum.rec_crt_ts) - 1);
+		pstBrhDtl->settle_amt += stRepair.opr_amt;
+		pstBrhDtl->unrepair_amt += stRepair.opr_amt;
+		stRepair_sum.unfreezesum += stRepair.opr_amt;
+		amt = stRepair_sum.prefreezesum-stRepair.opr_amt;
+		//dRAmt = stRepair_sum.surpunfreeze-stRepair.opr_amt;
+		
+		EXEC SQL UPDATE TBL_STLM_REPAIR_DTL SET OPR_TYPE = '0', SETTLE_NUM = :stBrhDtl.settle_num, 
+			REC_UPD_TS = :stRepair.rec_upd_ts WHERE ID = :stRepair.id;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新调帐信息表失败, err:(%d)(%s)代理商 (%s) ", sqlca.sqlcode, sDbsError(),
+				pstBrhDtl->settle_brh_id);
+			EXEC SQL CLOSE Cur_Tbl_stlm_repair_dtl;
+			return RC_FAIL;
+		}
+		
+		EXEC SQL UPDATE TBL_STLM_REPAIR_SUM SET UNFREEZESUM = :stRepair_sum.unfreezesum, PREFREEZESUM = :amt, 
+			REC_UPD_TS = :stRepair_sum.rec_upd_ts WHERE ID = :stRepair_sum.id;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新调帐汇总表失败, err:(%d)(%s)代理商 (%s) ", sqlca.sqlcode, sDbsError(),
+				pstBrhDtl->settle_brh_id);
+			EXEC SQL CLOSE Cur_Tbl_stlm_repair_dtl;
+			return RC_FAIL;
+		}
+	}
+
+	//  在处理截留的金额
+	EXEC SQL UPDATE TBL_STLM_REPAIR_SUM SET ID = ID WHERE APP_ID = :stBrhDtl.settle_brh_id AND APP_TYPE = :cType;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "锁表tbl_stlm_repair_sum记录失败，iRet(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+
+	memset(&stRepair_sum, 0, sizeof(stRepair_sum));
+	EXEC SQL DECLARE Cur_Tbl_stlm_repair_sum_1 CURSOR FOR
+		SELECT * FROM TBL_STLM_REPAIR_SUM WHERE APP_ID = :stBrhDtl.settle_brh_id AND APP_TYPE = :cType;
+	EXEC SQL OPEN Cur_Tbl_stlm_repair_sum_1;
+	if(sqlca.sqlcode)
+	{
+		HtLog(NML_PARAM, "查询代理商调帐汇总表失败【2】，err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+	else if(sqlca.sqlcode == DBS_NOTFOUND)
+	{
+		return RC_SUCC;
+	}
+	EXEC SQL FETCH Cur_Tbl_stlm_repair_sum_1 INTO :stRepair_sum;
+	EXEC SQL CLOSE Cur_Tbl_stlm_repair_sum_1;
+	if (stRepair_sum.unrepair_amt>0)
+	{
+		if (stRepair_sum.unrepair_amt>pstBrhDtl->settle_amt)
+		{
+			pstBrhDtl->repair_amt = pstBrhDtl->settle_amt;
+			stRepair_sum.repaired_amt += pstBrhDtl->settle_amt;
+			stRepair_sum.unrepair_amt -= pstBrhDtl->settle_amt;
+			stRepair_sum.surpunfreeze += pstBrhDtl->settle_amt;
+			pstBrhDtl->settle_amt =0.00;
+		}
+		else
+		{
+			pstBrhDtl->settle_amt -= stRepair_sum.unrepair_amt;
+			pstBrhDtl->repair_amt = stRepair_sum.unrepair_amt;
+			stRepair_sum.repaired_amt += stRepair_sum.unrepair_amt;
+			stRepair_sum.surpunfreeze += stRepair_sum.unrepair_amt;
+			stRepair_sum.unrepair_amt = 0.00;
+		}
+
+		memset(&stRepair, 0, sizeof(stRepair));
+		iRet = nGetRepairSeq(&iMaxID);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "获取tbl_stlm_repair_dtl最大ID失败, err:(%d)", iRet);
+			return RC_FAIL;
+		}
+		stRepair.id =iMaxID+1;
+		memcpy(stRepair.rec_crt_ts, sGetCurrentTime(), sizeof(stRepair.rec_crt_ts) - 1);
+		memcpy(stRepair_sum.rec_crt_ts, sGetCurrentTime(), sizeof(stRepair_sum.rec_crt_ts) - 1);
+		stRepair.app_type[0] = REPAIR_FLG_BRH;
+		stRepair.opr_type[0] = '3';
+		memcpy(stRepair.app_id, stRepair_sum.app_id, sizeof(stRepair.app_id) - 1);
+		strcpy(stRepair.opr_desc, "实际截留");
+		stRepair.opr_amt = pstBrhDtl->repair_amt;
+		stRepair.expand = stRepair_sum.expand;
+		strcpy(stRepair.settle_num,pstBrhDtl->settle_num);
+		memcpy(stRepair.brh, stRepair_sum.brh, sizeof(stRepair.brh) - 1);
+		EXEC SQL INSERT INTO TBL_STLM_REPAIR_DTL VALUES (:stRepair);
+		if(sqlca.sqlcode)
+		{
+			HtLog(ERR_PARAM, "新增调账(%s)明细记录失败, err:(%d)(%s), (%d)", pstBrhDtl->settle_brh_id,
+				iRet, sDbsError(), stRepair.id);
+			return RC_FAIL;
+		}
+		EXEC SQL UPDATE TBL_STLM_REPAIR_SUM SET REPAIRED_AMT = :stRepair_sum.repaired_amt, UNREPAIR_AMT = 
+			:stRepair_sum.unrepair_amt, SURPUNFREEZE = :stRepair_sum.surpunfreeze, REC_UPD_TS = 
+			:stRepair_sum.rec_upd_ts WHERE ID = :stRepair_sum.id;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新调帐汇总表失败, err:(%d)(%s)代理商 (%s) ", sqlca.sqlcode, sDbsError(),
+				pstBrhDtl->settle_brh_id);
+			return RC_FAIL;
+		}
+	}
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetErrorAmt(tbl_brh_settle_dtl_c *pstBrhDtl, char *pszStlmDate)  */
+/*   功能  ： 获取代理商的入账错误金额												*/
+/*   参数  ： 输入无																*/
+/*		 ： 输出无																	*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+int nGetErrorAmt(struct tbl_brh_settle_dtl_c *pstBrhtDtl, char *pszStlmDate)
+{
+	int	iRet = 0, iFlag = 0, iCount = 0;	
+	EXEC SQL BEGIN DECLARE SECTION;
+	char cFlag,cErr_type, szStlmDate[10];
+	struct tbl_settle_err_c	 stStlErr, stSetErr;
+	struct tbl_brh_settle_dtl_c	stBrhDtl;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memcpy(szStlmDate, pszStlmDate, 8);
+	cFlag = SETTLE_ERR_TO_DONE;
+	cErr_type = SETTLE_ERR_FAILED;
+	memset(&stBrhDtl, 0, sizeof(stBrhDtl));
+	memcpy(&stBrhDtl, pstBrhtDtl, sizeof(stBrhDtl));
+	EXEC SQL DECLARE Cur_Tbl_settle_err_1 CURSOR FOR
+		SELECT * FROM TBL_SETTLE_ERR WHERE DO_FLAG = :cFlag AND ERR_TYPE = :cErr_type
+		AND SETTLE_BRH_ID = :stBrhDtl.settle_brh_id ORDER BY DO_FLAG;
+	EXEC SQL OPEN Cur_Tbl_settle_err_1;
+	if(0 != sqlca.sqlcode)
+	{
+		HtLog(ERR_PARAM, "查询上期入账本期参与清算机构错误, err:(%d)(%s).", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+	
+	while(1)
+	{
+		memset(&stStlErr, 0x00, sizeof(stStlErr));
+		EXEC SQL FETCH Cur_Tbl_settle_err_1 INTO :stStlErr;
+		if(SQLNOTFOUND)
+		{
+			break;
+		}
+		else if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "查询本地参与清算机构失败, err:(%d)(%s)", SQLERR, sDbsError());
+			EXEC SQL CLOSE Cur_Tbl_settle_err_1;
+			return RC_FAIL;
+		}
+
+		sTrimAll(stStlErr.id);
+		iCount ++;
+		/* 1 -- 需要清算的 */
+		if(SETTLE_ERR_TO_DONE == stStlErr.do_flag[0]) 
+		{
+			pstBrhtDtl->uperr_amt += stStlErr.settle_amt;
+			pstBrhtDtl->settle_amt += stStlErr.settle_amt;
+			memcpy(stStlErr.rec_upd_ts, sGetCurrentTime(), sizeof(stStlErr.rec_upd_ts) - 1);
+			cFlag = SETTLE_ERR_SETTLE_SUCC;
+			EXEC SQL UPDATE TBL_SETTLE_ERR SET DO_FLAG = :cFlag, NETX_DATE = :szStlmDate, 
+				REC_UPD_TS = :stStlErr.rec_upd_ts WHERE ID = :stStlErr.id;
+			if(SQL_UD_ERR)	
+			{
+				HtLog(ERR_PARAM, "更新入账失败表本期参与清算记录状态失败Ret(%d)(%s), id(%s)", 
+					sqlca.sqlcode, sDbsError(), stStlErr.id);
+				EXEC SQL CLOSE Cur_Tbl_settle_err_1;
+				return RC_FAIL;
+			}	
+		}
+		else if(stStlErr.do_flag[0] > SETTLE_ERR_TO_DONE && iCount == 1)
+		{
+			/* 直接插入入账错误表进行手工清算 */
+			pstBrhtDtl->result_flag[0] = SETTLE_BRH_HL_WAITE;
+		
+			/*同时将此条数据转到tbl_settle_err表中*/
+			memset(&stSetErr, 0x00, sizeof(stSetErr)); 
+			memcpy(stSetErr.id, pstBrhtDtl->id, sizeof(stSetErr.id) - 1);
+			memcpy(stSetErr.settle_date, pstBrhtDtl->settle_date, sizeof(stSetErr.settle_date) - 1);
+			memcpy(stSetErr.settle_brh_id, pstBrhtDtl->settle_brh_id, sizeof(stSetErr.settle_brh_id) - 1);
+			memcpy(stSetErr.trace_no, pstBrhtDtl->trace_no, sizeof(stSetErr.trace_no) - 1);
+
+			memcpy(stSetErr.ret_msg, stStlErr.ret_msg, sizeof(stSetErr.ret_msg) - 1);
+			memcpy(pstBrhtDtl->result_desc, stStlErr.ret_msg, sizeof(pstBrhtDtl->result_desc) - 1);
+
+			memcpy(stSetErr.settle_acct_type, stStlErr.settle_acct_type, sizeof(stSetErr.settle_acct_type) - 1);
+ 			memcpy(stSetErr.settle_bank_no, stStlErr.settle_bank_no, sizeof(stSetErr.settle_bank_no) - 1);
+			memcpy(stSetErr.settle_bank_nm, stStlErr.settle_bank_nm, sizeof(stSetErr.settle_bank_nm) - 1);
+			memcpy(stSetErr.settle_bank_addr, stStlErr.settle_bank_addr, sizeof(stSetErr.settle_bank_addr) - 1);
+			memcpy(stSetErr.settle_bank_code, stStlErr.settle_bank_code, sizeof(stSetErr.settle_bank_code) - 1);
+			memcpy(stSetErr.settle_acct_nm, stStlErr.settle_acct_nm, sizeof(stSetErr.settle_acct_nm) - 1);
+			memcpy(stSetErr.settle_acct, stStlErr.settle_acct, sizeof(stSetErr.settle_acct) - 1);
+
+			stSetErr.settle_amt = pstBrhtDtl->settle_amt;
+			memcpy(stStlErr.rec_crt_ts, sGetCurrentTime(), sizeof(stStlErr.rec_crt_ts) - 1);
+			memcpy(stStlErr.rec_upd_ts, sGetCurrentTime(), sizeof(stStlErr.rec_upd_ts) - 1);
+			stSetErr.do_flag[0] = SETTLE_ERR_NOT_DEAL;
+			stSetErr.err_type[0] = SETTLE_ERR_FAILED;
+			EXEC SQL INSERT INTO TBL_SETTLE_ERR VALUES (:stSetErr);
+			if(SQLCODE)
+			{
+				HtLog(ERR_PARAM, "新增入账差错明细失败，err:(%d)(%s), brh(%s)id(%s)trace_no(%s)",
+					SQLCODE, sDbsError(), pstBrhtDtl->settle_brh_id, pstBrhtDtl->id, pstBrhtDtl->trace_no);	
+				return RC_FAIL;
+			}
+			break;
+		}
+		else
+		{
+			HtLog(ERR_PARAM, "未设置的处理标识[%c]!", stStlErr.do_flag[0]);
+			EXEC SQL CLOSE Cur_Tbl_settle_err_1;
+			return RC_FAIL;
+		}
+	} 
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetBrhRate														*/
+/*   功能  ： 获取机构费率															*/
+/*   参数  ： ptBrhDtl		  --代理商清算结构体									*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+int	 nGetBrhRate(struct tbl_brh_settle_dtl_c *pstBrhDtl)
+{
+	int		 iRet = 0; 
+	dbBrhInfo	stBrhInfo;
+
+	memset(&stBrhInfo, 0, sizeof(stBrhInfo));
+	iRet = lGetBrhInfo(&stBrhInfo, pstBrhDtl->settle_brh_id);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "查询机构号失败, err:(%d)(%s)(%s)", iRet, sGetError(), 
+			pstBrhDtl->settle_brh_id);
+		return RC_FAIL;
+	}
+
+	sTrimAll(stBrhInfo.brh_disc_id);
+	
+	return 0;
+}
+
+/************************************************************************************/
+/*   声明  ： int nInitBrhSettle													*/
+/*   功能  ： 初始化一条代理商清算明细												*/
+/*   参数  ： ptBrhDtl		  --代理商清算结构体									*/
+/*		 ： pszStlmDate	   --清算日期										 		*/
+/*		 ： iCount			--代理商交易有效条数									*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+int	 nInitBrhSettle(struct tbl_brh_settle_dtl_c *pstBrhDtl, char *pszStlmDate, 
+					char *pszSettleNum, int iCount)
+{
+	int		 iRet = 0; 
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct tbl_brh_settle_dtl_c stBrhDtl;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(&stBrhDtl, 0, sizeof(stBrhDtl));
+	memcpy(&stBrhDtl, pstBrhDtl, sizeof(stBrhDtl));	
+	/* 除去渠道  剩下机构和本部金额   手续费净额 */
+	stBrhDtl.in_fee = stBrhDtl.fee_amt - stBrhDtl.base_amt;
+
+/*
+	// stBrhDtl.rate = (int)();
+	iRet = nGetBrhRate(stBrhDtl);
+	if(iRet)
+	{
+		 HtLog(ERR_PARAM, "获取机构分润比率失败, err:(%d)", iRet);
+		 return RC_FAIL;
+	}
+*/
+
+	memcpy(stBrhDtl.settle_date, pszStlmDate, 8);
+	stBrhDtl.result_flag[0] = SETTLE_BRH_INIT;
+	memcpy(stBrhDtl.rec_upd_ts, sGetCurrentTime(), sizeof(stBrhDtl.rec_upd_ts) - 1);
+	memcpy(stBrhDtl.rec_crt_ts, sGetCurrentTime(), sizeof(stBrhDtl.rec_crt_ts) - 1);		
+	snprintf(stBrhDtl.id, sizeof(stBrhDtl.id), "%3s%8sB%08d", pszSettleNum + 1,
+			pszStlmDate, g_nBrhNum);
+
+	/* 先做入账错误，然后再做补帐差错 */
+	/* 入账错误的代理商 */
+	iRet = nGetErrorAmt(&stBrhDtl, pszStlmDate);
+	if( iRet )
+	{
+		HtLog(ERR_PARAM, "处理机构(%s)上期入账失败记录失败, err:(%d).", 
+			stBrhDtl.settle_brh_id, iRet);
+		return RC_FAIL;
+	}
+
+	if(stBrhDtl.settle_amt > 0.00)
+	{
+		/* 补帐信息处理表 */
+		iRet = nGetRepairAmt(&stBrhDtl, pszStlmDate);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "处理机构(%s)补帐记录失败, err:(%d).", 
+				stBrhDtl.settle_brh_id, iRet);
+			return RC_FAIL;
+		}
+	}
+
+	/* 直接插入入账错误表进行手工清算, 同时不会参与该代理商的清算 */
+	if(SETTLE_BRH_HL_WAITE == stBrhDtl.result_flag[0])
+	{
+		/* 修改入账错误表金额*/
+		EXEC SQL UPDATE TBL_SETTLE_ERR SET SETTLE_AMT = :stBrhDtl.settle_amt WHERE ID = :stBrhDtl.id;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新本期机构(%s)清算记录为入账失败错误, err:(%d)(%s)",
+				stBrhDtl.settle_brh_id, sqlca.sqlcode, sDbsError());
+			return RC_FAIL;
+		}
+	}
+
+	if(stBrhDtl.settle_amt <= 0.00 ) 
+	{
+		stBrhDtl.dc_flag[0] = 'C';
+		stBrhDtl.result_flag[0] = SETTLE_BRH_SUCC;			  //  0金额 入账成功
+	}
+	else
+		stBrhDtl.dc_flag[0] = 'D';
+
+	stBrhDtl.tx_num = iCount;
+	EXEC SQL INSERT INTO TBL_BRH_SETTLE_DTL VALUES (:stBrhDtl);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增机构(%s)清算记录失败, err:(%d)(%s)", stBrhDtl.settle_brh_id, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;  
+	}
+	
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nInsertBrhSettle(tbl_brh_settle_dtl_c *pstBrhDtl)					*/
+/*   功能  ： 将补帐或入账有错的代理商放入机构清算流水表中						 	*/
+/*   参数  ： 输入无																*/
+/*		 ： 输出无																	*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+int nInsertBrhSettle(struct tbl_brh_settle_dtl_c *pstBrhDtl, char *psStlmDate)
+{
+	int iRet = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char sStlmDate[10], cR_flag, cDc_flag;
+	struct tbl_brh_settle_dtl_c  stBrhDtl;
+	EXEC SQL END DECLARE SECTION;
+	memset(sStlmDate, 0, sizeof(sStlmDate));
+	memcpy(sStlmDate, psStlmDate, 8);
+	memset(&stBrhDtl, 0, sizeof(stBrhDtl));
+	memcpy(&stBrhDtl, pstBrhDtl, sizeof(stBrhDtl));
+	EXEC SQL DECLARE Cur_Tbl_settle_dtl CURSOR FOR
+		SELECT A.* FROM TBL_BRH_SETTLE_DTL WHERE SETTLE_BRH_ID = :stBrhDtl.settle_brh_id 
+		AND SETTLE_DATE = :sStlmDate AND SETTLE_NUM = :stBrhDtl.settle_num;
+	EXEC SQL OPEN Cur_Tbl_settle_dtl;
+	if( 0 != sqlca.sqlcode || sqlca.sqlcode != DBS_NOTFOUND)
+	{
+		HtLog(ERR_PARAM, "查询商户(%s)当日(%s)清算流水失败, err:(%d)(%s)", pstBrhDtl->settle_brh_id, 
+			psStlmDate, sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+	else if(0 == sqlca.sqlcode)
+	{
+		memset(&stBrhDtl, 0, sizeof(stBrhDtl));
+		EXEC SQL FETCH Cur_Tbl_settle_dtl INTO :stBrhDtl;
+		EXEC SQL CLOSE Cur_Tbl_settle_dtl;
+		/* 找到该代理商，直接Update 金额 */	
+		stBrhDtl.settle_amt += pstBrhDtl->settle_amt;
+		stBrhDtl.unrepair_amt += pstBrhDtl->unrepair_amt;
+		stBrhDtl.repair_amt += pstBrhDtl->repair_amt;
+		stBrhDtl.uperr_amt += pstBrhDtl->uperr_amt;
+		strcpy(stBrhDtl.rec_upd_ts, pstBrhDtl->rec_upd_ts);
+		HtLog(NML_PARAM, "本期存在该机构(%s)清算流水, 清算金额(%.2f), 补帐金额(%.2f), "
+			"补帐后继续处理金额(%.2f), 入账失败参与清算金额(%.2f).", pstBrhDtl->settle_brh_id, 
+			stBrhDtl.settle_amt, stBrhDtl.repair_amt, stBrhDtl.unrepair_amt, stBrhDtl.uperr_amt);
+		sTrimAll(stBrhDtl.id);
+		if(SETTLE_MCHT_HL_WAITE == stBrhDtl.result_flag[0])	// 修改tbl_settle_err 表的记录
+		{
+			EXEC SQL UPDATE TBL_SETTLE_ERR SET SETTLE_AMT = :stBrhDtl.settle_amt, REC_UPD_TS = :stBrhDtl.rec_upd_ts
+				WHERE ID = :stBrhDtl.id;
+		}
+		else
+		{
+			if(stBrhDtl.settle_amt <= 0.00)
+			{
+				stBrhDtl.dc_flag[0] = 'C';
+				stBrhDtl.result_flag[0] = SETTLE_BRH_SUCC;			  //	  0金额 入账成功
+			}
+			else	// 有可能stBrhDtl.result_flag[0] 为 '0', 这里金额大于'0', 状态改成'2'
+			{
+				stBrhDtl.dc_flag[0] = 'D';
+				stBrhDtl.result_flag[0] = SETTLE_BRH_NOT_DEAL;
+			}
+			cR_flag = stBrhDtl.result_flag[0];
+			cDc_flag = stBrhDtl.dc_flag[0];
+			EXEC SQL UPDATE TBL_BRH_SETTLE_DTL SET RESULT_FLAG = :cR_flag, SETTLE_AMT = :stBrhDtl.settle_amt,
+				UNREPAIR_AMT = :stBrhDtl.unrepair_amt, REPAIR_AMT = :stBrhDtl.repair_amt, UPERR_AMT = :stBrhDtl.uperr_amt, 
+				DC_FLAG = :cDc_flag WHERE ID = :stBrhDtl.id;
+		}
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新机构清算(%d)(%s), 机构号(%s)", SQL_UD_ERR, sDbsError(), 
+				stBrhDtl.settle_brh_id);
+			return RC_FAIL;
+		}
+
+		return RC_SUCC;
+	}
+
+	if(pstBrhDtl->settle_amt <= 0.00 )
+	{
+		pstBrhDtl->dc_flag[0] = 'C';
+		pstBrhDtl->result_flag[0] = SETTLE_BRH_SUCC;			  //	  0金额 入账成功
+	}
+	else
+		pstBrhDtl->dc_flag[0] = 'D';
+	memcpy(&stBrhDtl, pstBrhDtl, sizeof(stBrhDtl));
+
+	EXEC SQL INSERT INTO TBL_BRH_SETTLE_DTL VALUES (:stBrhDtl);
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "新增机构(%s)流水错误, err:(%d)(%s)", pstBrhDtl->settle_brh_id, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nSelectErrAmt(char *psStlmDate)								 	*/
+/*   功能  ： 从入账错误表中提取代理商明细数据									 	*/
+/*   参数  ： 输入无																*/
+/*		 ： 输出无																	*/
+/*  返回值 ： 0--  成功																*/
+/*		   -1--  失败																*/
+/************************************************************************************/
+int  nSelectErrAmt(char *pszSettleDate, char *pszSettleNum, char *pszBrhId)
+{
+	int	iRet, bInit = 0, iFlag = 0, iCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct tbl_brh_settle_dtl_c  stBrhDtl;
+	struct tbl_settle_err_c	  stStlErr;
+	char cFlag, cErr_type, szBrhId[20], szStlDate[10];
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szBrhId, 0, sizeof(szBrhId));
+	memset(szStlDate, 0, sizeof(szStlDate));
+	cFlag = SETTLE_ERR_TO_DONE;
+	cErr_type = SETTLE_ERR_FAILED;
+	strcpy(szBrhId, pszBrhId);
+	memcpy(szStlDate, pszSettleDate, 8);
+	memset(&stBrhDtl, 0, sizeof(stBrhDtl));
+	EXEC SQL DECLARE Cur_Tbl_settle_err CURSOR FOR
+		SELECT * FROM TBL_SETTLE_ERR WHERE DO_FLAG = :cFlag AND ERR_TYPE = :cErr_type 
+		AND SUBSTR(ID, 1, 1) = '9' AND SETTLE_BRH_ID = :szBrhId;
+	EXEC SQL OPEN Cur_Tbl_settle_err;
+	if( 0 != sqlca.sqlcode )
+	{
+		HtLog(ERR_PARAM, "查询上期入账本期参与清算机构错误, err:(%d)(%s).", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stStlErr, 0x00, sizeof(stStlErr));
+		EXEC SQL FETCH Cur_Tbl_settle_err INTO :stStlErr;
+		if(sqlca.sqlcode == DBS_NOTFOUND)
+		{
+			HtLog(NML_PARAM, "处理本期参与清算机构完成！");
+			break;
+		}
+		else if( 0 != sqlca.sqlcode )
+		{
+			HtLog(ERR_PARAM,  "查询本期参与清算机构失败, err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+			EXEC SQL CLOSE Cur_Tbl_settle_err;
+			return RC_FAIL;  
+		}
+		sTrimAll(stStlErr.id);
+		sTrimAll(stStlErr.settle_brh_id);
+		/* 非代理商 */
+		if(0 == strlen(stStlErr.settle_brh_id))	   
+			continue;
+
+		/* 预先初始化一条记录 */
+		if(0 == bInit)  
+		{
+			memcpy(stBrhDtl.brh, stStlErr.brh, sizeof(stBrhDtl.brh) - 1);
+			memcpy(stBrhDtl.settle_brh_id, stStlErr.settle_brh_id, sizeof(stBrhDtl.settle_brh_id) - 1);
+			g_nBrhNum ++;
+			bInit = 1;
+			iCount = 0;
+		}
+
+		stBrhDtl.uperr_amt += stStlErr.settle_amt;
+		stBrhDtl.settle_amt += stStlErr.settle_amt;
+		memcpy(stStlErr.rec_upd_ts, sGetCurrentTime(), sizeof(stStlErr.rec_upd_ts) - 1);
+
+		iCount ++;
+		/*  该代理商有 '1'- 参加清算 的记录, 全部清算, 更新标志 */
+		cFlag = SETTLE_ERR_SETTLE_SUCC;
+		EXEC SQL UPDATE TBL_SETTLE_ERR SET DO_FLAG = :cFlag, NEXT_DATE = :szStlDate, REC_UPD_TS = :stStlErr.rec_upd_ts
+			WHERE ID = :stStlErr.id;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新入账失败表本期参与清算记录状态失败，err:(%d)(%s), id(%s)", sqlca.sqlcode, sDbsError(),
+				stStlErr.id);
+			EXEC SQL CLOSE Cur_Tbl_settle_err;
+			return RC_FAIL;
+		}
+	}
+	
+	EXEC SQL CLOSE Cur_Tbl_settle_err;
+	/*  新的代理商有记录数 */
+	if(0 != iCount)
+	{
+		/* 转入机构清算明细 */
+		memcpy(stBrhDtl.rec_upd_ts, sGetCurrentTime(), sizeof(stBrhDtl.rec_upd_ts) - 1);
+		memcpy(stBrhDtl.rec_crt_ts, sGetCurrentTime(), sizeof(stBrhDtl.rec_crt_ts) - 1);
+		snprintf(stBrhDtl.id, sizeof(stBrhDtl.id), "%3s%8sB%08d", pszSettleNum + 1,
+			pszSettleDate, g_nBrhNum);
+		snprintf(stBrhDtl.trace_no, sizeof(stBrhDtl.trace_no), "%5s%3sB%06d",
+				pszSettleDate + 3, pszSettleNum + 1, g_nBrhNum);
+		memcpy(stBrhDtl.settle_date, pszSettleDate, sizeof(stBrhDtl.settle_date) - 1);
+		memcpy(stBrhDtl.settle_num, pszSettleNum, sizeof(stBrhDtl.settle_num) - 1);
+		stBrhDtl.result_flag[0] = SETTLE_BRH_INIT;
+		iRet = nGetRepairAmt(&stBrhDtl, pszSettleDate);
+		{
+			HtLog(ERR_PARAM, "检查参与清算机构是否有补帐失败, err:(%d)brh(%s)", iRet,
+				stBrhDtl.settle_brh_id);
+			return RC_FAIL;
+		}	
+		HtLog(NML_PARAM, "机构(%s)加入本期清算，本期参与清算金额(%.3f)真实清算金额(%.2f).", 
+			stBrhDtl.settle_brh_id, stBrhDtl.uperr_amt, stBrhDtl.settle_amt);
+		iRet = nInsertBrhSettle(&stBrhDtl, pszSettleDate);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "机构(%s)加入本期清算失败, err:(%d)", stBrhDtl.settle_brh_id, iRet);
+			return RC_FAIL;
+		}
+	}
+	
+	return RC_SUCC; 
+}
+
+/************************************************************************************/
+/*   声明  ： int nSelectRepairAmt(char *psStlmDate)								*/
+/*   功能  ： 从入账补帐表中提取代理商明细数据									  	*/
+/*   参数  ： 输入无																*/
+/*		 ： 输出无																	*/
+/*  返回值 ： 0--  成功															 	*/
+/*		   -1--  失败															 	*/
+/************************************************************************************/
+int nSelectRepairAmt(char *psStlmDate, char *pszSettleNum, char *pszBrhId)
+{
+	int	 iRet,iRet_sum, bInit = 0, iCount = 0, iFlag = 0;
+	double  amt = 0.0f, dRAmt = 0.00;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char cType, szBrhId[20];
+	struct tbl_stlm_repair_dtl_c	stRepair;
+	struct tbl_stlm_repair_sum_c	stRepair_sum;
+	struct tbl_brh_settle_dtl_c	stBrhDtl;
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szBrhId, 0, sizeof(szBrhId));
+	strcpy(szBrhId, pszBrhId);
+	cType = REPAIR_FLG_BRH;
+	EXEC SQL UPDATE TBL_STLM_REPAIR_DTL SET ID = ID WHERE APP_TYPE = :cType AND 
+		OPR_TYPE = '9' AND APP_ID = :szBrhId;
+	if( SQL_UD_ERR )
+	{
+		HtLog(ERR_PARAM, "锁表tbl_stlm_repair_dtl记录失败，iRet(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+
+	memset(&stBrhDtl, 0, sizeof(stBrhDtl));
+	EXEC SQL DECLARE Cur_Tbl_stlm_repair_dtl_2 CURSOR FOR
+		SELECT * FROM TBL_STLM_REPAIR_DTL WHERE APP_TYPE = :cType AND OPR_TYPE = '9' 
+		AND APP_ID = :szBrhId ORDER BY APP_ID, REC_CRT_TS;
+	EXEC SQL OPEN Cur_Tbl_stlm_repair_dtl_2;
+	if( 0 != sqlca.sqlcode )
+	{
+		HtLog(ERR_PARAM, "查询代理商补帐流水失败, err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stRepair, 0, sizeof(stRepair));
+		EXEC SQL FETCH Cur_Tbl_stlm_repair_dtl_2 INTO :stRepair;
+		if(SQLNOTFOUND)
+		{
+			HtLog(NML_PARAM, "代理商调帐/参与清算处理完成!");
+			break;
+		}
+		else if(0 != sqlca.sqlcode)
+		{
+			HtLog(NML_PARAM, "查询商户调帐/参与清算信息失败，err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+			EXEC SQL CLOSE Cur_Tbl_stlm_repair_dtl_2;
+			return RC_FAIL;
+		}
+
+		if(stRepair.opr_amt < 0.00)
+		{
+			HtLog(NML_PARAM, "调帐金额(%.2f)设置错误, 处理下一条调帐信息", stRepair.opr_amt);
+			continue;
+		}
+		
+		memset(&stRepair_sum, 0, sizeof(stRepair_sum));
+		EXEC SQL DECLARE Cur_Tbl_stlm_repair_sum_2 CURSOR FOR
+			SELECT A.* FROM TBL_STLM_REPAIR_SUM WHERE APP_ID = :stRepair.app_id AND APP_TYPE = :cType;
+		EXEC SQL OPEN Cur_Tbl_stlm_repair_sum_2;
+		if(sqlca.sqlcode)
+		{
+			HtLog(NML_PARAM, "查询代理商调帐汇总表失败【1】，err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+			continue;
+		}
+		else if(sqlca.sqlcode == DBS_NOTFOUND)
+		{
+			HtLog(NML_PARAM, "从没截留过，不能做解冻(%s), 处理下一条调帐信息", stRepair.app_id);
+			continue;
+		}
+		EXEC SQL FETCH Cur_Tbl_stlm_repair_sum_2 INTO :stRepair_sum;
+		EXEC SQL CLOSE Cur_Tbl_stlm_repair_sum_2;
+		if(stRepair_sum.unrepair_amt>0)
+		{
+			HtLog(NML_PARAM, "截留没有完成，不能做解冻(%s), 处理下一条调帐信息", stRepair.app_id);
+			continue;
+		}
+
+		sTrimAll(stRepair.app_id);
+		if(0 == bInit)
+		{
+			memset(&stBrhDtl, 0, sizeof(stBrhDtl));
+			memcpy(stBrhDtl.brh, stRepair.brh, sizeof(stBrhDtl.brh) - 1);
+			memcpy(stBrhDtl.settle_brh_id, stRepair.app_id, sizeof(stBrhDtl.settle_brh_id) - 1);
+			bInit = 1; 
+			iCount = 0; 
+		}
+
+		iCount ++;
+
+		/* 1 --处理后参加清算 */
+		memcpy(stRepair.rec_upd_ts, sGetCurrentTime(), sizeof(stRepair.rec_upd_ts) - 1);
+		memcpy(stRepair_sum.rec_upd_ts, sGetCurrentTime(), sizeof(stRepair_sum.rec_upd_ts) - 1);
+		stBrhDtl.settle_amt += stRepair.opr_amt;
+		stBrhDtl.unrepair_amt += stRepair.opr_amt;
+		stRepair_sum.unfreezesum += stRepair.opr_amt;
+		amt = stRepair_sum.prefreezesum-stRepair.opr_amt;
+		//dRAmt = stRepair_sum.surpunfreeze-stRepair.opr_amt;
+		EXEC SQL UPDATE TBL_STLM_REPAIR_DTL SET OPR_TYPE = '0', SETTLE_NUM = :stBrhDtl.settle_num, 
+			REC_UPD_TS = :stRepair.rec_upd_ts WHERE ID = :stRepair.id;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新调帐信息表失败, err:(%d)(%s)代理商 (%s)", sqlca.sqlcode, sDbsError(),
+				stBrhDtl.settle_brh_id);
+			EXEC SQL CLOSE Cur_Tbl_stlm_repair_dtl_2;
+			return RC_FAIL;
+		}
+		EXEC SQL UPDATE TBL_STLM_REPAIR_SUM SET UNFREEZESUM = :stRepair_sum.unfreezesum, PREFREEZESUM = :amt, 
+			REC_UPD_TS = :stRepair_sum.rec_upd_ts WHERE ID = :stRepair_sum.id;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新调帐汇总表失败, err:(%d)(%s)代理商 (%s)", sqlca.sqlcode, sDbsError(),
+				stBrhDtl.settle_brh_id);
+			EXEC SQL CLOSE Cur_Tbl_stlm_repair_dtl_2;
+			return RC_FAIL;
+		}
+	}
+
+	/* 提交还未 需要清算的代理商记录 */
+	if(0 != iCount)
+	{
+		memcpy(stBrhDtl.rec_crt_ts, sGetCurrentTime(), sizeof(stBrhDtl.rec_crt_ts) - 1);
+		memcpy(stBrhDtl.rec_upd_ts, sGetCurrentTime(), sizeof(stBrhDtl.rec_upd_ts) - 1);
+		snprintf(stBrhDtl.id, sizeof(stBrhDtl.id), "%3s%8sB%08d", pszSettleNum + 1,
+			psStlmDate, g_nBrhNum);
+
+		snprintf(stBrhDtl.trace_no, sizeof(stBrhDtl.trace_no), "%5s%3sB%06d",
+			psStlmDate + 3, pszSettleNum + 1, g_nBrhNum);
+
+		memcpy(stBrhDtl.settle_num, pszSettleNum, sizeof(stBrhDtl.settle_num) - 1);
+		memcpy(stBrhDtl.settle_date, psStlmDate, sizeof(stBrhDtl.settle_date) - 1);
+		stBrhDtl.result_flag[0] = SETTLE_BRH_INIT;
+
+		/* 查找本次代理商是否有清算记录，没有则新增，有则更新清算金额 */
+		HtLog(NML_PARAM, "代理商 (%s) 之后加入本期清算，本期参与清算金额(%.2f)调帐金额(%.2f)真实清算金额(%.2f).",
+			stBrhDtl.settle_brh_id, stBrhDtl.repair_amt, stBrhDtl.unrepair_amt, stBrhDtl.settle_amt);
+		iRet = nInsertBrhSettle(&stBrhDtl, psStlmDate);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "代理商 (%s) 本期清算失败, err:(%d)", stBrhDtl.settle_brh_id, iRet);
+			return RC_FAIL;
+		}
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： char*  sGetLastMon													*/
+/*   功能  ： 计算上个月月份 														*/
+/*   参数  ： pszDate		   --日期 												*/
+/*  返回值 ： 0--  成功															 	*/
+/*		   -1--  失败															 	*/
+/************************************************************************************/
+char*	sGetLastMon(char *pszDate)
+{
+	long	lYear = 0, lMon = 0;
+	char	szYear[5], szMon[5];
+	static	char	szLastMon[10];
+
+	/** 计算上个月月份**/
+	memset(szYear, 0, sizeof(szYear));
+	memset(szMon, 0, sizeof(szMon));
+	memcpy(szYear, pszDate, 4);
+	memcpy(szMon, pszDate + 4, 2);
+	lYear = atoi(szYear);
+	lMon = atoi(szMon);
+	if(lMon == 1)
+	{
+		lYear -= 1;
+		lMon = 12;
+	}
+	else
+		lMon -= 1;
+
+	memset(szLastMon, 0, sizeof(szLastMon));
+	snprintf(szLastMon, sizeof(szLastMon), "%04d%02d", lYear, lMon);
+
+	return szLastMon;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetMaxBrhId(long *plOut)											*/
+/*   功能  ： 机构清算分类表														*/
+/*   参数  ：																		*/
+/*		 ： plOut   			--输出最大ID										*/
+/*  返回值 ： 0--  成功															 	*/
+/*		   -1--  失败															 	*/
+/************************************************************************************/
+int	nGetMaxBrhId(long *plOut)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lSeq = 0;
+	EXEC SQL END DECLARE SECTION;
+	
+	EXEC SQL SELECT TBL_BRH_SETTLE_DTL_SEQ.NEXTVAL INTO :lSeq FROM dual;
+	if(0 != sqlca.sqlcode)
+	{
+		HtLog(ERR_PARAM, "获取序列数据失败, err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+	*plOut = lSeq;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int GenBrhInfile(char *psStlmDate)									*/
+/*   功能  ： 生成机构清算明细													  	*/
+/*   参数  ： 输入无																*/
+/*		 ： 输出无																	*/
+/*  返回值 ： 0--  成功															 	*/
+/*		   -1--  失败															 	*/
+/************************************************************************************/
+int GenBrhInfile(char *pszStlmDate, char *pszSettleNum, char *pszBrhId)
+{
+	int		iRet, iCount = 0, iInit = 0, lRes = 0;
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	cFlag1, cFlag2, cErr_type, szBrhId[20];
+	char	szStlmDate[9], szBefMon[7], cBrh_flag;
+	struct tbl_algo_dtl_c		stAlgoDtl;
+	struct tbl_brh_settle_dtl_c	stBrhDtl;
+	EXEC SQL END DECLARE SECTION;
+	
+	cFlag1 = SETTLE_ERR_TO_DONE;
+	cFlag2 = SETTLE_ERR_NOT_DEAL;
+	cErr_type = SETTLE_ERR_FAILED;
+	cBrh_flag = ALGO_BRH_FLAG_INIT;
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memcpy(szStlmDate, pszStlmDate, sizeof(szStlmDate) - 1);
+	snprintf(szBefMon, sizeof(szBefMon), "%s", sGetLastMon(pszStlmDate));
+	memset(szBrhId, 0, sizeof(szBrhId));
+	strcpy(szBrhId, pszBrhId);
+
+	HtLog(NML_PARAM, "开始清分机构上个月[%s]", szBefMon);
+	iRet = nGetMaxBrhId((long *)&g_nBrhNum);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "获取机构清算最大序号失败, err:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+
+	/*** 代理商清算信息 ***/
+	/* 将入账错误表中的 有清算代理商为'1'类的代理商，将其状态从为处理 改成 1、处理后参入下一批清算*/
+	EXEC SQL UPDATE TBL_SETTLE_ERR SET DO_FLAG = :cFlag1 WHERE DO_FLAG = :cFlag2 AND 
+		ERR_TYPE = :cErr_type AND SETTLE_BRH_ID IN(SELECT SETTLE_BRH_ID FROM TBL_SETTLE_ERR
+		WHERE DO_FLAG = :cFlag1 AND ERR_TYPE = :cErr_type AND SETTLE_BRH_ID = :szBrhId);
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "根据入账差错表参与清算装载更新未处理状态失败, err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+	EXEC SQL COMMIT WORK;
+	
+	EXEC SQL DECLARE Cur_Algo_dtl CURSOR FOR
+		SELECT * FROM TBL_ALGO_DTL WHERE BRH_FLAG = :cBrh_flag AND SUBSTR(TX_DATE,1,6) = :szBefMon 
+			AND SETTLE_BRH_ID = :szBrhId;
+	EXEC SQL OPEN Cur_Algo_dtl;
+	if(0 != sqlca.sqlcode)
+	{
+		HtLog(ERR_PARAM, "查询机构清分信息失败, err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stAlgoDtl, 0, sizeof(stAlgoDtl));
+		EXEC SQL FETCH Cur_Algo_dtl INTO :stAlgoDtl;
+		if(sqlca.sqlcode == DBS_NOTFOUND)
+		{
+			HtLog(NML_PARAM, "对清分表机构分润汇总完成！");
+			break;
+		}
+		else if(0 != sqlca.sqlcode)
+		{
+			HtLog(ERR_PARAM, "获取清分表机构分润信息失败，err:(%d)(%s)", sqlca.sqlcode, sDbsError());
+			EXEC SQL CLOSE Cur_Algo_dtl;
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;
+		}
+
+		sTrimAll(stAlgoDtl.settle_brh_id);  
+		iRet = lIsBrhSettle(stAlgoDtl.settle_brh_id, &lRes);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "查询机构(%s)是否清算标识失败, err:(%d)(%s)", stAlgoDtl.settle_brh_id, 
+				iRet, sGetError());
+			EXEC SQL CLOSE Cur_Algo_dtl;
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;
+		}
+		
+		if(TRUE != lRes)
+			continue;
+
+		sTrimAll(stAlgoDtl.tx_date);  
+		if(0 == iInit)
+		{
+			iCount = 0;
+			memset(&stBrhDtl, 0x00, sizeof(stBrhDtl));
+			memcpy(stBrhDtl.brh, stAlgoDtl.brno, sizeof(stBrhDtl.brh) - 1);
+			memcpy(stBrhDtl.settle_brh_id, stAlgoDtl.settle_brh_id, sizeof(stBrhDtl.settle_brh_id) - 1);
+			strcpy(stBrhDtl.tx_date, szBefMon);
+			iInit ++;
+			snprintf(stBrhDtl.trace_no, sizeof(stBrhDtl.trace_no), "%5s%3sB%06d",
+				szStlmDate + 3, pszSettleNum + 1, g_nBrhNum);
+		}
+		
+		sTrimAll(stAlgoDtl.id);
+		iCount ++;	  //   有效笔数 
+
+		/*  统计该代理商的总金额 */
+		stBrhDtl.tx_amt += stAlgoDtl.tx_amt;			  //  交易总金额
+		stBrhDtl.fee_amt += stAlgoDtl.fee_amt;			//  总手续费
+		stBrhDtl.cups_fee += stAlgoDtl.cup_fee;		   //  渠道总手续费
+		stBrhDtl.settle_amt += stAlgoDtl.brh_fee;		 //  机构手续费
+		stBrhDtl.base_amt += stAlgoDtl.base_amt;		  //  对外结算手续费
+		//stBrhDtl.other_fee += stAlgoDtl.other_fee;		//  其他金额
+		
+		/* 增加免额金额和免额金额手续费 */
+		stBrhDtl.free_amt += stAlgoDtl.free_amt;
+		stBrhDtl.free_fee += stAlgoDtl.free_fee;
+		
+		memcpy(stAlgoDtl.rec_upd_ts, sGetCurrentTime(), sizeof(stAlgoDtl.rec_upd_ts) - 1);		
+		
+		cBrh_flag = ALGO_BRH_FLAG_SUCC;
+		EXEC SQL UPDATE TBL_ALGO_DTL SET BRH_FLAG = :cBrh_flag, BRH_TRACE_NO = :stBrhDtl.trace_no, 
+			REC_UPD_TS = :stAlgoDtl.rec_upd_ts WHERE ID = :stAlgoDtl.id;
+		if(SQL_UD_ERR)	
+		{
+			HtLog(ERR_PARAM, "更新清分表数据失败, err:(%d)(%s), 清算机构号号(%s)", sqlca.sqlcode, sDbsError(),
+				stAlgoDtl.settle_brh_id);
+			EXEC SQL CLOSE Cur_Algo_dtl;
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;
+		}
+	}
+	if(0 != iCount)
+	{
+		memcpy(stBrhDtl.settle_num, pszSettleNum, sizeof(stBrhDtl.settle_num) - 1);
+		iRet = nInitBrhSettle(&stBrhDtl, szStlmDate, pszSettleNum, iCount);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "初始化机构分润明细数据失败, err:(%d)", iRet);
+			EXEC SQL CLOSE Cur_Algo_dtl;
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_Algo_dtl;
+	EXEC SQL COMMIT WORK;
+ 
+	/* 入账差错表中需要清算的记录清算 */
+	HtLog(NML_PARAM, "查询处理上期入账失败本期重新清算的商户金额.");
+	iRet = nSelectErrAmt(szStlmDate, pszSettleNum, pszBrhId);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "处理上期入账失败机构金额失败, err:(%d)", iRet);
+	   	EXEC SQL ROLLBACK WORK;
+		return RC_FAIL;
+	}
+	EXEC SQL COMMIT WORK;
+
+	/* 从补帐表要清算的记录清算 */
+	HtLog(NML_PARAM, "查询处理上期补帐本期归还清算的商户金额.");
+	iRet = nSelectRepairAmt(szStlmDate, pszSettleNum, pszBrhId);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "处理上期补帐本期归还清算的机构金额失败, err:(%d)", iRet);
+	   	EXEC SQL ROLLBACK WORK;
+	   	return RC_FAIL;
+	}
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "生成机构分润代发入账信息生成完成.\n");
+	return RC_SUCC;
+}

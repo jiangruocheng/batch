@@ -1,0 +1,151 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+
+#include "framework.h"
+
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_cup_succ.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL BEGIN DECLARE SECTION;
+TCupSucc g_cup_succ;
+EXEC SQL END DECLARE SECTION;
+
+typedef struct _BjnpFieldExtend
+{
+	char revoke[7];
+	char fd64[7];
+}BjnpFieldExtend;
+
+BjnpFieldExtend bjnp;
+
+
+void on_token_over(void* ctx, int index, const char* token)
+{
+	StatementField* fields = ((TokenCtx*)ctx)->field;
+	(void)fields;
+
+	TCupSucc* cup_succ = ((TokenCtx*)ctx)->cup_succ;
+
+	cup_succ->tx_amt = cup_succ->tx_amt / 100.00;
+	cup_succ->cup_fee = cup_succ->tx_amt - cup_succ->cup_fee / 100.00;
+
+	memcpy(cup_succ->tx_date, cup_succ->res, 8);
+	memcpy(cup_succ->tx_time, cup_succ->res + 8, 6);
+	memet(cup_succ->res, 0, sizeof(cup_succ->res));
+
+	cup_succ->result_flag[0] = '0';
+	strcpy(cup_succ->cups_no, "umpy");
+
+	sprintf(cup_succ->id, "%s%s%s", cup_succ->cups_no, cup_succ->tx_date, cup_succ->trace_no);
+	sprintf(cup_succ->cup_key, "%s%s%s", cup_succ->cups_no, cup_succ->tx_date, cup_succ->trace_no);
+
+	EXEC SQL INSERT INTO TBL_CUP_SUCC VALUES(:g_cup_succ);
+	if (SQLCODE) {
+		printf("%d,%s",SQLCODE, sDbsError());
+	}
+
+	memset(&g_cup_succ, 0, sizeof(TCupSucc));  //import!
+
+	return;
+}
+
+int on_line_find(void* ctx, int index, const char* line)
+{
+	if (index == 1)
+	{
+		printf("connect\n");
+		lDbsConnect(DBS_BATCH);
+
+		EXEC SQL DELETE FROM TBL_CUP_SUCC WHERE CUPS_NO = 'umpy';
+		lDbsCommit();
+		
+		return 0;
+	}	
+
+	if (line[0] >= '0' && line[0] <= '9')
+	{
+		delims_token_parse('|', on_token_find, on_token_over, ctx, (void*)line);	
+	}
+
+	return 0;
+}
+
+int on_line_over(void* ctx, int index, const char* line)
+{
+	printf("disconnect\n");
+
+	vDbsDisconnect();
+
+	return 0;
+}
+
+
+int main(int argc, const char* argv[])
+{
+
+	dbMchtBase	  stBase;
+	strcpy(stBase.mcht_no, "001310157320001");
+	long lRet = lGetMchtBase(&stBase, stBase.mcht_no);
+
+	int ret = 0;
+
+	memset(&g_cup_succ, 0, sizeof(g_cup_succ));
+
+	StatementField fields[] = 
+	{
+		{1, STRING,	0},
+		{2,	STRING,	0},
+		{3,	STRING,	0},
+		{4,	STRING,	0},
+		{5,	STRING,	0},
+		{7,	FLOAT,	0},
+		{8,	FLOAT,	0},
+		{10,STRING,	0},
+		{-1,NONE,	NULL}
+	};
+
+	X x[] = 
+	{
+		{"fill", 1, STRING,	0},
+		{"term_no", 2,	STRING,	0},
+		{"res", 3,	STRING,	0},
+		{"trace_no", 4,	STRING,	0},
+		{"ac_no", 5,	STRING,	0},
+		{"tx_amt", 7,	FLOAT,	0},
+		{"cup_fee", 8,	FLOAT,	0},
+		{"sys_ref_no", 10,STRING, 0},
+		{"", -1,NONE,	NULL}
+	};
+
+	relocate_cupsucc(&g_cup_succ, x);
+
+	assert(&g_cup_succ.sys_ref_no == x[7].addr);
+
+//---
+	fields[0].addr = x[0].addr;
+	fields[1].addr = x[1].addr;
+	fields[2].addr = x[2].addr;
+	fields[3].addr = x[3].addr;
+	fields[4].addr = x[4].addr;
+	fields[5].addr = x[5].addr;
+	fields[6].addr = x[6].addr;
+	fields[7].addr = x[7].addr;
+
+	TokenCtx token_ctx = {.cup_succ = &g_cup_succ, fields};
+	
+	ret = fileline_foreach("report.txt", on_line_find, on_line_over, &token_ctx);
+
+	(void)ret;
+
+	return 0;
+}

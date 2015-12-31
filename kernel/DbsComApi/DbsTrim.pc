@@ -1,0 +1,410 @@
+#include	"DbsApi.h"
+
+/*******************************************************************************
+	去掉表TBL_N_TXN空格
+ *******************************************************************************/
+void	vTrimNTxn(TNTxn *pstNTxn)
+{
+	sTrimRight(pstNTxn->id);
+	sTrimRight(pstNTxn->tx_date);
+	sTrimRight(pstNTxn->tx_time);
+	sTrimRight(pstNTxn->trace_no);
+	sTrimRight(pstNTxn->ibox_no);
+	sTrimRight(pstNTxn->order_no);
+	sTrimRight(pstNTxn->cups_no);
+	sTrimRight(pstNTxn->ac_no);
+	sTrimRight(pstNTxn->export_flag);
+	sTrimRight(pstNTxn->ac_bank_no);
+	sTrimRight(pstNTxn->tx_code);
+	sTrimRight(pstNTxn->tx_name);
+	sTrimRight(pstNTxn->tx_sub_code);
+	sTrimRight(pstNTxn->brno);
+	sTrimRight(pstNTxn->longitude);
+	sTrimRight(pstNTxn->latitude);
+	sTrimRight(pstNTxn->sw_respcd);
+	sTrimRight(pstNTxn->ibox_respcd);
+	sTrimRight(pstNTxn->stat);
+	sTrimRight(pstNTxn->brf);
+	sTrimRight(pstNTxn->fill);
+	sTrimRight(pstNTxn->fd3);
+	sTrimRight(pstNTxn->fd7);
+	sTrimRight(pstNTxn->ibox11);
+	sTrimRight(pstNTxn->fd11);
+	sTrimRight(pstNTxn->fd12);
+	sTrimRight(pstNTxn->fd13);
+	sTrimRight(pstNTxn->fd15);
+	sTrimRight(pstNTxn->ibox18);
+	sTrimRight(pstNTxn->fd18);
+	sTrimRight(pstNTxn->fd19);
+	sTrimRight(pstNTxn->fd22);
+	sTrimRight(pstNTxn->fd23);
+	sTrimRight(pstNTxn->fd25);
+	sTrimRight(pstNTxn->fd28);
+	sTrimRight(pstNTxn->fd32);
+	sTrimRight(pstNTxn->fd33);
+	sTrimRight(pstNTxn->fd35);
+	sTrimRight(pstNTxn->fd36);
+	sTrimRight(pstNTxn->fd37);
+	sTrimRight(pstNTxn->fd38);
+	sTrimRight(pstNTxn->fd39);
+	sTrimRight(pstNTxn->ibox41);
+	sTrimRight(pstNTxn->fd41);
+	sTrimRight(pstNTxn->ibox42);
+	sTrimRight(pstNTxn->fd42);
+	sTrimRight(pstNTxn->ibox43);
+	sTrimRight(pstNTxn->fd43);
+	sTrimRight(pstNTxn->fd49);
+	sTrimRight(pstNTxn->fd55);
+	sTrimRight(pstNTxn->fd60);
+	sTrimRight(pstNTxn->fd61);
+	sTrimRight(pstNTxn->fd90_1);
+	sTrimRight(pstNTxn->fd90_2);
+	sTrimRight(pstNTxn->fd90_3);
+	sTrimRight(pstNTxn->fd90_4);
+	sTrimRight(pstNTxn->fd90_5);
+	sTrimRight(pstNTxn->fd100);
+	sTrimRight(pstNTxn->fd102);
+	sTrimRight(pstNTxn->fd103);
+	sTrimRight(pstNTxn->fdxx);
+	sTrimRight(pstNTxn->fdxxx);
+	sTrimRight(pstNTxn->errstr);
+	sTrimRight(pstNTxn->resv2);
+	sTrimRight(pstNTxn->resv3);
+	sTrimRight(pstNTxn->ibox_batch_no);
+	sTrimRight(pstNTxn->ibox60);
+	sTrimRight(pstNTxn->ibox61);
+	sTrimRight(pstNTxn->ibox62);
+	sTrimRight(pstNTxn->batch_no);
+	sTrimRight(pstNTxn->fd44);
+	sTrimRight(pstNTxn->fd62);
+	sTrimRight(pstNTxn->rsp_fd55);
+	sTrimRight(pstNTxn->inst_date);
+	sTrimRight(pstNTxn->updt_date);
+	sTrimRight(pstNTxn->ibox42_lsd);
+	sTrimRight(pstNTxn->ibox43_lsd);
+	sTrimRight(pstNTxn->servetype);
+	sTrimRight(pstNTxn->promtsmode);
+	sTrimRight(pstNTxn->settlemode);
+}
+
+/*******************************************************************************
+	去掉表TBL_ORDER_INF空格
+ *******************************************************************************/
+void	vTrimOrderInf(TOrderInf *pstOrderInf)
+{
+	sTrimRight(pstOrderInf->tx_date);
+	sTrimRight(pstOrderInf->bar_code);
+	sTrimRight(pstOrderInf->cups_no);
+	sTrimRight(pstOrderInf->order_no_out);
+	sTrimRight(pstOrderInf->order_no);
+	sTrimRight(pstOrderInf->stat);
+	sTrimRight(pstOrderInf->term_no);
+	sTrimRight(pstOrderInf->brh_no);
+	sTrimRight(pstOrderInf->mcht_no);
+	sTrimRight(pstOrderInf->mcht_nm);
+	sTrimRight(pstOrderInf->card_no);
+	sTrimRight(pstOrderInf->reserve1);
+	sTrimRight(pstOrderInf->reserve2);
+}
+
+/*******************************************************************************
+	去掉表TBL_TXN_SUCC空格
+ *******************************************************************************/
+void	vTrimTxnSucc(TTxnSucc *pstTxnSucc)
+{
+	sTrimRight(pstTxnSucc->id);
+	sTrimRight(pstTxnSucc->tx_date);
+	sTrimRight(pstTxnSucc->tx_time);
+	sTrimRight(pstTxnSucc->trace_no);
+	sTrimRight(pstTxnSucc->cup_key);
+	sTrimRight(pstTxnSucc->result_flag);
+	sTrimRight(pstTxnSucc->ibox_no);
+	sTrimRight(pstTxnSucc->order_no);
+	sTrimRight(pstTxnSucc->cups_no);
+	sTrimRight(pstTxnSucc->ac_no);
+	sTrimRight(pstTxnSucc->tx_code);
+	sTrimRight(pstTxnSucc->tx_sub_code);
+	sTrimRight(pstTxnSucc->brno);
+	sTrimRight(pstTxnSucc->longitude);
+	sTrimRight(pstTxnSucc->latitude);
+	sTrimRight(pstTxnSucc->sw_respcd);
+	sTrimRight(pstTxnSucc->ibox_respcd);
+	sTrimRight(pstTxnSucc->stat);
+	sTrimRight(pstTxnSucc->brf);
+	sTrimRight(pstTxnSucc->fill);
+	sTrimRight(pstTxnSucc->fd3);
+	sTrimRight(pstTxnSucc->fd7);
+	sTrimRight(pstTxnSucc->ibox11);
+	sTrimRight(pstTxnSucc->fd11);
+	sTrimRight(pstTxnSucc->fd12);
+	sTrimRight(pstTxnSucc->fd13);
+	sTrimRight(pstTxnSucc->fd15);
+	sTrimRight(pstTxnSucc->ibox18);
+	sTrimRight(pstTxnSucc->fd28);
+	sTrimRight(pstTxnSucc->fd37);
+	sTrimRight(pstTxnSucc->fd38);
+	sTrimRight(pstTxnSucc->fd39);
+	sTrimRight(pstTxnSucc->ibox41);
+	sTrimRight(pstTxnSucc->fd41);
+	sTrimRight(pstTxnSucc->ibox42);
+	sTrimRight(pstTxnSucc->fd42);
+	sTrimRight(pstTxnSucc->ibox43);
+	sTrimRight(pstTxnSucc->fd43);
+	sTrimRight(pstTxnSucc->fd49);
+	sTrimRight(pstTxnSucc->fd60);
+	sTrimRight(pstTxnSucc->fd100);
+	sTrimRight(pstTxnSucc->fd102);
+	sTrimRight(pstTxnSucc->fd103);
+	sTrimRight(pstTxnSucc->fdxx);
+	sTrimRight(pstTxnSucc->fdxxx);
+	sTrimRight(pstTxnSucc->ibox_batch_no);
+	sTrimRight(pstTxnSucc->servetype);
+	sTrimRight(pstTxnSucc->promtsmode);
+	sTrimRight(pstTxnSucc->fd62);
+	sTrimRight(pstTxnSucc->settlemode);
+	sTrimRight(pstTxnSucc->user_name);
+	sTrimRight(pstTxnSucc->user_phone);
+	sTrimRight(pstTxnSucc->user_email);
+}
+
+/*******************************************************************************
+	去掉表TBL_CUP_SUCC空格
+ *******************************************************************************/
+void	vTrimCupSucc(TCupSucc *pstCupSucc)
+{
+	sTrimRight(pstCupSucc->id);
+	sTrimRight(pstCupSucc->stlm_date);
+	sTrimRight(pstCupSucc->tx_date);
+	sTrimRight(pstCupSucc->tx_time);
+	sTrimRight(pstCupSucc->trace_no);
+	sTrimRight(pstCupSucc->cup_key);
+	sTrimRight(pstCupSucc->result_flag);
+	sTrimRight(pstCupSucc->cups_no);
+	sTrimRight(pstCupSucc->term_no);
+	sTrimRight(pstCupSucc->ac_no);
+	sTrimRight(pstCupSucc->ac_bank_no);
+	sTrimRight(pstCupSucc->tx_code);
+	sTrimRight(pstCupSucc->sys_ref_no);
+	sTrimRight(pstCupSucc->brf);
+	sTrimRight(pstCupSucc->fill);
+	sTrimRight(pstCupSucc->rec_crt_ts);
+	sTrimRight(pstCupSucc->rec_upd_ts);
+	sTrimRight(pstCupSucc->res);
+	sTrimRight(pstCupSucc->cups_nm);
+	sTrimRight(pstCupSucc->ac_bank_name);
+}
+
+/*******************************************************************************
+	去掉表TBL_STLM_SUCC空格
+ *******************************************************************************/
+void	vTrimStlmSucc(TStlmSucc *pstStlmSucc)
+{
+	sTrimRight(pstStlmSucc->id);
+	sTrimRight(pstStlmSucc->stlm_date);
+	sTrimRight(pstStlmSucc->tx_date);
+	sTrimRight(pstStlmSucc->tx_time);
+	sTrimRight(pstStlmSucc->trace_no);
+	sTrimRight(pstStlmSucc->result_flag);
+	sTrimRight(pstStlmSucc->ibox_no);
+	sTrimRight(pstStlmSucc->order_no);
+	sTrimRight(pstStlmSucc->cups_no);
+	sTrimRight(pstStlmSucc->ac_no);
+	sTrimRight(pstStlmSucc->ac_bank_no);
+	sTrimRight(pstStlmSucc->tx_code);
+	sTrimRight(pstStlmSucc->tx_name);
+	sTrimRight(pstStlmSucc->tx_sub_code);
+	sTrimRight(pstStlmSucc->brno);
+	sTrimRight(pstStlmSucc->longitude);
+	sTrimRight(pstStlmSucc->latitude);
+	sTrimRight(pstStlmSucc->sw_respcd);
+	sTrimRight(pstStlmSucc->ibox_respcd);
+	sTrimRight(pstStlmSucc->fd3);
+	sTrimRight(pstStlmSucc->fd7);
+	sTrimRight(pstStlmSucc->ibox11);
+	sTrimRight(pstStlmSucc->fd11);
+	sTrimRight(pstStlmSucc->fd12);
+	sTrimRight(pstStlmSucc->fd13);
+	sTrimRight(pstStlmSucc->fd15);
+	sTrimRight(pstStlmSucc->ibox18);
+	sTrimRight(pstStlmSucc->fd28);
+	sTrimRight(pstStlmSucc->fd37);
+	sTrimRight(pstStlmSucc->fd38);
+	sTrimRight(pstStlmSucc->fd39);
+	sTrimRight(pstStlmSucc->ibox41);
+	sTrimRight(pstStlmSucc->fd41);
+	sTrimRight(pstStlmSucc->ibox42);
+	sTrimRight(pstStlmSucc->fd42);
+	sTrimRight(pstStlmSucc->ibox43);
+	sTrimRight(pstStlmSucc->fd43);
+	sTrimRight(pstStlmSucc->fd49);
+	sTrimRight(pstStlmSucc->fd60);
+	sTrimRight(pstStlmSucc->fd100);
+	sTrimRight(pstStlmSucc->fd102);
+	sTrimRight(pstStlmSucc->fd103);
+	sTrimRight(pstStlmSucc->rec_crt_ts);
+	sTrimRight(pstStlmSucc->rec_upd_ts);
+	sTrimRight(pstStlmSucc->fdxx);
+	sTrimRight(pstStlmSucc->fdxxx);
+	sTrimRight(pstStlmSucc->servetype);
+	sTrimRight(pstStlmSucc->promtsmode);
+	sTrimRight(pstStlmSucc->settlemode);
+	sTrimRight(pstStlmSucc->settle_mcht_nm);
+	sTrimRight(pstStlmSucc->ibox42_mcht_nm);
+	sTrimRight(pstStlmSucc->settle_brh_name);
+	sTrimRight(pstStlmSucc->trade_brh_name);
+	sTrimRight(pstStlmSucc->expand_name);
+}
+
+/*******************************************************************************
+	去掉表TBL_STLM_ERR空格
+ *******************************************************************************/
+void	vTrimStlmErr(TStlmErr *pstStlmErr)
+{
+	sTrimRight(pstStlmErr->id);
+	sTrimRight(pstStlmErr->stlm_date);
+	sTrimRight(pstStlmErr->tx_date);
+	sTrimRight(pstStlmErr->tx_time);
+	sTrimRight(pstStlmErr->trace_no);
+	sTrimRight(pstStlmErr->result_flag);
+	sTrimRight(pstStlmErr->opr_date);
+	sTrimRight(pstStlmErr->next_date);
+	sTrimRight(pstStlmErr->next_do);
+	sTrimRight(pstStlmErr->err_type);
+	sTrimRight(pstStlmErr->err_desc);
+	sTrimRight(pstStlmErr->stlm_type);
+	sTrimRight(pstStlmErr->ibox_no);
+	sTrimRight(pstStlmErr->order_no);
+	sTrimRight(pstStlmErr->cups_no);
+	sTrimRight(pstStlmErr->ac_no);
+	sTrimRight(pstStlmErr->ac_bank_no);
+	sTrimRight(pstStlmErr->tx_code);
+	sTrimRight(pstStlmErr->tx_name);
+	sTrimRight(pstStlmErr->tx_sub_code);
+	sTrimRight(pstStlmErr->brno);
+	sTrimRight(pstStlmErr->longitude);
+	sTrimRight(pstStlmErr->latitude);
+	sTrimRight(pstStlmErr->sys_ref_no);
+	sTrimRight(pstStlmErr->ibox41);
+	sTrimRight(pstStlmErr->fd41);
+	sTrimRight(pstStlmErr->ibox42);
+	sTrimRight(pstStlmErr->fd42);
+	sTrimRight(pstStlmErr->ibox43);
+	sTrimRight(pstStlmErr->fd43);
+	sTrimRight(pstStlmErr->rec_crt_ts);
+	sTrimRight(pstStlmErr->rec_upd_ts);
+	sTrimRight(pstStlmErr->fdxx);
+	sTrimRight(pstStlmErr->fdxxx);
+	sTrimRight(pstStlmErr->settle_num);
+	sTrimRight(pstStlmErr->load_date);
+	sTrimRight(pstStlmErr->settlemode);
+	sTrimRight(pstStlmErr->mcht_name);
+	sTrimRight(pstStlmErr->expand_name);
+	sTrimRight(pstStlmErr->brh_name);
+	sTrimRight(pstStlmErr->opr_name);
+	sTrimRight(pstStlmErr->user_name);
+	sTrimRight(pstStlmErr->user_phone);
+	sTrimRight(pstStlmErr->user_email);
+	sTrimRight(pstStlmErr->stlm_s0isdeal);
+}
+
+/*******************************************************************************
+	去掉表TBL_ALGO_DTL空格
+ *******************************************************************************/
+void	vTrimAlgoDtl(TAlgoDtl *pstAlgoDtl)
+{
+	sTrimRight(pstAlgoDtl->id);
+	sTrimRight(pstAlgoDtl->stlm_date);
+	sTrimRight(pstAlgoDtl->algo_date);
+	sTrimRight(pstAlgoDtl->tx_date);
+	sTrimRight(pstAlgoDtl->tx_time);
+	sTrimRight(pstAlgoDtl->trace_no);
+	sTrimRight(pstAlgoDtl->mcht_batch_no);
+	sTrimRight(pstAlgoDtl->mcht_trace_no);
+	sTrimRight(pstAlgoDtl->mcht_flag);
+	sTrimRight(pstAlgoDtl->brh_batch_no);
+	sTrimRight(pstAlgoDtl->brh_trace_no);
+	sTrimRight(pstAlgoDtl->brh_flag);
+	sTrimRight(pstAlgoDtl->ibox_no);
+	sTrimRight(pstAlgoDtl->order_no);
+	sTrimRight(pstAlgoDtl->cups_no);
+	sTrimRight(pstAlgoDtl->ac_no);
+	sTrimRight(pstAlgoDtl->ac_bank_no);
+	sTrimRight(pstAlgoDtl->brno);
+	sTrimRight(pstAlgoDtl->longitude);
+	sTrimRight(pstAlgoDtl->latitude);
+	sTrimRight(pstAlgoDtl->tx_code);
+	sTrimRight(pstAlgoDtl->tx_name);
+	sTrimRight(pstAlgoDtl->tx_sub_code);
+	sTrimRight(pstAlgoDtl->settle_brh_id);
+	sTrimRight(pstAlgoDtl->ibox41);
+	sTrimRight(pstAlgoDtl->ibox42);
+	sTrimRight(pstAlgoDtl->settle_mcht);
+	sTrimRight(pstAlgoDtl->settle_disc);
+	sTrimRight(pstAlgoDtl->rec_crt_ts);
+	sTrimRight(pstAlgoDtl->rec_upd_ts);
+	sTrimRight(pstAlgoDtl->fdxx);
+	sTrimRight(pstAlgoDtl->fdxxx);
+	sTrimRight(pstAlgoDtl->settle_num);
+	sTrimRight(pstAlgoDtl->mcht_serve_type);
+	sTrimRight(pstAlgoDtl->mcht_mcc_grp);
+	sTrimRight(pstAlgoDtl->mcht_type);
+	sTrimRight(pstAlgoDtl->trans_type);
+	sTrimRight(pstAlgoDtl->mcht_grp);
+	sTrimRight(pstAlgoDtl->class_id);
+	sTrimRight(pstAlgoDtl->class_remark);
+	sTrimRight(pstAlgoDtl->servetype);
+	sTrimRight(pstAlgoDtl->promts_mode);
+	sTrimRight(pstAlgoDtl->settlemode);
+	sTrimRight(pstAlgoDtl->settle_mcht_nm);
+	sTrimRight(pstAlgoDtl->ibox42_mcht_nm);
+	sTrimRight(pstAlgoDtl->settle_brh_name);
+	sTrimRight(pstAlgoDtl->trade_brh_name);
+	sTrimRight(pstAlgoDtl->expand_name);
+	sTrimRight(pstAlgoDtl->ibox11);
+}
+
+/*******************************************************************************
+	去掉表TBL_MCHT_SETTLE_DTL空格
+ *******************************************************************************/
+void	vTrimMchtSettleDtl(TMchtSettleDtl *pstMchtSettleDtl)
+{
+	sTrimRight(pstMchtSettleDtl->id);
+	sTrimRight(pstMchtSettleDtl->settle_date);
+	sTrimRight(pstMchtSettleDtl->in_date);
+	sTrimRight(pstMchtSettleDtl->tx_date);
+	sTrimRight(pstMchtSettleDtl->batch_no);
+	sTrimRight(pstMchtSettleDtl->trace_no);
+	sTrimRight(pstMchtSettleDtl->result_flag);
+	sTrimRight(pstMchtSettleDtl->result_desc);
+	sTrimRight(pstMchtSettleDtl->dc_flag);
+	sTrimRight(pstMchtSettleDtl->ibox42);
+	sTrimRight(pstMchtSettleDtl->rec_crt_ts);
+	sTrimRight(pstMchtSettleDtl->rec_upd_ts);
+	sTrimRight(pstMchtSettleDtl->res);
+	sTrimRight(pstMchtSettleDtl->settle_num);
+	sTrimRight(pstMchtSettleDtl->brh);
+	sTrimRight(pstMchtSettleDtl->trace_all);
+	sTrimRight(pstMchtSettleDtl->cups_no);
+}
+
+/*******************************************************************************
+	去掉表TBL_BAT_MAIN_CTL_DTL空格
+ *******************************************************************************/
+void	vTrimBatMainCtlDtl(TBatMainCtlDtl *pstBatMainCtlDtl)
+{
+	sTrimRight(pstBatMainCtlDtl->id);
+	sTrimRight(pstBatMainCtlDtl->date_settlmt);
+	sTrimRight(pstBatMainCtlDtl->settle_num);
+	sTrimRight(pstBatMainCtlDtl->bat_id);
+	sTrimRight(pstBatMainCtlDtl->bat_proc_name);
+	sTrimRight(pstBatMainCtlDtl->bat_state);
+	sTrimRight(pstBatMainCtlDtl->task_assign_state);
+	sTrimRight(pstBatMainCtlDtl->task_start_flg);
+	sTrimRight(pstBatMainCtlDtl->bat_dsp);
+	sTrimRight(pstBatMainCtlDtl->bat_note);
+	sTrimRight(pstBatMainCtlDtl->rec_opr_id);
+	sTrimRight(pstBatMainCtlDtl->rec_upd_opr);
+	sTrimRight(pstBatMainCtlDtl->rec_crt_ts);
+	sTrimRight(pstBatMainCtlDtl->rec_upd_ts);
+}
+

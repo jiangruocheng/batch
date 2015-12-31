@@ -1,0 +1,254 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取客户表TBL_ACCT_INFO启动内存大小	
+ ****************************************************************************************/
+long	lDefine_AcctInfo(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lSize = 0, lCount = 0, lDefault = 1, lAppType = 1;
+	char	szFlag[2], szSettleNum[5], szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	szFlag[0] = '0';
+	memcpy(szSettleNum, pszSettleNum, 4);
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM
+		(SELECT * FROM TBL_ACCT_INFO WHERE (APP_ID IN 
+			(SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum)) 
+			AND ACCT_FLAG = :szFlag AND ACCT_DEFAULT = :lDefault
+		UNION
+		SELECT * FROM TBL_ACCT_INFO WHERE APP_TYPE = :lAppType AND ACCT_FLAG = :szFlag 
+			AND ACCT_DEFAULT = :lDefault);
+   	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbAcctInfo), &lSize))
+	   	return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbAcctInfo, acct_id, FIELD_LONG))
+	{	
+		HtLog(ERR_PARAM, "设置表(%s)字段(acct_id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(app_type)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, app_type, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(app_type)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(app_id)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, app_id, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(app_id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_type)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, acct_type, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(t)字段(acct_type)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_default)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, acct_default, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(t)字段(acct_default)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, acct_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(acct_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_bank_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, acct_bank_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(acct_bank_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_zbank_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, acct_zbank_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(acct_zbank_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_zbank_code)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, acct_zbank_code, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(acct_zbank_code)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_net_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, acct_net_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(acct_net_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(acct_union_no)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbAcctInfo, acct_union_no, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(acct_union_no)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_ACCT_INFO 
+ ****************************************************************************************/
+long	lLoad_AcctInfo(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0, lRes = RC_SUCC;
+	char	*pszIdx = NULL;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	long			lDefault = 1, lAppType = 1;	
+	dbAcctInfo		stAct;
+	char			szFlag[2], szSettleNum[5], szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleNum, pszSettleNum, 4);
+	szFlag[0] = '0';
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL DECLARE Cur_acct_info CURSOR FOR SELECT NVL(ACCT_ID, 0), NVL(APP_TYPE, 0), 
+		NVL(APP_ID, ' '),  NVL(ACCT_DEFAULT, 1), NVL(ACCT_TYPE, 0), NVL(ACCT_NO, ' '), 
+		NVL(ACCT_NM, ' '), NVL(ACCT_BANK_NO, ' '), NVL(ACCT_BANK_NM, ' '), NVL(ACCT_ZBANK_NO, ' '), NVL(ACCT_ZBANK_NM, ' '), 
+		NVL(ACCT_ZBANK_ADDR, ' '), NVL(ACCT_ZBANK_CODE, ' '), NVL(ACCT_NET_NO, ' '), NVL(ACCT_UNION_NO, ' ')
+		FROM 
+		(SELECT * FROM TBL_ACCT_INFO WHERE (APP_ID IN (SELECT IBOX42 FROM TBL_MEM_MCHT_CUR WHERE SETTLE_NUM = :szSettleNum))
+	  		AND ACCT_FLAG = :szFlag AND ACCT_DEFAULT = :lDefault
+ 		UNION
+ 		SELECT * FROM TBL_ACCT_INFO WHERE APP_TYPE = :lAppType AND ACCT_FLAG = :szFlag AND ACCT_DEFAULT = :lDefault)
+		ORDER BY APP_ID;
+
+	EXEC SQL OPEN Cur_acct_info;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表Tbl_acct_info错误, (%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(&stAct, 0, sizeof(stAct));
+		EXEC SQL FETCH Cur_acct_info INTO :stAct.acct_id, :stAct.app_type, :stAct.app_id, :stAct.acct_default, 
+			:stAct.acct_type, :stAct.acct_no, :stAct.acct_nm, :stAct.acct_bank_no, :stAct.acct_bank_nm, 
+			:stAct.acct_zbank_no, :stAct.acct_zbank_nm, :stAct.acct_zbank_addr, :stAct.acct_zbank_code, 
+			:stAct.acct_net_no, :stAct.acct_union_no;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_acct_info; 
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;	
+
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载(%d)<(%d)!", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_acct_info; 
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		
+		sTrimAll(stAct.app_id);	
+		sTrimAll(stAct.acct_type);	
+		sTrimAll(stAct.acct_no);	
+		sTrimAll(stAct.acct_nm);	
+		sTrimAll(stAct.acct_bank_no);	
+		sTrimAll(stAct.acct_bank_nm);	
+		sTrimAll(stAct.acct_zbank_no);	
+		sTrimAll(stAct.acct_zbank_nm);	
+		sTrimAll(stAct.acct_zbank_addr);	
+		sTrimAll(stAct.acct_zbank_code);	
+		sTrimAll(stAct.acct_net_no);	
+		sTrimAll(stAct.acct_union_no);	
+		stAct.acct_id = lSetEXLong(stAct.acct_id);
+		stAct.app_type = lSetEXLong(stAct.app_type);
+		stAct.acct_default = lSetEXLong(stAct.acct_default);
+
+		//	deubg
+		if(0 == strlen(stAct.acct_zbank_no))
+			HtLog(ERR_PARAM, "APPID(%s)账号(%s)支行号为空(%s)", stAct.app_id, stAct.acct_no, stAct.acct_zbank_no);
+
+		pszIdx = sGetComIdx(stAct.app_id, sizeof(stAct.app_id) - 1, stAct.app_type, 
+			stAct.acct_default);
+		if(!pszIdx)
+		{
+			HtLog(ERR_PARAM, "设置组合索引错误:(%s)", sGetError());
+			vDestroyTree(pstRoot);
+			EXEC SQL CLOSE Cur_acct_info; 
+			return RC_FAIL;
+		}
+
+		pstRoot = (Tree *)pInsertTree(pstRoot, pszIdx, ++(pGetTblDef(t)->lTreeNode), 0, 
+			MAX_INDEX_LEN, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载表(%s)账号(%s)失败, 原因:%s", sGetTableName(t), stAct.app_id, 
+				sGetError());
+			EXEC SQL CLOSE Cur_acct_info; 
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		if(RC_SUCC != IBPInsertData(t, &stAct, sizeof(stAct)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t), 
+				stAct.app_id, sGetError());
+			EXEC SQL CLOSE Cur_acct_info; 
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}  
+	EXEC SQL CLOSE Cur_acct_info; 
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

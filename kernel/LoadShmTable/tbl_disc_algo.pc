@@ -1,0 +1,155 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取客户表TBL_DISC_ALGO启动内存大小
+ ****************************************************************************************/
+long	lDefine_DiscAlgo(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100], szFlag[2];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	szFlag[0] = '0';
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_DISC_ALGO WHERE DISC_ID IN (
+		SELECT DISC_ID FROM TBL_DISC_INFO WHERE DISC_FLAG = :szFlag );
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbDisc), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbDisc, id, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(disc_id)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbDisc, disc_id, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(disc_id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(index_num)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbDisc, index_num, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(index_num)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(flag)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbDisc, flag, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(flag)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(card_type)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbDisc, card_type, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(card_type)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	fprintf(stdout, "建立%s表完成 ... success\n", szTable);
+	return lSize;
+}
+
+/****************************************************************************************
+	加载客户表TBL_DISC_ALGO
+ ****************************************************************************************/
+long	lLoad_DiscAlgo(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	dbDisc	stDisc;
+	char	szFlag[2];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szFlag, 0, sizeof(szFlag));
+	szFlag[0] = '0';
+
+	EXEC SQL DECLARE Cur_disc_algo CURSOR FOR 
+		SELECT NVL(ID, 0), NVL(DISC_ID, ' '), NVL(INDEX_NUM, 0),  NVL(MIN_FEE, 0.00), 
+			NVL(MAX_FEE, 0.00), NVL(FLOOR_AMOUNT, 0.00), NVL(UPPER_AMOUNT, 0.00), 
+			NVL(FLAG, 0), NVL(FEE_VALUE, 0), NVL(CARD_TYPE, 0)
+		FROM TBL_DISC_ALGO WHERE DISC_ID IN 
+			(SELECT DISC_ID FROM TBL_DISC_INFO WHERE DISC_FLAG = :szFlag) 
+		ORDER BY DISC_ID, UPPER_AMOUNT;
+
+	EXEC SQL OPEN Cur_disc_algo;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);	
+	while(1)
+	{
+		memset(&stDisc, 0, sizeof(stDisc));
+		EXEC SQL FETCH Cur_disc_algo INTO :stDisc.id, :stDisc.disc_id, :stDisc.index_num,
+			:stDisc.min_fee, :stDisc.max_fee, :stDisc.floor_amount, :stDisc.upper_amount,
+			:stDisc.flag, :stDisc.fee_value, :stDisc.card_type;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_disc_algo;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载(%d)<(%d)!", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_disc_algo;
+			return RC_FAIL;
+		}
+
+		sTrimAll(stDisc.disc_id);	
+		stDisc.id = lSetEXLong(stDisc.id);
+		stDisc.index_num = lSetEXLong(stDisc.index_num);
+		stDisc.flag = lSetEXLong(stDisc.flag);
+		stDisc.card_type = lSetEXLong(stDisc.card_type);
+
+		if(RC_SUCC != IBPInsertData(t, &stDisc, sizeof(stDisc)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t), stDisc.disc_id, 
+				sGetError());
+			EXEC SQL CLOSE Cur_disc_algo;
+			return RC_FAIL;
+		}		
+	}
+	EXEC SQL CLOSE Cur_disc_algo;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	*pstNode = pstRoot;
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/

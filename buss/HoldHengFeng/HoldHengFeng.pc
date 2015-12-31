@@ -1,0 +1,269 @@
+/*****************************************************************
+ *文 件 名: LoadHxnpFile.c
+ *功	能: 加载渠道流水文件
+******************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+#define FILE_NAME_LEN_MAX   512
+#define REPAIR_AMT_SUCC	 '1'
+#define REPAIR_AMT_FAIL	 '0'
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_financ_manage.h"
+#include "tbl_mcht_settle_dtl.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   函数名：					   装载渠道流水主函数								*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*		  	  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	char	szStlmDate[9], szBuss[21], szLast[3];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "HoldHengFeng.log");
+
+	if(5 > argc)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szLast, 0, sizeof(szLast));
+	memset(szBuss, 0, sizeof(szBuss));
+
+	memcpy(szStlmDate, argv[1], 8);
+	strcpy(szBuss, "hengfeng");
+	memcpy(szLast, argv[4], sizeof(szLast) - 1);
+	snprintf(gsLogFile, sizeof(gsLogFile), "HoldHengFeng_%s.log", szLast);
+
+	if(RC_SUCC != lDbsConnect(DBS_BATCH))
+	{
+		HtLog(ERR_PARAM, "DbsConnect err:(%s)", sDbsError());
+		return RC_FAIL;
+	}
+
+	if(RC_SUCC != nHoldHengFeng(szStlmDate, szBuss, szLast))
+	{
+		vDbsDisconnect(); 
+		HtLog(ERR_PARAM, "对恒丰商户资金截留失败!\n");
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();		
+	HtLog(ERR_PARAM, "对恒丰商户资金截留处理完毕!\n");
+	return RC_SUCC;
+}	  
+
+/************************************************************************************/
+/*   声明  ： int  nRepairHengFeng(char *pszStlmDate, char *pszMchtNo, double *pdRAmt)*/
+/*   功能  ： 获取渠道文件															*/
+/*   参数  ： pszStlmDate 			--装载日期										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nRepairHengFeng(char *pszStlmDate, char *pszMchtNo, double *pdRAmt)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	double	dSettleAmt = 0.00, dRepairAmt = 0.00;
+	char	szStlmDate[9], szMchtNo[25], szId[41];
+	TMchtSettleDtl	stMchtDtl;
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szMchtNo, 0, sizeof(szMchtNo));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memcpy(szMchtNo, pszMchtNo, sizeof(szMchtNo) - 1);
+	memcpy(szStlmDate, pszStlmDate, sizeof(szStlmDate) - 1);
+
+	if(!pdRAmt || fabs(*pdRAmt) < 0.005)	return RC_SUCC;
+
+	//	无论是T + C 还是T + N 都要截留，通一个商户可能存在多笔截留
+	EXEC SQL DECLARE Cur_mcht_settle_dtl CURSOR FOR 
+		SELECT NVL(ID, ' '), NVL(SETTLE_AMT, 0.00) 
+			FROM TBL_MCHT_SETTLE_DTL 
+		WHERE SETTLE_DATE = :szStlmDate AND IBOX42 = :szMchtNo 
+			AND DISC_CYCLE > 0 AND RESULT_FLAG = '8';
+
+	EXEC SQL OPEN Cur_mcht_settle_dtl;	
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询商户(%s)代发明细失败, err:(%d)(%s)", szMchtNo, 
+			SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stMchtDtl, 0, sizeof(stMchtDtl));
+		EXEC SQL FETCH Cur_mcht_settle_dtl INTO :stMchtDtl.id, :stMchtDtl.settle_amt;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "获取商户(%s)清算金额失败, err:(%d)(%s)", szMchtNo, 
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_settle_dtl;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		sTrimAll(stMchtDtl.id);
+
+		if(*pdRAmt >= stMchtDtl.settle_amt)
+		{
+			*pdRAmt -= stMchtDtl.settle_amt;						//	剩余截留金额
+			stMchtDtl.repair_amt = stMchtDtl.settle_amt;
+			stMchtDtl.settle_amt = 0.00;
+			stMchtDtl.dc_flag[0] = 'C';
+			stMchtDtl.result_flag[0] = SETTLE_MCHT_SUCC;		//  金额 入账成功
+		}
+		else
+		{
+			stMchtDtl.settle_amt -= *pdRAmt;	
+			stMchtDtl.repair_amt  = *pdRAmt;
+			*pdRAmt = 0.00;										//	全部截留完毕
+			stMchtDtl.dc_flag[0]  = 'D';
+			stMchtDtl.result_flag[0] = SETTLE_MCHT_NOT_DEAL;
+		}
+
+		EXEC SQL UPDATE TBL_MCHT_SETTLE_DTL SET
+			REPAIR_AMT	= REPAIR_AMT + :stMchtDtl.repair_amt,
+			DC_FLAG		= :stMchtDtl.dc_flag,
+			SETTLE_AMT	= :stMchtDtl.settle_amt,
+			REC_UPD_TS	= :stMchtDtl.rec_upd_ts,
+			RESULT_FLAG = :stMchtDtl.result_flag
+		WHERE ID = :stMchtDtl.id;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新商户(%s)代发明细失败, err:(%d)(%s)", szMchtNo, 
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_mcht_settle_dtl;
+			return RC_SUCC;
+		}
+	}
+	EXEC SQL CLOSE Cur_mcht_settle_dtl;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int nHoldHengFeng(char *pszStlmDate, char *pszBuss)					*/
+/*   功能  ： 检查上期未截留完成的商户												*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*		   ： pszBuss				--业务类型										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*			  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nHoldHengFeng(char *pszStlmDate, char *pszBuss, char *pszLast)
+{
+	long	lCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	double	dRealAmt = 0, dAmt = 0.00;
+	char	szFlag[2], szTime[15], szLast[2];
+	char	szStlmDate[9], szBuss[21], szMchtNo[25], szId[41];
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szLast, 0, sizeof(szLast));
+	memset(szTime, 0, sizeof(szTime));
+	memset(szBuss, 0, sizeof(szBuss));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+
+	memcpy(szBuss, pszBuss, sizeof(szBuss) - 1);
+	memcpy(szStlmDate, pszStlmDate, sizeof(szStlmDate) - 1);
+	memcpy(szTime, sGetCurrentTime(), sizeof(szTime) - 1);
+	memcpy(szLast, pszLast, sizeof(szLast) - 1);
+
+	szFlag[0] = REPAIR_AMT_SUCC;
+
+	EXEC SQL DECLARE Cur_finac_manage CURSOR FOR 
+		SELECT NVL(ID, ' '), NVL(APP_ID, ' '), 
+			NVL(LOAD_AMT, 0.00) - NVL(REAL_AMT, 0.00)
+		FROM TBL_FINANC_MANAGE WHERE BUSS_TYPE = :szBuss AND DONE_DATE = :szStlmDate 
+			AND STATE = :szFlag AND SUBSTR(APP_ID, LENGTH(RTRIM(APP_ID)), 1) = :szLast
+			ORDER BY LOAD_DATE;
+
+	EXEC SQL OPEN Cur_finac_manage;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "查询恒丰理财明细失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szId, 0, sizeof(szId));
+		memset(szMchtNo, 0, sizeof(szMchtNo));
+		EXEC SQL FETCH Cur_finac_manage INTO :szId, :szMchtNo, :dAmt;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "获取恒丰截留流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_finac_manage;
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+
+		++ lCount;
+		sTrimAll(szId);
+		sTrimAll(szMchtNo);
+		dRealAmt = dAmt;
+
+		if(RC_SUCC != nRepairHengFeng(szStlmDate, szMchtNo, &dAmt))
+		{
+			HtLog(ERR_PARAM, "截留恒丰商户(%s)金额(%.2f(失败, err:(%d)(%s)", szMchtNo, dAmt,
+				SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_finac_manage;
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;
+		}
+
+		EXEC SQL UPDATE TBL_FINANC_MANAGE SET
+			REAL_AMT   = REAL_AMT + :dRealAmt - :dAmt,
+			REC_UPD_TS = :szTime
+		WHERE ID = :szId;
+		if(SQL_UD_ERR)
+		{
+			HtLog(ERR_PARAM, "更新恒丰理财明细(%s)失败, err:(%d)(%s)", SQLCODE,
+				sDbsError());
+			EXEC SQL CLOSE Cur_finac_manage;
+			EXEC SQL ROLLBACK WORK;
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_finac_manage;
+
+	HtLog(ERR_PARAM, "处理恒丰商户规则号(%s)商户个数(%d)!", szLast, lCount);
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/************************************************************************************/

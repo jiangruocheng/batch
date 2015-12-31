@@ -1,0 +1,336 @@
+/*****************************************************************
+ *  功能: 商户代发明细汇总
+ *  Author：DeffPuzzL
+ *  Edit History:
+ ****************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+#include	"tbl_settle_txn.h"
+#include	"tbl_settle_err.h"
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INCLUDE SQLCA;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   函数名：					   结算主函数										*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*  返回值 ： RC_SUCC		--  成功												*/ 
+/*			  RC_FAIL		--  失败		  										*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	int		iRet;
+	char	szSettleDate[9], szSettleNum[10], szLast[2];
+   
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	sprintf(gsLogFile, "ReviseSettle.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+	
+	memset(szLast, 0, sizeof(szLast));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+
+	memcpy(szSettleDate, argv[1], sizeof(szSettleDate) - 1);
+	memcpy(szSettleNum, argv[2], sizeof(szSettleNum) - 1);
+	memcpy(szLast, argv[4], sizeof(szLast) - 1);
+	snprintf(gsLogFile, sizeof(gsLogFile), "ReviseSettle_%s.log", szLast);
+
+	HtLog(NML_PARAM, "修复清算流水冗余数据开始...");
+	HtLog(NML_PARAM, "清算日期(%s) 清算批序号(%s) 机构规则号(%s)", szSettleDate, 
+		szSettleNum, szLast);
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "数据库连接失败sqlcode[%d]", iRet);
+		return RC_FAIL;
+	}
+	
+	//	修复tbl_settle_txn的冗余数据
+	iRet = nReviseSettle(szSettleDate, szSettleNum, szLast);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "汇总当日(%s)(%s)清算数据失败, err:(%d)\n", szSettleDate, 
+			szSettleNum, iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+   
+	//	修复tbl_txn_succ的冗余数据
+	iRet = nReviseTxnSucc(szSettleDate, szSettleNum, szLast);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "汇总当日(%s)(%s)清算数据失败, err:(%d)\n", szSettleDate, 
+			szSettleNum, iRet);
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	vDbsDisconnect();
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： void vGetNameFiled(TSettleTxn *pstSettleTxn)							*/
+/*   功能  ： 根据清算流水表修复冗余数据											*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vGetNameFiled(TSettleTxn *pstSettleTxn)
+{
+	dbBrhInfo   stBrh;
+	dbOprInf	stOprIf;
+	dbMchtBase  stBase;
+
+	memset(&stBase, 0, sizeof(stBase));
+	memset(&stBrh, 0, sizeof(stBrh));
+	memset(&stOprIf, 0, sizeof(stOprIf));
+
+	//  无论是否获取成功，都不报错
+	if(RC_SUCC == lGetOprInfo(&stOprIf, pstSettleTxn->expand))
+		memcpy(pstSettleTxn->expand_name, stOprIf.opr_name,  sizeof(pstSettleTxn->expand_name) - 1);
+	else
+		HtLog(ERR_PARAM, "警告:获取用户(%d)数据失败, err:%s", pstSettleTxn->expand, sGetError());
+
+	//  无论是否获取成功，都不报错
+	if(RC_SUCC == lGetBrhInfo(&stBrh, pstSettleTxn->brh))
+		memcpy(pstSettleTxn->brh_name, stBrh.brh_name,  sizeof(pstSettleTxn->brh_name) - 1);
+	else
+		HtLog(ERR_PARAM, "警告:获取机构(%s)数据失败, err:%s", pstSettleTxn->brh, sGetError());
+
+	if(SETTLE_TXN_MCHT == pstSettleTxn->settle_flag[0])	//	清给商户的
+	{
+		if(RC_SUCC == lGetMchtBase(&stBase, pstSettleTxn->mcht_no))
+			memcpy(pstSettleTxn->mcht_nm, stBase.mcht_nm,  sizeof(pstSettleTxn->mcht_nm) - 1);
+		else
+			HtLog(ERR_PARAM, "警告:获取商户(%s)数据失败, err:%s", pstSettleTxn->mcht_no, 
+				sGetError());
+	}
+	else if(SETTLE_MCHT_BRH == pstSettleTxn->settle_flag[0] || SETTLE_TXN_BRH == pstSettleTxn->settle_flag[0])
+	{
+		//  清给机构接入/分润机构
+		memset(&stBrh, 0, sizeof(stBrh));
+		//  无论是否获取成功，都不报错
+		if(RC_SUCC == lGetBrhInfo(&stBrh, pstSettleTxn->settle_brh_id))
+			memcpy(pstSettleTxn->settle_brh_name, stBrh.brh_name, 
+				sizeof(pstSettleTxn->settle_brh_name) - 1);
+		else
+			HtLog(ERR_PARAM, "警告:获取清算机构(%s)数据失败, err:%s", 
+				pstSettleTxn->settle_brh_id, sGetError());
+	}
+	else
+		;
+
+	sTrimAll(pstSettleTxn->expand_name);
+	sTrimAll(pstSettleTxn->brh_name);
+	sTrimAll(pstSettleTxn->mcht_nm);
+	sTrimAll(pstSettleTxn->settle_brh_name);
+}
+
+/************************************************************************************/
+/*   声明  ： int	nReviseSettle(char *pszSettleNum, char *pszSettleNum, 			*/
+/*					char *pszLast)													*/
+/*   功能  ： 根据商户和机构清算表生成清算流水表, 清算汇总表						*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		nReviseSettle(char *pszSettleDate, char *pszSettleNum, char *pszLast)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szSettleNum[5], szSettleDate[9], szLast[2];
+	TSettleTxn	stSettle;
+	long		lCount = 0;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szLast, 0, sizeof(szLast));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memcpy(szSettleDate, pszSettleDate, sizeof(szSettleDate) - 1);
+	memcpy(szSettleNum, pszSettleNum, sizeof(szSettleNum) - 1);
+	szLast[0] = pszLast[0];
+
+	HtLog(NML_PARAM, "修复清算流水日期(%s)批次(%s)规则号(%s)冗余数据.", pszSettleDate, 
+		pszSettleNum, szLast);
+
+	EXEC SQL DECLARE Cur_settle_txn CURSOR FOR 
+		SELECT NVL(ID, ' '), NVL(MCHT_NO, ' '), NVL(SETTLE_BRH_ID, ' '), 
+			NVL(BRH, ' '), NVL(SETTLE_FLAG, ' '), NVL(EXPAND, 0)
+		FROM TBL_SETTLE_TXN WHERE SETTLE_DATE = :szSettleDate AND SETTLE_NUM = :szSettleNum 
+			AND SUBSTR(ID, LENGTH(RTRIM(ID)), 1) = :szLast ORDER BY ID;
+
+	EXEC SQL OPEN Cur_settle_txn;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "获取清算流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(&stSettle, 0, sizeof(stSettle));
+		EXEC SQL FETCH Cur_settle_txn INTO :stSettle.id, :stSettle.mcht_no, :stSettle.settle_brh_id, 
+			:stSettle.brh, :stSettle.settle_flag, :stSettle.expand;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{   
+			HtLog(ERR_PARAM, "获取清算流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_settle_txn;
+			return RC_FAIL;
+		} 
+
+		sTrimAll(stSettle.id);
+		sTrimAll(stSettle.mcht_no);
+		sTrimAll(stSettle.brh);
+		sTrimAll(stSettle.settle_brh_id);
+		sTrimAll(stSettle.settle_flag);
+
+		++ lCount;
+		vGetNameFiled(&stSettle);
+
+		EXEC SQL UPDATE TBL_SETTLE_TXN SET
+			MCHT_NM 		= :stSettle.mcht_nm,
+			SETTLE_BRH_NAME = :stSettle.settle_brh_name,
+			EXPAND_NAME		= :stSettle.expand_name,
+			BRH_NAME		= :stSettle.brh_name
+		WHERE ID = :stSettle.id;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新清算流水冗余数据失败, err:(%d)(%s)ID(%s)", SQLCODE,
+				sDbsError(), stSettle.id);
+			break;
+		}   
+	}   
+	EXEC SQL CLOSE Cur_settle_txn;
+	EXEC SQL COMMIT WORK;
+
+	EXEC SQL UPDATE TBL_SETTLE_ERR E SET 
+		(MCHT_NM, SETTLE_BRH_NAME) =
+			(SELECT N.MCHT_NM, N.SETTLE_BRH_NAME 
+				FROM TBL_SETTLE_TXN N
+			WHERE N.SETTLE_DATE = :szSettleDate
+				AND N.SETTLE_NUM = :szSettleNum AND E.ID = N.ID) 
+		WHERE  E.SETTLE_DATE = :szSettleDate AND E.SETTLE_NUM = :szSettleNum AND
+			SUBSTR(E.ID, LENGTH(RTRIM(E.ID)), 1) = :szLast;
+	if(SQL_UD_ERR)
+	{
+   		HtLog(ERR_PARAM, "更新入账失败表冗余数据失败, err:(%d)(%s)", SQLCODE,
+ 			sDbsError());
+		return ;
+	}
+
+	HtLog(NML_PARAM, "修复清算流水日期(%s)批次(%s), 处理完毕, 修复笔数(%d)!", pszSettleDate, 
+			szSettleNum, lCount);
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int	nReviseTxnSucc(char *pszSettleNum, char *pszSettleNum, 			*/
+/*					char *pszLast)													*/
+/*   功能  ： 根据商户和机构清算表生成清算流水表, 清算汇总表						*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--  失败												*/
+/************************************************************************************/
+int		nReviseTxnSucc(char *pszSettleDate, char *pszSettleNum, char *pszLast)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szDate[9], szLast[2], szId[23];
+	dbMchtUser	stUser;
+	long		lUserId = 0, lCount = 0;
+	EXEC SQL END DECLARE SECTION;
+
+	memset(szLast, 0, sizeof(szLast));
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, sGetChgDate(pszSettleDate, -1), 8);
+	szLast[0] = pszLast[0];
+
+	if(strcmp(pszSettleNum, "TN00"))
+		return RC_SUCC;
+
+	HtLog(NML_PARAM, "修复交易流水日期(%s)批次(%s)规则号(%s)冗余数据.", pszSettleDate, 
+		pszSettleNum, szLast);
+
+	//	全量更新
+	EXEC SQL DECLARE Cur_txn_succ CURSOR FOR SELECT NVL(ID, ' '), NVL(USER_ID, 0) 
+			FROM TBL_TXN_SUCC 
+		WHERE TX_DATE = :szDate AND SUBSTR(ID, LENGTH(RTRIM(ID)), 1) = :szLast 
+		AND USER_ID != 0 ORDER BY ID;
+
+	EXEC SQL OPEN Cur_txn_succ;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "获取交易流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	while(1)
+	{
+		memset(szId, 0, sizeof(szId));
+		EXEC SQL FETCH Cur_txn_succ INTO :szId, :lUserId;
+		if(SQLCODE == DBS_NOTFOUND)
+			break;
+		else if(SQLCODE)
+		{   
+			HtLog(ERR_PARAM, "获取清算流水失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_txn_succ;
+			return RC_FAIL;
+		} 
+
+		sTrimAll(szId);
+
+		memset(&stUser, 0, sizeof(stUser));
+		if(RC_FAIL == lGetMchtUser(&stUser, lUserId))
+		{
+			HtLog(ERR_PARAM, "警告:获取用户(%d)数据失败, err:%s", lUserId, sGetError());
+			continue;
+		}
+
+		EXEC SQL UPDATE TBL_TXN_SUCC SET
+			USER_NAME	= :stUser.user_name,
+			USER_PHONE	= :stUser.user_phone,
+			USER_EMAIL	= :stUser.user_email
+		WHERE ID = :szId;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新清算流水冗余数据失败, err:(%d)(%s)ID(%s)", SQLCODE,
+				sDbsError(), szId);
+			break;
+		}   
+		
+		if(++ lCount % 500)
+			EXEC SQL COMMIT WORK;
+	}   
+	EXEC SQL CLOSE Cur_txn_succ;
+	EXEC SQL COMMIT WORK;
+
+	HtLog(NML_PARAM, "修复清算流水日期(%s)批次(%s), 处理完毕, 修复笔数(%d)!", pszSettleDate, 
+			pszSettleNum, lCount);
+	return RC_SUCC;
+}

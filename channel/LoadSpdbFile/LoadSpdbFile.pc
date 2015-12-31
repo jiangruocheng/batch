@@ -1,0 +1,487 @@
+/*****************************************************************
+ *文 件 名: LoadSpdbFile.c
+ *功	能: 加载渠道流水文件
+******************************************************************/
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "DbsApi.h"
+#include "load.h"
+
+#define FILE_NAME_LEN_MAX   512
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include "tbl_txn_succ.h"
+#include "tbl_cup_succ.h"
+EXEC SQL END DECLARE SECTION;
+
+#define	FILE_MAX_NUM		10		// 目前设定浦发最大文件个数
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   函数名：						装载渠道流水主函数								*/
+/************************************************************************************/
+/*   声明  ： int main(int argc  , char ** argv )									*/
+/*   功能  ： 完成清算全流程														*/
+/*   参数  ： argc (参数个数 -- 输入)												*/
+/*  返回值 ： RC_SUCC	--	成功													*/
+/*			  RC_FAIL	--	失败													*/
+/************************************************************************************/
+int main(int argc, char **argv)
+{
+	int		iRet;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char	szStlmDate[9], szCupsNo[5];
+	EXEC SQL END DECLARE SECTION;
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "LoadSpdbFile.log");
+
+	if(5 > argc)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memcpy(szStlmDate, argv[1], 8);
+	strcpy(szCupsNo, "spdb");
+
+	iRet = lDbsConnect(DBS_BATCH);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "dbsconnect error:(%d)(%s)", iRet, sDbsError());
+		return RC_FAIL;
+	}
+   
+	/*删除当天加载数据*/
+	EXEC SQL DELETE FROM TBL_CUP_SUCC WHERE STLM_DATE = :szStlmDate AND CUPS_NO = :szCupsNo;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "删除渠道(%s)流水失败, err:(%d)(%s)", szCupsNo, SQLCODE, sDbsError());
+		vDbsDisconnect();
+		return RC_FAIL;
+	}
+
+	/*加载一般交易流水文件*/
+	if(!memcmp("*", argv[4], 1))	//  非FileScan调启，可能人工或者页面发起
+	{
+		HtLog(NML_PARAM, "参数*, 未指明文件名, 程序自动FTP获取文件");
+		iRet = nGetCupsFile(szStlmDate);
+	}
+	else
+	{
+		HtLog(NML_PARAM, "指明装载文件名[%s]", argv[4]);
+		iRet = nLoadSpdbFile(szStlmDate, argv[4]);
+	}
+	if(iRet)
+	{
+		vDbsDisconnect(); 
+		HtLog(ERR_PARAM, "装载浦发渠道对账文件失败!, iRet=%d", iRet);
+		return RC_FAIL;
+	}
+	vDbsDisconnect();		
+
+	return RC_SUCC;
+}	  
+
+/************************************************************************************/
+/*   声明  ： int nCheckCupsFee(TCupSucc *pstCupTxn, dbNMchtMatch *pstMacht)		*/
+/*   功能  ： 核对渠道手续费														*/
+/*   参数  ： pstCupTxn			--渠道流水结构										*/
+/*		   ： pstCupsInf		--渠道商户费率结构									*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int	nCheckCupsFee(TCupSucc *pstCupTxn, dbNMchtMatch *pstMacht)
+{
+	int	  iRet = 0;
+	double   dFee = 0.00;
+
+	if(TRADE_TXN_INIT != pstCupTxn->result_flag[0])
+		return RC_SUCC;  
+
+	dFee = pstMacht->fee_rate * pstCupTxn->tx_amt / 100;
+	if(pstMacht->fee_val > 0.00)
+	{
+		dFee = (dFee >= pstMacht->fee_val) ? pstMacht->fee_val:dFee;
+//		if(fabs(dFee - pstCupTxn->cup_fee) < 0.0051)
+		if(fabs(dFee - pstCupTxn->cup_fee) < 0.01)
+			return RC_SUCC;
+		HtLog(ERR_PARAM, "交易金额:%.2f, 封顶手续费(%.2f), 手续费不相等:%.2f != %.2f", 
+			pstCupTxn->tx_amt, pstMacht->fee_val, pstCupTxn->cup_fee, dFee);
+	}
+	else
+	{
+		//  四舍五入原则0.005 自动进位0.01, 浦发 0.0038 为 0.01
+		if(fabs(dFee - pstCupTxn->cup_fee) < 0.01)
+			return RC_SUCC;
+		HtLog(ERR_PARAM, "交易金额:%.2f, 比率费率, 手续费不相等:%f!= %f, Diff:%f", 
+			pstCupTxn->tx_amt, dFee, pstCupTxn->cup_fee, fabs(dFee - pstCupTxn->cup_fee));
+	}
+
+	return RC_FAIL;
+}
+
+/************************************************************************************/
+/*   声明  ： int nGetCupsFile														*/
+/*   功能  ： 获取渠道文件															*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int	nGetCupsFile(char *pszDate, char *pszOutFile)
+{
+	int		i = 0, iRet = 0;
+	char	szCmd[512], szYDay[9], szFile[512], szPath[1024];
+
+	memset(szYDay, 0, sizeof(szYDay));
+	strcpy(szYDay, sGetChgDate(pszDate, -1));
+
+	memset(szCmd, 0, sizeof(szCmd));
+	snprintf(szCmd, sizeof(szCmd), "sh %s/sbin/spdb_down.sh %s", getenv("HOME"), szYDay + 2);
+	system(szCmd);
+	HtLog(NML_PARAM, "system cmd [%s]", szCmd);
+
+	for(i = 1; i <= FILE_MAX_NUM; i ++)
+	{
+		memset(szFile, 0, sizeof(szFile));
+		memset(szPath, 0, sizeof(szPath));
+		snprintf(szFile, sizeof(szFile), "SPDB_TXN_79000001_%s_%02d.txt", szYDay + 2, i);
+		snprintf(szPath, sizeof(szPath), "%s/spdb/%s", getenv("FILEDIR"), szFile);
+		sTrimAll(szPath);
+		iRet = access(szPath, R_OK);
+		if(iRet)
+		{
+			if(1 == i)
+			{
+				HtLog(ERR_PARAM, "获取浦发第1个对账文件[%s]失败!", szPath);
+				return RC_FAIL;
+			}
+			HtLog(ERR_PARAM, "浦发第%d个对账文件[%s]不存在, 处理完毕!", i, szFile);
+			break;
+		}
+	
+		HtLog(ERR_PARAM, "正在处理浦发第%d个对账文件[%s]", i, szFile);
+		iRet = nLoadSpdbFile(pszDate, szFile);
+		if(iRet)
+		{
+			HtLog(ERR_PARAM, "nLoadCilkFile error %d", iRet);
+			return RC_FAIL;
+		}
+	}
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： nAbolishTrade															*/
+/*   功能  ： 对撤销类交易的处理													*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int  nAbolishTrade(char *pszDate)
+{
+	int		iRet = 0, iCount = 0;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szStlmDate[9], szCupsNo[5], szFlag[2];
+	char		szFd11[7], szFd13[5], szYear[5];
+	TTxnSucc	stTxn;
+	TCupSucc	stCups;
+	EXEC SQL END DECLARE SECTION;
+	
+	memset(szFlag, 0, sizeof(szFlag));
+	memset(szCupsNo, 0, sizeof(szCupsNo));
+	memset(szStlmDate, 0, sizeof(szStlmDate));
+
+	szFlag[0] = TRADE_TXN_REVERSED;
+	strcpy(szCupsNo, "spdb");
+	memcpy(szStlmDate, pszDate, sizeof(szStlmDate) - 1);
+
+	// 渠道明确撤销掉的交易
+	EXEC SQL DECLARE Cur_cup_succ CURSOR FOR SELECT * FROM TBL_CUP_SUCC WHERE 
+		STLM_DATE = :szStlmDate AND CUPS_NO = :szCupsNo AND RESULT_FLAG = :szFlag;
+
+	EXEC SQL OPEN Cur_cup_succ;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "Tbl_cup_succ_Dec_Sel error %d:%s", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+	
+	//order_no
+	while(1)
+	{
+		memset(&stCups, 0, sizeof(stCups));
+		EXEC SQL FETCH Cur_cup_succ INTO :stCups;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "tbl_cup_succ_fet Err:(%d)(%s)", iRet, sDbsError());
+			EXEC SQL CLOSE Cur_cup_succ;	
+			lDbsRollback();
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+		{
+			HtLog(NML_PARAM, "处理浦发撤销类流水完成!");
+			EXEC SQL CLOSE Cur_cup_succ;	
+			break;
+		}
+		
+		sTrimAll(stCups.trace_no);
+		sTrimAll(stCups.tx_date);
+
+		memset(szYear, 0, sizeof(szYear));
+		memcpy(szYear, stCups.tx_date, 4);
+
+		memset(szFd11, 0, sizeof(szFd11));
+		memset(szFd13, 0, sizeof(szFd13));
+		memcpy(szFd13, stCups.tx_date + 4, sizeof(szFd13) - 1);
+		memcpy(szFd11, stCups.trace_no + 6, sizeof(szFd11) - 1);
+
+		// 渠道明确撤销掉的交易, 
+		memset(&stTxn, 0, sizeof(stTxn));
+		HtLog(NML_PARAM, "日期[%s]对撤销流水[%s]", stCups.tx_date, stCups.trace_no);
+		EXEC SQL SELECT NVL(FD11, ' '), NVL(FD13, ' ') INTO :stTxn.fd11, :stTxn.fd13 
+			FROM TBL_TXN_SUCC WHERE ORDER_NO = (
+				SELECT NVL(ORDER_NO, ' ') FROM TBL_TXN_SUCC WHERE CUPS_NO = :szCupsNo
+					AND FD13 = :szFd13 AND FD11 = :szFd11 AND SUBSTR(TX_DATE,1,4) = :szYear)
+			AND TX_SUB_CODE IN ('31','51');
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "tbl_txn_succ err:(%d)(%s), date(%s)fd11(%s)", SQLCODE, sDbsError(), 
+				stCups.tx_date, stCups.trace_no + 6);
+			EXEC SQL CLOSE Cur_cup_succ;	
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		sTrimAll(stTxn.fd11);
+		sTrimAll(stTxn.fd13);
+
+		// 更新一笔消费成功的交易为冲正	虽然数据基本不可能保存一年, 安全性加上年判断
+		EXEC SQL UPDATE TBL_CUP_SUCC SET 
+			RESULT_FLAG = :szFlag
+		WHERE SUBSTR(TRACE_NO,7,6) = :stTxn.fd11 AND SUBSTR(TX_DATE,5,4) = :stTxn.fd13 
+			AND SUBSTR(TX_DATE,1,4) = :szYear AND CUPS_NO = :szCupsNo;
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "更新渠道(%s)流水失败, err:(%d)(%s), (%s)(%s)(%s)(%s)", szCupsNo, 
+				SQLCODE, sDbsError(), stTxn.fd11, stTxn.fd13, stCups.trace_no, szYear);
+			EXEC SQL CLOSE Cur_cup_succ;	
+			lDbsRollback();
+			return RC_FAIL;
+		}
+		
+		iCount ++;
+		if(0 == iCount % 100)
+			lDbsCommit();
+	}
+	lDbsCommit();
+	
+	return RC_SUCC;	
+}
+
+/************************************************************************************/
+/*   声明  ： int nLoadYsepFile(char *pszStlmDate, char *pszFile)					*/
+/*   功能  ： 从渠道给的文件中加载渠道流水表										*/
+/*   参数  ： pszStlmDate			--装载日期										*/
+/*		   :  pszFile				--渠道文件名									*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int nLoadSpdbFile(char *pszDate, char *pszFile)
+{
+	long	lSeqNo = 0;
+	int	 iRet = 0, iYear = 0, iLine = 0, lCancle = 0, lRec = 0;
+	FILE	*fp = NULL;
+	char	szPath[FILE_NAME_LEN_MAX + 1];
+	char	szLine[RECORD_LEN_MAX + 1], szTemp[100], szDate[10], szDay[10];
+	EXEC SQL BEGIN DECLARE SECTION;
+	TCupSucc	stCups;
+	EXEC SQL END DECLARE SECTION;
+	dbNMchtMatch	stMatch;
+	
+	/* open file */
+	memset(szPath, 0, sizeof(szPath));
+	sprintf(szPath, "%s/spdb/%s", getenv("FILEDIR"), pszFile);
+	sTrimAll(szPath);
+
+	HtLog(NML_PARAM, "浦发对账文件:%s", szPath);
+	iRet = access(szPath, R_OK);
+	if(iRet)
+	{
+		HtLog(ERR_PARAM, "文件[%s]不存在，请查看!, strerr[%s]", szPath, strerror(errno));
+		return RC_FAIL;
+	}
+
+	if(NULL == (fp = fopen(szPath, "r")))
+	{
+		HtLog(ERR_PARAM, "fopen %s error.", szPath);
+		return RC_FAIL;
+	}
+  
+	/* get file record */
+	memset(szLine, 0, sizeof(szLine));
+	while(fgets(szLine, RECORD_LEN_MAX, fp))
+	{
+		lRec ++;
+		if(0 == strlen(szLine))
+			continue;
+
+		memset(&stCups, 0, sizeof(stCups));
+		strcpy(stCups.res, sGetValueByIdx(szLine, "||", 4));		  //   商户号
+		sTrimAll(stCups.res);
+
+		/* 银商或银行编号 */					  
+		memcpy(stCups.cups_no, "spdb", 4); 
+		
+		/*检查商户是否在本平台注册，对注册的处理，对未注册的不处理*/
+		memset(&stMatch, 0, sizeof(stMatch));
+		iRet = lGetSpdbRoute(&stMatch, stCups.cups_no, stCups.res);
+		if(RC_NOTFOUND == iRet)
+		{
+			memset(szLine, 0, sizeof(szLine));
+			HtLog(NML_PARAM, "渠道商户(%s)在本平台未注册, 不予装载!", stCups.res);
+			continue;
+		}
+		else if(iRet)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "查找路由表商户信息错误:(%d)(%s), (%s)(%d)", iRet, sGetError(), 
+				stCups.res, lRec);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		/*对帐日期*/
+		memcpy(stCups.stlm_date, pszDate, 8); 
+
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, "||", 6));
+		memcpy(stCups.tx_time, szTemp + 4, 6);
+
+		strcpy(szDate, sGetValueByIdx(szLine, "||", 1));
+		memcpy(szDay, szDate, 4);
+		iYear = atoi(szDay);
+
+		memset(szDay, 0, sizeof(szDay));
+		memcpy(szDay, szTemp, 4);
+		if(0 == memcmp(szDate + 4, "0101", 4) && 0 == memcmp(szDay, "1231", 4))
+			iYear --;
+
+		snprintf(stCups.tx_date, sizeof(stCups.tx_date), "%d%s", iYear, szDay);
+
+		strcpy(stCups.brf, sGetValueByIdx(szLine, "||", 2));		  //   分行号
+		strcpy(stCups.fill, sGetValueByIdx(szLine, "||", 3));		 //   归类商户号
+		strcpy(stCups.term_no, sGetValueByIdx(szLine, "||", 5));	  //   终端号
+		strcpy(stCups.ac_no, sGetValueByIdx(szLine, "||", 7));		//   账号
+		sTrimAll(stCups.ac_no);
+
+		strcpy(stCups.sys_ref_no, sGetValueByIdx(szLine, "||", 8));				//   支付平台流水号
+
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, "||", 9));				 //   收单系统流水号
+		sTrimAll(szTemp);
+		lSeqNo = atol(szTemp);
+		sprintf(stCups.trace_no, "%012d", lSeqNo);
+		
+/*
+1101	联机消费
+3101	消费撤销
+5151	联机退货
+1091	预授权完成
+3091	预授权完成撤销
+1111	脱机消费
+5171	脱机退货
+*/
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, "||", 10));	//   收单内部交易码
+		sTrimAll(szTemp);
+		if(0 == strncmp(szTemp, "1101", 4))		   //   联机消费
+		{
+			iLine ++;
+			strcpy(stCups.tx_code, "POS消费");
+			stCups.result_flag[0] = TRADE_TXN_INIT;
+		}
+		else if(0 == strncmp(szTemp, "3101", 4))	  //   消费撤销
+		{
+			lCancle ++;
+			strcpy(stCups.tx_code, "POS消费撤销");
+			stCups.result_flag[0] = TRADE_TXN_REVERSED;
+		}
+		else // 5151 3091 5171
+		{
+			stCups.result_flag[0] = '4';
+			strcpy(stCups.tx_code, szTemp);
+			HtLog(NML_PARAM, "未知的交易类型:[%s]", stCups.tx_code);
+		}
+
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, "||", 11));				//   交易金额
+		sTrimAll(szTemp);
+		stCups.tx_amt = atof(szTemp);
+
+		memset(szTemp, 0, sizeof(szTemp));
+		strcpy(szTemp, sGetValueByIdx(szLine, "||", 12));				//   渠道手续费
+		sTrimAll(szTemp);
+		sTrimCRLF(szTemp);
+		stCups.cup_fee = atof(szTemp);
+
+		/* 系统检索号 */
+		/* 唯一键值	  */
+		sprintf(stCups.id, "%s%s%s", stCups.cups_no, stCups.tx_date, stCups.trace_no);
+		sprintf(stCups.cup_key, "%s%s%s", stCups.cups_no, stCups.tx_date, stCups.trace_no);
+
+		/* 时间   */	   
+		memcpy(stCups.rec_crt_ts, sGetCurrentTime(), sizeof(stCups.rec_crt_ts) - 1);
+
+		// 只对消费交易计算手续费
+		iRet = nCheckCupsFee(&stCups, &stMatch);
+		if(iRet)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "核对手续费错误, err:(%d)Line(%d),mcht(%s)", iRet, iLine, stCups.res);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		EXEC SQL INSERT INTO TBL_CUP_SUCC VALUES(:stCups);
+		if(SQLCODE)
+		{
+			fclose(fp);
+			HtLog(ERR_PARAM, "新增渠道(%s)流水(%s)失败, err:(%d)(%s), Line(%d)", stCups.cups_no,
+				stCups.id, SQLCODE, sDbsError(), iLine);
+			lDbsRollback();
+			return RC_FAIL;
+		}
+
+		if(0 == iLine % 1000)
+			lDbsCommit();
+	  
+		memset(szLine, 0, sizeof(szLine));
+	}
+	lDbsCommit();  
+	fclose(fp);
+	HtLog(NML_PARAM, "装载浦发渠道流水完成，装载日期(%s),本地装载有效条数(%d),撤销流水(%d)笔, 实际清算笔数(%d)", 
+		pszDate, iLine, lCancle, iLine - lCancle);
+
+	return nAbolishTrade(pszDate);
+}

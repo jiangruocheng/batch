@@ -1,0 +1,149 @@
+/******************************************************************
+*文 件 名: GenCheckInfo.pc
+*功	   能: 生成对账状态表
+*判断标识: 
+*编程人员: DeffPuzzL
+*编程时间: 20150619
+******************************************************************/
+#include "DbsApi.h"
+#include "Ibp.h"
+#include "pos_stlm.h"
+#include "load.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"tbl_chn_settle.h"
+EXEC SQL END DECLARE SECTION;
+
+/************************************************************************************/
+/*   声明  ： vPrintVersion(char *pszParm)											*/
+/*   功能  ：																		*/
+/*  返回值 ： 无																	*/
+/************************************************************************************/
+void	vPrintVersion(char *pszParm)
+{
+	if(!pszParm)	return ;
+	if(strcmp(sUpper(pszParm), "-V"))   return ;
+
+	fprintf(stdout, "%s\n", g_szVersion);
+
+	exit(0);
+}
+
+/************************************************************************************/
+/*   声明  ： int nGenChannelBill(char *pszSettleDate, char *pszSettleNum) 			*/
+/*   功能  ： 生成商户对帐流水文件													*/
+/*   参数  ： pszSettleDate			 --清算日期										*/
+/*  返回值 ： RC_SUCC	--  成功													*/
+/*		   	  RC_FAIL	--  失败													*/
+/************************************************************************************/
+int		nGenCheckInfo(char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	TChnSettle	stChnSet;   
+	char		szDate[9];
+	long		lRec = 0, lCount = 0;
+	EXEC SQL END DECLARE SECTION;
+	CMList		*pstNode = NULL, *pstRoot = NULL;
+
+	memset(szDate, 0, sizeof(szDate));
+	memcpy(szDate, pszSettleDate, sizeof(szDate) - 1);
+	EXEC SQL DELETE FROM TBL_CHN_SETTLE WHERE SETTLE_DATE = :szDate;
+	if(SQL_UD_ERR)
+	{
+		HtLog(ERR_PARAM, "删除任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	if(RC_SUCC != lGroupCupsNo(&pstRoot, 0))
+	{
+		fprintf(stdout, "获取渠道列表失败, err:(%s)", sGetError());
+		vDestroyList(pstRoot);
+		return RC_FAIL;
+	}
+
+	pstNode = pstRoot;
+	while(pstNode)
+	{
+		memset(&stChnSet, 0, sizeof(stChnSet));
+		memcpy(stChnSet.settle_date, pszSettleDate, sizeof(stChnSet.settle_date) - 1);
+		memcpy(stChnSet.cups_no, (char *)pstNode->pstData, 4);
+		snprintf(stChnSet.cups_name, sizeof(stChnSet.cups_name) - 1, "%s", 
+			sGetCupsName(stChnSet.cups_no));
+		snprintf(stChnSet.id, sizeof(stChnSet.id) - 1, "%s%s", stChnSet.settle_date,
+			stChnSet.cups_no);
+
+		stChnSet.check_state[0] = CHANNEL_CHECK_INIT;
+ 		//Begin, Modified by JiangRuocheng, 20151121
+ 		stChnSet.settle_flag[0] = CHANNEL_SETTLE_DONE; //CHANNEL_SETTLE_NOT;
+ 		//End, Modified by JiangRuocheng, 20151121
+
+		EXEC SQL SELECT COUNT(*) INTO :lRec FROM TBL_MCHT_CLEAR WHERE CUPS_NO = :stChnSet.cups_no;
+		if(lRec > 0)
+			stChnSet.clear_flag[0] = CHANNEL_CLEAR_YES;
+		else
+			stChnSet.clear_flag[0] = CHANNEL_CLEAR_NO;
+
+		HtLog(NML_PARAM, "生成第(%d)个渠道(%s)对账状态表", ++ lCount, stChnSet.cups_no);
+		EXEC SQL INSERT INTO TBL_CHN_SETTLE VALUES(:stChnSet);
+		if(SQLCODE)
+		{
+			HtLog(ERR_PARAM, "新增任务列表失败, err:(%d)(%s)", SQLCODE, sDbsError());
+			vDestroyList(pstRoot);
+			return RC_FAIL;
+		}
+
+		pstNode = pstNode->pstNext;
+	}
+	vDestroyList(pstRoot);
+
+	HtLog(NML_PARAM, "生成本周期(%s)共渠道(%d)个对账状态表\n", pszSettleDate, lCount);
+	EXEC SQL COMMIT WORK;
+
+	return RC_SUCC;
+}
+
+/************************************************************************************/
+/*   声明  ： int main(int argc, char ** argv )										*/
+/*   功能  ： 生成对账状态表														*/
+/*  返回值 ： RC_SUCC		--	成功												*/
+/*			  RC_FAIL		--	失败												*/
+/************************************************************************************/
+int main(int argc, char *argv[])
+{
+	int		iRet = 0;
+	char	szSettleDate[9], szSettleNum[5];
+
+	memset(gsLogFile, 0, sizeof(gsLogFile));
+	strcpy(gsLogFile, "GenCheckInfo.log");
+
+	vPrintVersion(argv[1]);
+	if(argc < 5)
+	{
+		HtLog(ERR_PARAM, MAIN_ERR, argc, argv[0]);
+		return RC_FAIL;
+	}
+
+	memset(szSettleNum, 0, sizeof(szSettleNum));
+	memset(szSettleDate, 0, sizeof(szSettleDate));
+	strcpy(szSettleDate, argv[1]);
+	strcpy(szSettleNum, argv[2]);
+
+	if(RC_SUCC != lDbsConnect(DBS_BATCH))
+	{
+		HtLog(ERR_PARAM, "连接数据库失败，err:(%d)(%s)", SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	if(RC_SUCC != nGenCheckInfo(szSettleDate, szSettleNum))
+	{
+		HtLog(ERR_PARAM, "生成本周期(%s)生成对账状态表失败!\n", szSettleDate);
+		vDbsDisconnect();
+		return iRet;
+	}
+
+	vDbsDisconnect();
+	
+	return RC_SUCC;
+}

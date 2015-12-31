@@ -1,0 +1,179 @@
+#include	"Ibp.h"
+#include	"DbsApi.h"
+#include	"pos_stlm.h"
+#include	"load.h"
+#include	"table.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+#include	"shmdb.h"
+EXEC SQL END DECLARE SECTION;
+
+/****************************************************************************************
+	获取系统启动所需表大小	
+ ****************************************************************************************/
+long	lDefine_BrhInfo(TABLE t, char *pszSettleDate, char *pszSettleNum)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	long	lCount = 0, lSize = 0;
+	char	szTable[100];
+	EXEC SQL END DECLARE SECTION;
+
+	lSize = sizeof(TblDef);
+
+	memset(szTable, 0, sizeof(szTable));
+	strcpy(szTable, sGetTableName(t));
+
+	EXEC SQL SELECT COUNT(*) INTO :lCount FROM TBL_BRH_INFO WHERE 1 = 1;
+	if(RC_SUCC != lInitTblSize(t, lCount, sizeof(dbBrhInfo), &lSize))
+		return RC_FAIL;
+
+	fprintf(stdout, "开始建立表:%s\n", szTable);
+	HtLog(NML_PARAM, "初始化表(%s)索引(brh_id)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbBrhInfo, brh_id, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(brh_id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)索引(brh_code)", szTable);
+	if(RC_SUCC != IBPSetUnIdx(t, dbBrhInfo, brh_code, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(brh_code)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)查询索引(brh_level)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbBrhInfo, brh_level, FIELD_LONG))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(brh_level)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)查询索引(brh_stlm_flag)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbBrhInfo, brh_stlm_flag, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(brh_stlm_flag)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)查询索引(brh_disc_id)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbBrhInfo, brh_disc_id, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(brh_disc_id)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)查询索引(brh_tag)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbBrhInfo, brh_tag, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(brh_tag)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+
+	HtLog(NML_PARAM, "初始化表(%s)查询索引(brh_file_flag)", szTable);
+	if(RC_SUCC != IBPSetIdx(t, dbBrhInfo, brh_file_flag, FIELD_CHAR))
+	{
+		HtLog(ERR_PARAM, "设置表(%s)字段(brh_file_flag)失败, err:(%s)", szTable, sGetError());
+		return RC_FAIL;
+	}
+	fprintf(stdout, "建立%s表完成 ... success\n", sGetTableName(t));
+
+	return lSize;
+}
+
+/****************************************************************************************
+	创建客户表
+ ****************************************************************************************/
+long	lLoad_BrhInfo(TABLE t, Tree **pstNode, char *pszSettleDate, char *pszSettleNum)
+{
+	long	lCount = 0, lRes = RC_SUCC;
+	Tree	*pstRoot = NULL;
+	EXEC SQL BEGIN DECLARE SECTION;
+	char		szTemp[1025];
+	dbBrhInfo	stBrh;
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL DECLARE Cur_brh_info CURSOR FOR 
+		SELECT NVL(BRH_ID, 0), NVL(BRH_LEVEL, 0), NVL(BRH_CODE, ' '), 
+			NVL(BRH_NAME, ' '), NVL(BRH_STLM_FLAG, ' '), NVL(BRH_DISC_ID, ' '), 
+			NVL(BRH_TAG, ' '), NVL(BRH_FILE_FLAG, ' ') 
+		FROM TBL_BRH_INFO ORDER BY BRH_CODE;
+
+	EXEC SQL OPEN Cur_brh_info;
+	if(SQLCODE)
+	{
+		HtLog(ERR_PARAM, "定义表%s错误, (%d)(%s)", sGetTableName(t), SQLCODE, sDbsError());
+		return RC_FAIL;
+	}
+
+	IBPInitTable(t);
+	while(1)
+	{
+		memset(szTemp, 0, sizeof(szTemp));
+		memset(&stBrh, 0, sizeof(stBrh));
+		EXEC SQL FETCH Cur_brh_info INTO :stBrh.brh_id, :stBrh.brh_level, 
+			:stBrh.brh_code, :szTemp, :stBrh.brh_stlm_flag, :stBrh.brh_disc_id, 
+			:stBrh.brh_tag, :stBrh.brh_file_flag;
+		if(SQLERR)
+		{
+			HtLog(ERR_PARAM, "用游标获取数据失败, (%d)(%s)", SQLCODE, sDbsError());
+			EXEC SQL CLOSE Cur_brh_info;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+		else if(SQLNOTFOUND)
+			break;
+		
+		lCount ++;
+		if(lGetTblCount(t) <= lCount)
+		{
+			HtLog(ERR_PARAM, "定义超限，请重新装载(%d)<(%d)!", lGetTblCount(t), lCount);
+			EXEC SQL CLOSE Cur_brh_info;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		sTrimAll(szTemp);	
+		sTrimAll(stBrh.brh_code);	
+		sTrimAll(stBrh.brh_stlm_flag);	
+		sTrimAll(stBrh.brh_disc_id);	
+		sTrimAll(stBrh.brh_tag);	
+		sTrimAll(stBrh.brh_file_flag);	
+		memcpy(stBrh.brh_name, szTemp, sizeof(stBrh.brh_name) - 1);
+
+		pstRoot = (Tree *)IBPInsertTree(pstRoot, stBrh.brh_code, ++(pGetTblDef(t)->lTreeNode),
+			dbBrhInfo, brh_code, lGetTblPos(t) + ((IBPShm *)pGetShmRun())->m_lOffset, &lRes);
+		if(RC_FAIL == lRes)
+		{
+			HtLog(ERR_PARAM, "装载机构号(%s)失败, 原因:%s", stBrh.brh_code, sGetError());
+			EXEC SQL CLOSE Cur_brh_info;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+
+		stBrh.brh_id = lSetEXLong(stBrh.brh_id);
+		stBrh.brh_level = lSetEXLong(stBrh.brh_level);
+
+		if(RC_SUCC != IBPInsertData(t, &stBrh, sizeof(stBrh)))
+		{
+			HtLog(ERR_PARAM, "新增表(%s)数据(%s)失败, 原因:%s", sGetTableName(t),
+				stBrh.brh_code, sGetError());
+			EXEC SQL CLOSE Cur_brh_info;
+			vDestroyTree(pstRoot);
+			return RC_FAIL;
+		}
+	}
+	EXEC SQL CLOSE Cur_brh_info;
+	*pstNode = pstRoot;
+
+	HtLog(NML_PARAM, "(%s)装载表空间总记录(%d), 有效记录(%d)", sGetTableName(t), lGetTblCount(t), 
+		pGetTblDef(t)->lValid);
+
+	return RC_SUCC;
+}
+
+/****************************************************************************************
+	end
+ ***************************************************************************************/
